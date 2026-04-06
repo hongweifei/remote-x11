@@ -252,7 +252,7 @@ async fn handle_client(
                                     let disp = session.display;
                                     let sid = session.id.clone();
                                     info!("Session created for display :{}", disp);
-                                    eprintln!("[rx11] 会话已创建: DISPLAY=:{} (客户端: {})", disp, tid);
+                                    eprintln!("[rx11] Session created: DISPLAY=:{} (client: {})", disp, tid);
                                     session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
                                         display: disp,
@@ -286,7 +286,7 @@ async fn handle_client(
                                     let disp = session.display;
                                     let sid = session.id.clone();
                                     info!("Session resumed for display :{}", disp);
-                                    eprintln!("[rx11] 会话已恢复: DISPLAY=:{} (客户端: {})", disp, tid);
+                                    eprintln!("[rx11] Session resumed: DISPLAY=:{} (client: {})", disp, tid);
                                     session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
                                         display: disp,
@@ -323,7 +323,7 @@ async fn handle_client(
                                     let disp = session.display;
                                     let sid = session.id.clone();
                                     info!("Session auto-created for display :{}", disp);
-                                    eprintln!("[rx11] 会话已创建: DISPLAY=:{} (客户端: {})", disp, tid);
+                                    eprintln!("[rx11] Session created: DISPLAY=:{} (client: {})", disp, tid);
                                     session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
                                         display: disp,
@@ -356,7 +356,7 @@ async fn handle_client(
                             session_mgr.unregister_x11_relay(disp).await;
                             session_mgr.destroy_session(disp).await;
                             info!("Session destroyed for display :{}", disp);
-                            eprintln!("[rx11] 会话已销毁: DISPLAY=:{}", disp);
+                            eprintln!("[rx11] Session destroyed: DISPLAY=:{}", disp);
                         }
                         Ok(Frame::DataX11(msg)) => {
                             if !session_mgr.owns_connection(msg.connection_id, &tid).await {

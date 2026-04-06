@@ -104,15 +104,15 @@ async fn wait_for_port(addr: &str, timeout_duration: std::time::Duration) -> any
 #[command(
     name = "rx11",
     version,
-    about = "rx11 — 远程 X11 转发工具",
+    about = "rx11 — Remote X11 forwarding tool",
     long_about = None,
-    after_help = "快速开始:
-  1. 远程服务器:  rx11 server -t <TOKEN>
-  2. 本地电脑:    rx11 client -r <HOST>:7000 -t <TOKEN>
-     或:          rx11 ssh -H <HOST> -u <USER> -t <TOKEN>
-  3. 远程服务器:  DISPLAY=:0 <gui-program>  (Display 编号见客户端输出)
+    after_help = "Quick start:
+  1. Remote server:  rx11 server -t <TOKEN>
+  2. Local machine:  rx11 client -r <HOST>:7000 -t <TOKEN>
+     or:             rx11 ssh -H <HOST> -u <USER> -t <TOKEN>
+  3. Remote server:  DISPLAY=:0 <gui-program>  (see client output for display number)
 
-配置优先级: 命令行参数 > 环境变量 > 配置文件 > 默认值",
+Priority: command-line args > environment variables > config file > defaults",
 )]
 struct Cli {
     #[command(subcommand)]
@@ -122,204 +122,204 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     #[command(
-        about = "启动中继服务器",
-        long_about = "在远程服务器上启动中继服务，监听客户端连接并代理 X11 端口。
+        about = "Start relay server",
+        long_about = "Start a relay server on the remote host that listens for client connections and proxies X11 ports.
 
-不指定 -t 时自动生成并打印 Token，需保存供客户端使用。
+If -t is not specified, a token is auto-generated and printed to the terminal. Save it for client use.
 
-示例:
+Examples:
   rx11 server -t my-secret-token
   rx11 server -l 0.0.0.0:8000 -x 6100 -t my-secret-token",
-        after_help = "默认值:
+        after_help = "Defaults:
   --listen    0.0.0.0:7000
   --x11-port  6000
 
-也可通过 RX11_TOKEN 环境变量提供 Token",
+Token can also be provided via RX11_TOKEN environment variable",
         next_line_help = true,
         display_order = 0,
     )]
     Server {
         #[arg(
             short, long,
-            help = "监听地址",
-            long_help = "中继服务器监听地址，格式为 IP:PORT"
+            help = "Listen address",
+            long_help = "Relay server listen address, format: IP:PORT"
         )]
         listen: Option<String>,
 
         #[arg(
             short = 'x', long = "x11-port",
-            help = "X11 代理起始端口",
-            long_help = "X11 代理起始端口号，Display :N 对应端口 6000+N"
+            help = "X11 proxy start port",
+            long_help = "X11 proxy start port number. Display :N maps to port 6000+N"
         )]
         x11_port: Option<u16>,
 
         #[arg(
             short = 't', long, env = "RX11_TOKEN",
-            help = "认证 Token (不指定则自动生成)",
-            long_help = "客户端/服务端之间的认证 Token，不指定时自动生成并打印到终端。也可通过 RX11_TOKEN 环境变量提供"
+            help = "Auth token (auto-generated if omitted)",
+            long_help = "Authentication token between client and server. Auto-generated and printed if omitted. Can also be provided via RX11_TOKEN environment variable"
         )]
         token: Option<String>,
     },
 
     #[command(
-        about = "启动本地客户端",
-        long_about = "连接到远程中继服务器，将 X11 数据转发到本地 X Server。
+        about = "Start local client",
+        long_about = "Connect to a remote relay server and forward X11 data to the local X Server.
 
-连接前会自动检测本地 X Server 是否可用。
-默认自动分配 Display 编号，也可手动指定。
+Automatically detects whether the local X Server is available before connecting.
+Display number is auto-assigned by default, or can be specified manually.
 
-示例:
+Examples:
   rx11 client -r 192.168.1.100:7000 -t my-secret-token
   rx11 client -r server:7000 -t $TOKEN -d 1",
-        after_help = "默认值:
+        after_help = "Defaults:
   --relay    remote-server:7000
   --x11      127.0.0.1:6000
-  --auto     true (自动分配 Display 编号)
+  --auto     true (auto-assign display number)
 
-Token 也可通过 RX11_TOKEN 环境变量提供",
+Token can also be provided via RX11_TOKEN environment variable",
         next_line_help = true,
         display_order = 1,
     )]
-    Client {
+        Client {
         #[arg(
             short, long,
-            help = "中继服务器地址",
-            long_help = "远程中继服务器地址，格式为 IP:PORT"
+            help = "Relay server address",
+            long_help = "Remote relay server address, format: IP:PORT"
         )]
         relay: Option<String>,
 
         #[arg(
             short = 't', long, env = "RX11_TOKEN",
-            help = "认证 Token",
-            long_help = "与远程服务器一致的认证 Token。也可通过 RX11_TOKEN 环境变量提供"
+            help = "Auth token",
+            long_help = "Authentication token matching the remote server. Can also be provided via RX11_TOKEN environment variable"
         )]
         token: Option<String>,
 
         #[arg(
             short, long,
-            help = "本地 X Server 地址",
-            long_help = "本地 X Server 监听地址，默认 127.0.0.1:6000 (即 Display :0)"
+            help = "Local X Server address",
+            long_help = "Local X Server listen address, default 127.0.0.1:6000 (i.e. Display :0)"
         )]
         x11: Option<String>,
 
         #[arg(
             short = 'd', long,
-            help = "指定 Display 编号 (禁用自动分配)",
-            long_help = "手动指定转发的 X11 Display 编号，对应远程端口 6000+N。指定后自动禁用 --auto"
+            help = "Specify display number (disables auto-assign)",
+            long_help = "Manually specify the X11 display number to forward, maps to remote port 6000+N. Disables --auto"
         )]
         display: Option<u16>,
 
         #[arg(
             long,
             hide = true,
-            help = "自动分配 Display 编号 (默认启用)",
+            help = "Auto-assign display number (enabled by default)",
         )]
         auto: Option<bool>,
     },
 
     #[command(
-        about = "通过 SSH 隧道连接",
-        long_about = "自动建立 SSH 端口转发连接远程中继服务器，数据全程加密。
-无需在远程服务器开放额外端口，推荐用于公网环境。
+        about = "Connect via SSH tunnel",
+        long_about = "Automatically create an SSH tunnel to connect to the remote relay server. All data is encrypted end-to-end.
+No extra ports need to be opened on the remote server. Recommended for public networks.
 
-远程服务器仍需先运行 rx11 server。
-默认自动分配 Display 编号，也可手动指定。
+The remote server still needs to run rx11 server first.
+Display number is auto-assigned by default, or can be specified manually.
 
-示例:
+Examples:
   rx11 ssh -H 192.168.1.100 -u root -t my-secret-token
   rx11 ssh -H server -u user -i ~/.ssh/id_rsa -t $TOKEN -d 1",
-        after_help = "默认值:
+        after_help = "Defaults:
   --port        22
   --relay-port  7000
   --x11         127.0.0.1:6000
-  --auto        true (自动分配 Display 编号)
+  --auto        true (auto-assign display number)
 
-Token 也可通过 RX11_TOKEN 环境变量提供",
+Token can also be provided via RX11_TOKEN environment variable",
         next_line_help = true,
         display_order = 2,
     )]
     Ssh {
         #[arg(
             short = 'H', long,
-            help = "远程服务器地址",
-            long_help = "远程服务器主机名或 IP 地址 (必填)"
+            help = "Remote server address",
+            long_help = "Remote server hostname or IP address (required)"
         )]
         host: Option<String>,
 
         #[arg(
             short = 'P', long,
-            help = "SSH 端口",
-            long_help = "远程服务器 SSH 端口"
+            help = "SSH port",
+            long_help = "Remote server SSH port"
         )]
         port: Option<u16>,
 
         #[arg(
             short = 'u', long,
-            help = "SSH 用户名",
-            long_help = "SSH 登录用户名，不指定则使用 SSH 默认配置"
+            help = "SSH username",
+            long_help = "SSH login username. Uses SSH default config if omitted"
         )]
         user: Option<String>,
 
         #[arg(
             short = 'i', long,
-            help = "SSH 私钥文件路径",
-            long_help = "SSH 认证使用的私钥文件，如 ~/.ssh/id_rsa"
+            help = "SSH private key path",
+            long_help = "Private key file for SSH authentication, e.g. ~/.ssh/id_rsa"
         )]
         identity: Option<String>,
 
         #[arg(
             short = 't', long, env = "RX11_TOKEN",
-            help = "认证 Token",
-            long_help = "与远程服务器一致的认证 Token。也可通过 RX11_TOKEN 环境变量提供"
+            help = "Auth token",
+            long_help = "Authentication token matching the remote server. Can also be provided via RX11_TOKEN environment variable"
         )]
         token: Option<String>,
 
         #[arg(
             short, long = "relay-port",
-            help = "远程中继端口",
-            long_help = "远程服务器上 rx11 server 的中继监听端口"
+            help = "Remote relay port",
+            long_help = "Relay listen port of rx11 server on the remote host"
         )]
         relay_port: Option<u16>,
 
         #[arg(
             short, long,
-            help = "本地 X Server 地址",
-            long_help = "本地 X Server 监听地址，默认 127.0.0.1:6000 (即 Display :0)"
+            help = "Local X Server address",
+            long_help = "Local X Server listen address, default 127.0.0.1:6000 (i.e. Display :0)"
         )]
         x11: Option<String>,
 
         #[arg(
             short = 'd', long,
-            help = "指定 Display 编号 (禁用自动分配)",
-            long_help = "手动指定转发的 X11 Display 编号，对应远程端口 6000+N。指定后自动禁用 --auto"
+            help = "Specify display number (disables auto-assign)",
+            long_help = "Manually specify the X11 display number to forward, maps to remote port 6000+N. Disables --auto"
         )]
         display: Option<u16>,
 
         #[arg(
             long,
             hide = true,
-            help = "自动分配 Display 编号 (默认启用)",
+            help = "Auto-assign display number (enabled by default)",
         )]
         auto: Option<bool>,
     },
 
     #[command(
-        about = "生成认证 Token",
-        long_about = "生成一个随机 256-bit Token，用于 rx11 server 和 rx11 client 之间的认证。
+        about = "Generate auth token",
+        long_about = "Generate a random 256-bit token for authentication between rx11 server and rx11 client.
 
-示例:
+Examples:
   TOKEN=$(rx11 gen-token)
-  rx11 server -t $TOKEN &  # 远程
-  rx11 client -r server:7000 -t $TOKEN  # 本地",
+  rx11 server -t $TOKEN &  # remote
+  rx11 client -r server:7000 -t $TOKEN  # local",
         display_order = 3,
     )]
     GenToken,
 
     #[command(
-        about = "运行 GUI 程序",
-        long_about = "自动设置 DISPLAY 环境变量并执行指定命令，省去每次手动 export DISPLAY。
+        about = "Run a GUI program",
+        long_about = "Automatically set the DISPLAY environment variable and execute the specified command, so you don't need to manually export DISPLAY each time.
 
-示例:
+Examples:
   rx11 run xclock
   rx11 run -d 1 firefox
   rx11 run -- gedit /etc/hosts",
@@ -328,33 +328,33 @@ Token 也可通过 RX11_TOKEN 环境变量提供",
     Run {
         #[arg(
             short, long,
-            help = "X11 Display 编号",
-            long_help = "设置的 DISPLAY 环境变量值，默认 0 (即 DISPLAY=:0)"
+            help = "X11 display number",
+            long_help = "DISPLAY environment variable value to set, default 0 (i.e. DISPLAY=:0)"
         )]
         display: u16,
 
         #[arg(
             trailing_var_arg = true,
             required = true,
-            help = "要运行的命令及其参数",
-            long_help = "要运行的命令及参数，使用 -- 与 rx11 参数分隔
+            help = "Command and arguments to run",
+            long_help = "Command and arguments to run. Use -- to separate from rx11 args
 
-示例: rx11 run -- gedit /etc/hosts"
+Example: rx11 run -- gedit /etc/hosts"
         )]
         command: Vec<String>,
     },
 
     #[command(
-        about = "配置管理",
-        long_about = "管理 rx11 配置文件。
+        about = "Configuration management",
+        long_about = "Manage rx11 configuration file.
 
-配置文件路径: ~/.config/rx11/config.toml
+Config file path: ~/.config/rx11/config.toml
 
-配置优先级: 命令行参数 > 环境变量 > 配置文件 > 默认值
+Priority: command-line args > environment variables > config file > defaults
 
-示例:
-  rx11 config init    # 生成默认配置文件
-  rx11 config path    # 显示配置文件路径",
+Examples:
+  rx11 config init    # generate default config file
+  rx11 config path    # show config file path",
         subcommand_required = true,
         display_order = 5,
     )]
@@ -366,9 +366,9 @@ Token 也可通过 RX11_TOKEN 环境变量提供",
 
 #[derive(Subcommand)]
 enum ConfigAction {
-    #[command(about = "生成默认配置文件")]
+    #[command(about = "Generate default config file")]
     Init,
-    #[command(about = "显示配置文件路径")]
+    #[command(about = "Show config file path")]
     Path,
 }
 
@@ -396,8 +396,8 @@ async fn main() -> anyhow::Result<()> {
             let x11_port = x11_port.or(sc.x11_port).unwrap_or(rx11_core::protocol::DEFAULT_X11_PORT);
             let token = token.or(sc.token).unwrap_or_else(|| {
                 let t = rx11_core::auth::generate_token();
-                eprintln!("生成 Token: {}", t);
-                eprintln!("请保存此 Token，客户端连接时需要使用");
+                eprintln!("Generated token: {}", t);
+                eprintln!("Save this token, it is required for client connections");
                 t
             });
 
@@ -415,13 +415,13 @@ async fn main() -> anyhow::Result<()> {
             let cc = config.client.unwrap_or_default();
 
             let relay = relay.or(cc.relay).ok_or_else(|| {
-                anyhow::anyhow!("缺少中继服务器地址，请使用 --relay 参数或配置文件指定")
+                anyhow::anyhow!("Missing relay server address. Use --relay or set it in config file")
             })?;
             let x11 = x11.or(cc.x11).unwrap_or_else(|| "127.0.0.1:6000".to_string());
 
             let token = token.or(cc.token);
             let token = token.ok_or_else(|| {
-                anyhow::anyhow!("缺少认证 Token，请使用 --token 参数、RX11_TOKEN 环境变量或配置文件指定")
+                anyhow::anyhow!("Missing auth token. Use --token, RX11_TOKEN env var, or set it in config file")
             })?;
 
             let auto_display = auto.unwrap_or(true) && display.is_none() && cc.display.is_none();
@@ -448,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
 
             let host = host.or(sc.host);
             let host = host.ok_or_else(|| {
-                anyhow::anyhow!("缺少远程服务器地址，请使用 --host 参数或配置文件指定")
+                anyhow::anyhow!("Missing remote server address. Use --host or set it in config file")
             })?;
 
             let port = port.or(sc.port).unwrap_or(22);
@@ -459,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
 
             let token = token.or(sc.token);
             let token = token.ok_or_else(|| {
-                anyhow::anyhow!("缺少认证 Token，请使用 --token 参数、RX11_TOKEN 环境变量或配置文件指定")
+                anyhow::anyhow!("Missing auth token. Use --token, RX11_TOKEN env var, or set it in config file")
             })?;
 
             let user = user.or(sc.user);
