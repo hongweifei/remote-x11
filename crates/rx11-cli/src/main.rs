@@ -14,7 +14,6 @@ struct ClientConfig {
     relay: Option<String>,
     token: Option<String>,
     x11: Option<String>,
-    #[allow(dead_code)]
     display: Option<u16>,
 }
 
@@ -37,13 +36,19 @@ struct SshConfig {
     display: Option<u16>,
 }
 
-fn load_config() -> Config {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    let config_path = Some(std::path::PathBuf::from(home).join(".config").join("rx11").join("config.toml"));
+fn config_home() -> Option<std::path::PathBuf> {
+    std::env::var("HOME")
+        .ok()
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from))
+}
 
-    if let Some(path) = config_path {
+fn config_path() -> Option<std::path::PathBuf> {
+    config_home().map(|h| h.join(".config").join("rx11").join("config.toml"))
+}
+
+fn load_config() -> Config {
+    if let Some(path) = config_path() {
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match toml::from_str::<Config>(&content) {
@@ -53,6 +58,7 @@ fn load_config() -> Config {
                     }
                     Err(e) => {
                         warn!("Failed to parse config file {}: {}", path.display(), e);
+                        eprintln!("WARNING: Failed to parse config file {}: {}. Using default config.", path.display(), e);
                     }
                 },
                 Err(e) => {
@@ -62,13 +68,6 @@ fn load_config() -> Config {
         }
     }
     Config::default()
-}
-
-fn config_path() -> Option<std::path::PathBuf> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_else(|_| ".".to_string());
-    Some(std::path::PathBuf::from(home).join(".config").join("rx11").join("config.toml"))
 }
 
 async fn detect_x11_server(addr: &str) {
@@ -416,13 +415,13 @@ async fn main() -> anyhow::Result<()> {
             let cc = config.client.unwrap_or_default();
 
             let relay = relay.or(cc.relay).ok_or_else(|| {
-                anyhow::anyhow!("Relay address is required. Use --relay or config file")
+                anyhow::anyhow!("缺少中继服务器地址，请使用 --relay 参数或配置文件指定")
             })?;
             let x11 = x11.or(cc.x11).unwrap_or_else(|| "127.0.0.1:6000".to_string());
 
             let token = token.or(cc.token);
             let token = token.ok_or_else(|| {
-                anyhow::anyhow!("Token is required. Use --token, RX11_TOKEN env, or config file")
+                anyhow::anyhow!("缺少认证 Token，请使用 --token 参数、RX11_TOKEN 环境变量或配置文件指定")
             })?;
 
             let auto_display = auto.unwrap_or(true) && display.is_none() && cc.display.is_none();
@@ -449,7 +448,7 @@ async fn main() -> anyhow::Result<()> {
 
             let host = host.or(sc.host);
             let host = host.ok_or_else(|| {
-                anyhow::anyhow!("SSH host is required. Use --host or config file")
+                anyhow::anyhow!("缺少远程服务器地址，请使用 --host 参数或配置文件指定")
             })?;
 
             let port = port.or(sc.port).unwrap_or(22);
@@ -460,7 +459,7 @@ async fn main() -> anyhow::Result<()> {
 
             let token = token.or(sc.token);
             let token = token.ok_or_else(|| {
-                anyhow::anyhow!("Token is required. Use --token, RX11_TOKEN env, or config file")
+                anyhow::anyhow!("缺少认证 Token，请使用 --token 参数、RX11_TOKEN 环境变量或配置文件指定")
             })?;
 
             let user = user.or(sc.user);
@@ -476,13 +475,14 @@ async fn main() -> anyhow::Result<()> {
                 17000u16.saturating_add(display_for_port)
             };
 
-            let local_bind_addr = format!("127.0.0.1:{}", local_bind_port);
-
-            if !auto_display && tokio::net::TcpStream::connect(&local_bind_addr).await.is_ok() {
-                anyhow::bail!(
-                    "Port {} is already in use. Another rx11 ssh instance may be running, or use a different display (-d) to pick another port",
-                    local_bind_port
-                );
+            if !auto_display {
+                let check_addr = format!("127.0.0.1:{}", local_bind_port);
+                if tokio::net::TcpStream::connect(&check_addr).await.is_ok() {
+                    anyhow::bail!(
+                        "Port {} is already in use. Another rx11 ssh instance may be running, or use a different display (-d) to pick another port",
+                        local_bind_port
+                    );
+                }
             }
 
             let mut ssh_child = rx11_client::ssh::SshClient::create_forward_tunnel(
@@ -503,10 +503,9 @@ async fn main() -> anyhow::Result<()> {
 
             detect_x11_server(&x11).await;
 
-            let relay_addr = format!("127.0.0.1:{}", local_bind_port);
             let connector =
                 rx11_client::connector::LocalConnector::new(
-                    relay_addr, token, x11, display, auto_display,
+                    local_addr, token, x11, display, auto_display,
                 );
 
             tokio::select! {
@@ -539,10 +538,9 @@ async fn main() -> anyhow::Result<()> {
             let result = tokio::select! {
                 status = child.wait() => status,
                 _ = tokio::signal::ctrl_c() => {
-                    info!("Forwarding SIGINT to child process...");
+                    info!("Received Ctrl+C, waiting for child process to exit...");
                     #[cfg(unix)]
                     {
-                        use std::os::unix::process::ExitStatusExt;
                         if let Some(id) = child.id() {
                             let _ = unsafe { libc::kill(id as libc::pid_t, libc::SIGTERM) };
                         }
@@ -561,8 +559,13 @@ async fn main() -> anyhow::Result<()> {
                     #[cfg(windows)]
                     {
                         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        child.kill().await?;
-                        child.wait().await
+                        match child.try_wait()? {
+                            Some(status) => Ok(status),
+                            None => {
+                                child.kill().await?;
+                                child.wait().await
+                            }
+                        }
                     }
                 }
             }?;
@@ -573,7 +576,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { action } => match action {
             ConfigAction::Init => {
-                let cfg_path = config_path().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+                let cfg_path = config_path().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory (HOME/USERPROFILE not set)"))?;
 
                 if cfg_path.exists() {
                     anyhow::bail!("Config file already exists at {}", cfg_path.display());
@@ -608,7 +611,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("Config file created at {}", cfg_path.display());
             }
             ConfigAction::Path => {
-                let cfg_path = config_path().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory"))?;
+                let cfg_path = config_path().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory (HOME/USERPROFILE not set)"))?;
                 println!("{}", cfg_path.display());
             }
         },
