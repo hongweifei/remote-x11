@@ -9,6 +9,7 @@ use tracing::{info, warn};
 use crate::x11_listener::X11Listener;
 
 const SESSION_GRACE_PERIOD_SECS: u64 = 60;
+const MAX_X11_CONNECTIONS_PER_DISPLAY: usize = 64;
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -207,7 +208,7 @@ impl SessionManager {
                     flag.store(true, Ordering::Relaxed);
                 }
 
-                info!(
+                warn!(
                     "Session {} resumed for display :{} (old client: {}, new client: {})",
                     session_id, session.display, old_client_id, new_client_id
                 );
@@ -217,6 +218,22 @@ impl SessionManager {
                 "Session {} not found or expired",
                 session_id
             ))),
+        }
+    }
+
+    pub async fn owns_session(&self, disp: u16, client_id: &str) -> bool {
+        let sessions = self.sessions.read().await;
+        sessions
+            .get(&disp)
+            .map(|s| s.client_id == client_id)
+            .unwrap_or(false)
+    }
+
+    pub async fn owns_connection(&self, conn_id: u32, client_id: &str) -> bool {
+        let disp = self.conn_display_map.lock().await.get(&conn_id).copied();
+        match disp {
+            Some(d) => self.owns_session(d, client_id).await,
+            None => false,
         }
     }
 
@@ -245,7 +262,9 @@ impl SessionManager {
         {
             let mut tasks = self.grace_tasks.lock().await;
             for (disp, _) in &to_release {
-                tasks.insert(*disp, cancelled.clone());
+                if let Some(old_flag) = tasks.insert(*disp, cancelled.clone()) {
+                    old_flag.store(true, Ordering::Relaxed);
+                }
             }
         }
 
@@ -283,6 +302,10 @@ impl SessionManager {
             flag.store(true, Ordering::Relaxed);
         }
 
+        if let Some(listener) = self.x11_listener.read().await.as_ref() {
+            listener.unbind_display(disp).await;
+        }
+
         let conn_ids: Option<HashSet<u32>> = self.display_conns.lock().await.remove(&disp);
         if let Some(ids) = conn_ids {
             let mut relay_to_conn = self.relay_to_conn.lock().await;
@@ -293,9 +316,6 @@ impl SessionManager {
             }
         }
 
-        if let Some(listener) = self.x11_listener.read().await.as_ref() {
-            listener.unbind_display(disp).await;
-        }
         xauth_remove(disp).await;
 
         self.conn_to_relay.write().await.remove(&disp);
@@ -314,10 +334,21 @@ impl SessionManager {
         self.conn_to_relay.read().await.get(&disp).cloned()
     }
 
-    pub async fn register_x11_connection(&self, conn_id: u32, disp: u16, sender: mpsc::Sender<X11RelayToConn>) {
+    pub async fn register_x11_connection(&self, conn_id: u32, disp: u16, sender: mpsc::Sender<X11RelayToConn>) -> rx11_core::error::Result<()> {
+        {
+            let display_conns = self.display_conns.lock().await;
+            let count = display_conns.get(&disp).map(|s| s.len()).unwrap_or(0);
+            if count >= MAX_X11_CONNECTIONS_PER_DISPLAY {
+                return Err(rx11_core::error::Rx11Error::Protocol(format!(
+                    "Too many X11 connections for display :{} (max {})",
+                    disp, MAX_X11_CONNECTIONS_PER_DISPLAY
+                )));
+            }
+        }
         self.relay_to_conn.lock().await.insert(conn_id, sender);
         self.display_conns.lock().await.entry(disp).or_default().insert(conn_id);
         self.conn_display_map.lock().await.insert(conn_id, disp);
+        Ok(())
     }
 
     pub async fn unregister_x11_connection(&self, conn_id: u32) {
