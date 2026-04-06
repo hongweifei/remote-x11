@@ -300,7 +300,7 @@ async fn handle_client(
                                 Err(e) => {
                                     let err_msg = format!("{}", e);
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
-                                        display: 0,
+                                        display: u16::MAX,
                                         success: false,
                                         error_msg: Some(err_msg),
                                         session_id: None,
@@ -349,18 +349,33 @@ async fn handle_client(
                         }
                         Ok(Frame::SessionDestroy(msg)) => {
                             let disp = msg.display;
+                            if !session_mgr.owns_session(disp, &tid).await {
+                                warn!("Client {} tried to destroy unowned session for display :{}", tid, disp);
+                                continue;
+                            }
                             session_mgr.unregister_x11_relay(disp).await;
                             session_mgr.destroy_session(disp).await;
                             info!("Session destroyed for display :{}", disp);
                             eprintln!("[rx11] 会话已销毁: DISPLAY=:{}", disp);
                         }
                         Ok(Frame::DataX11(msg)) => {
+                            if !session_mgr.owns_connection(msg.connection_id, &tid).await {
+                                warn!("Client {} sent data for unowned connection_id={}", tid, msg.connection_id);
+                                continue;
+                            }
                             session_mgr.send_to_x11_connection(msg.connection_id, msg.data).await;
                         }
                         Ok(Frame::CompressedDataX11 { connection_id, original_len, data }) => {
+                            if !session_mgr.owns_connection(connection_id, &tid).await {
+                                warn!("Client {} sent compressed data for unowned connection_id={}", tid, connection_id);
+                                continue;
+                            }
                             let algo = match compression_algo {
                                 Some(a) => a,
-                                None => continue,
+                                None => {
+                                    warn!("CompressedDataX11 received but no compression negotiated, dropping");
+                                    continue;
+                                }
                             };
                             match algo.decompress(&data, original_len) {
                                 Some(decompressed) if decompressed.len() == original_len => {

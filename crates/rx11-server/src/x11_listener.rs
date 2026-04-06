@@ -106,7 +106,7 @@ async fn handle_x11_connection(
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(256);
     session_mgr
         .register_x11_connection(connection_id, disp, relay_tx)
-        .await;
+        .await?;
 
     if event_tx
         .send(X11ConnToRelay::Connected {
@@ -152,10 +152,11 @@ async fn handle_x11_connection(
         while let Some(cmd) = relay_rx.recv().await {
             match cmd {
                 X11RelayToConn::Data(data) => {
-                    if write_half.write_all(&data).await.is_err() {
+                    if write_half.write_all(&data).await.is_err()
+                        || write_half.flush().await.is_err()
+                    {
                         break;
                     }
-                    let _ = write_half.flush().await;
                 }
                 X11RelayToConn::Close => break,
             }
