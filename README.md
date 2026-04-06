@@ -36,6 +36,8 @@
 - **配置文件** — 支持 TOML 配置文件，CLI 参数 > 环境变量 > 配置文件 > 默认值
 - **多 Display** — 通过 `-d` 参数同时运行多个独立的 GUI 会话
 - **Display 自动分配** — 默认由服务端自动分配可用的 Display 编号，需要时可手动指定
+- **数据压缩** — 支持 zstd/lz4/zlib 三种算法，自动协商，超过 64 字节的数据自动压缩，压缩后更大则回退
+- **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
 - **SSH 端口冲突检测** — 启动 SSH 隧道前自动检测本地端口是否被占用
 
 ## 快速开始
@@ -329,6 +331,7 @@ rx11 使用自定义二进制帧协议，每帧结构：
 | SessionResume | 0x13 | 恢复已有的会话 |
 | SessionAutoCreate | 0x14 | 自动分配 Display 并创建会话 |
 | DataX11 | 0x20 | X11 数据帧（二进制，非 JSON） |
+| CompressedDataX11 | 0x21 | 压缩的 X11 数据帧 |
 | X11Connect | 0x22 | X11 应用连接通知 |
 | X11Disconnect | 0x23 | X11 应用断开通知 |
 | Heartbeat | 0x30 | 心跳（双向） |
@@ -338,11 +341,21 @@ rx11 使用自定义二进制帧协议，每帧结构：
 控制帧的 Payload 使用 JSON 编码。X11 数据帧使用二进制编码：
 
 ```
-┌──────────┬───────────────┬─────────────────┐
-│ Display  │ Connection ID │ X11 Data        │
-│ 2 bytes  │ 4 bytes       │ remaining bytes │
-│ (BE u16) │ (BE u32)      │                 │
-└──────────┴───────────────┴─────────────────┘
+┌───────────────┬─────────────────┐
+│ Connection ID │ X11 Data        │
+│ 4 bytes       │ remaining bytes │
+│ (BE u32)      │                 │
+└───────────────┴─────────────────┘
+```
+
+CompressedDataX11 帧格式：
+
+```
+┌───────────────┬──────────────┬─────────────────┐
+│ Connection ID │ Original Len │ Compressed Data │
+│ 4 bytes       │ 4 bytes      │ remaining bytes │
+│ (BE u32)      │ (BE u32)     │                 │
+└───────────────┴──────────────┴─────────────────┘
 ```
 
 `X11Connect` / `X11Disconnect` 帧携带 `{display, connection_id}`，用于通知对端 X11 应用的连接与断开。多连接通过 `connection_id` 实现多路复用。
@@ -373,9 +386,10 @@ remote-x11/
 └── crates/
     ├── rx11-core/              # 核心库：协议定义、传输层、认证、统计
     │   └── src/
-    │       ├── protocol.rs     # 帧编解码、消息类型定义
-    │       ├── transport.rs    # 异步传输层（支持 split 读写分离）
-    │       ├── auth.rs         # Token 生成与验证（常量时间比较）
+     │       ├── protocol.rs     # 帧编解码、消息类型定义
+     │       ├── transport.rs    # 异步传输层（帧同步恢复、缓冲区限制）
+     │       ├── compress.rs     # 数据压缩（zstd/lz4/zlib 协商与编解码）
+     │       ├── auth.rs         # Token 生成与验证（常量时间比较、空 token 拒绝）
     │       ├── stats.rs        # 连接统计（字节数、帧数、活跃连接等）
     │       └── error.rs        # 错误类型（支持可重试判断）
     ├── rx11-server/            # 远程端：中继服务器 + X11 监听
@@ -437,6 +451,10 @@ RUST_LOG=rx11=debug rx11 client -r server:7000 -t <TOKEN>
 - TCP 直连模式下建议配合防火墙限制 7000 端口的访问来源
 - Ctrl+C 退出时自动发送 `SessionDestroy` 清理远程会话
 - Token 验证使用常量时间比较，防止时序攻击
+- 会话和连接归属权限校验，防止跨会话数据注入
+- auth 数据长度限制（auth_name 256B / auth_data 4KB）
+- 解压输出大小验证，防止 zip bomb 攻击
+- 帧解析支持同步恢复，防止畸形数据导致连接不可用
 
 ---
 
