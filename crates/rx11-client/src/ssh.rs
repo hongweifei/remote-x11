@@ -4,13 +4,13 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::process::Command;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use tracing::{info, warn};
 
 use rx11_core::config::SshDefaults;
 
 pub struct SshTunnel {
-    child: tokio::process::Child,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
     local_addr: String,
     cancel: Arc<Notify>,
     health_task: tokio::task::JoinHandle<()>,
@@ -39,13 +39,15 @@ impl SshTunnel {
         let cancel = Arc::new(Notify::new());
         let cancel_clone = cancel.clone();
         let local_addr_clone = local_addr.clone();
+        let child_ref = Arc::new(Mutex::new(Some(child)));
 
+        let health_child = child_ref.clone();
         let health_task = tokio::spawn(async move {
-            health_check_loop(&local_addr_clone, cancel_clone).await;
+            health_check_loop(&local_addr_clone, cancel_clone, health_child).await;
         });
 
         Ok(Self {
-            child,
+            child: child_ref,
             local_addr,
             cancel,
             health_task,
@@ -53,13 +55,22 @@ impl SshTunnel {
     }
 
     pub async fn wait(&mut self) -> anyhow::Result<std::process::ExitStatus> {
-        self.child.wait().await.map_err(Into::into)
+        let mut child = self.child.lock().await;
+        match child.as_mut() {
+            Some(c) => c.wait().await.map_err(Into::into),
+            None => Err(anyhow::anyhow!("SSH tunnel already killed")),
+        }
     }
 
     pub async fn kill(&mut self) -> anyhow::Result<()> {
         self.cancel.notify_one();
         self.health_task.abort();
-        self.child.kill().await.map_err(Into::into)
+        let mut child = self.child.lock().await;
+        if let Some(mut c) = child.take() {
+            c.kill().await?;
+            let _ = c.wait().await;
+        }
+        Ok(())
     }
 
     pub fn local_addr(&self) -> &str {
@@ -67,7 +78,11 @@ impl SshTunnel {
     }
 }
 
-async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
+async fn health_check_loop(
+    local_addr: &str,
+    cancel: Arc<Notify>,
+    child: Arc<Mutex<Option<tokio::process::Child>>>,
+) {
     let mut interval = tokio::time::interval(SshDefaults::HEALTH_CHECK_INTERVAL);
     interval.tick().await;
 
@@ -77,7 +92,18 @@ async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
         tokio::select! {
             _ = cancel.notified() => break,
             _ = interval.tick() => {
-                let healthy = check_tunnel_health(local_addr).await;
+                let process_alive = {
+                    let mut guard = child.lock().await;
+                    match guard.as_mut() {
+                        Some(c) => c.try_wait().ok().flatten().is_none(),
+                        None => false,
+                    }
+                };
+
+                let port_alive = check_tunnel_port(local_addr).await;
+
+                let healthy = process_alive && port_alive;
+
                 if healthy {
                     if consecutive_failures > 0 {
                         info!("SSH tunnel health check recovered");
@@ -85,10 +111,17 @@ async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
                     consecutive_failures = 0;
                 } else {
                     consecutive_failures += 1;
-                    warn!(
-                        "SSH tunnel health check failed ({}/{})",
-                        consecutive_failures, SshDefaults::MAX_CONSECUTIVE_FAILURES
-                    );
+                    if !process_alive {
+                        warn!(
+                            "SSH process exited (port_alive={}) ({}/{})",
+                            port_alive, consecutive_failures, SshDefaults::MAX_CONSECUTIVE_FAILURES
+                        );
+                    } else {
+                        warn!(
+                            "SSH tunnel health check failed ({}/{})",
+                            consecutive_failures, SshDefaults::MAX_CONSECUTIVE_FAILURES
+                        );
+                    }
                     if consecutive_failures >= SshDefaults::MAX_CONSECUTIVE_FAILURES {
                         warn!(
                             "SSH tunnel health check failed {} consecutive times, tunnel appears dead",
@@ -102,7 +135,7 @@ async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
     }
 }
 
-async fn check_tunnel_health(addr: &str) -> bool {
+async fn check_tunnel_port(addr: &str) -> bool {
     let result = tokio::time::timeout(
         SshDefaults::HEALTH_CHECK_TIMEOUT,
         async {
@@ -185,7 +218,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_check_tunnel_health_unreachable() {
-        assert!(!check_tunnel_health("127.0.0.1:1").await);
+        assert!(!check_tunnel_port("127.0.0.1:1").await);
     }
 
     #[tokio::test]
@@ -202,7 +235,7 @@ mod tests {
             }
         });
 
-        assert!(check_tunnel_health(&format!("127.0.0.1:{}", port)).await);
+        assert!(check_tunnel_port(&format!("127.0.0.1:{}", port)).await);
         listener_task.abort();
     }
 }
