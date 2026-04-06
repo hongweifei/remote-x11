@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use rand::RngExt;
@@ -13,10 +14,12 @@ use rx11_core::protocol::*;
 use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::Rx11Transport;
 
-type X11ConnMap = HashMap<u32, (tokio::sync::mpsc::Sender<Vec<u8>>, JoinHandle<()>)>;
+type X11ConnMap = HashMap<u32, (tokio::sync::mpsc::Sender<bytes::Bytes>, JoinHandle<()>)>;
 type SharedX11Conns = Arc<Mutex<X11ConnMap>>;
 
 const CLIENT_READ_TIMEOUT_SECS: u64 = 100;
+const INITIAL_BUF_SIZE: usize = 64 * 1024;
+const MAX_BUF_SIZE: usize = 256 * 1024;
 
 pub struct LocalConnector {
     relay_addr: String,
@@ -245,8 +248,9 @@ impl LocalConnector {
 
         let x11_connections: SharedX11Conns = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(ConnectionStats::new());
+        let seq_counter = Arc::new(AtomicU32::new(1));
 
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Frame>(256);
+        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Frame>(512);
 
         let stats_clone = stats.clone();
         let stats_task = tokio::spawn(async move {
@@ -291,41 +295,44 @@ impl LocalConnector {
                                         let (mut local_read, mut local_write) = tokio::io::split(local_stream);
 
                                         let (write_tx, mut write_rx) =
-                                            tokio::sync::mpsc::channel::<Vec<u8>>(256);
+                                            tokio::sync::mpsc::channel::<bytes::Bytes>(512);
 
                                         let outbound = outbound_tx.clone();
                                         let stats_clone = stats.clone();
                                         let x11_conns_clone = x11_connections.clone();
                                         let compress = compression_algo;
+                                        let seq = seq_counter.clone();
 
                                         let handle = tokio::spawn(async move {
-                                            let mut buf = vec![0u8; 65536];
+                                            let mut buf = vec![0u8; INITIAL_BUF_SIZE];
                                             loop {
                                                 tokio::select! {
                                                     result = local_read.read(&mut buf) => {
                                                         match result {
                                                             Ok(0) => break,
                                                             Ok(n) => {
-                                                                let data = buf[..n].to_vec();
+                                                                let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                                                                let seq_id = seq.fetch_add(1, Ordering::Relaxed);
                                                                 let frame = if let Some(algo) = compress {
-                                                                    if let Some(compressed) = algo.compress(&data) {
+                                                                    if let Some(compressed) = algo.compress_to_bytes(&data) {
                                                                         stats_clone.add_compression_saved((data.len() - compressed.len()) as u64);
                                                                         Frame::CompressedDataX11 {
                                                                             connection_id: conn_id,
+                                                                            sequence_id: seq_id,
                                                                             original_len: data.len(),
                                                                             data: compressed,
                                                                         }
                                                                     } else {
                                                                         Frame::DataX11(X11DataMessage {
-                                                                            display: 0,
                                                                             connection_id: conn_id,
+                                                                            sequence_id: seq_id,
                                                                             data,
                                                                         })
                                                                     }
                                                                 } else {
                                                                     Frame::DataX11(X11DataMessage {
-                                                                        display: 0,
                                                                         connection_id: conn_id,
+                                                                        sequence_id: seq_id,
                                                                         data,
                                                                     })
                                                                 };
@@ -333,6 +340,10 @@ impl LocalConnector {
                                                                     break;
                                                                 }
                                                                 stats_clone.add_bytes_sent(n as u64);
+                                                                if buf.len() < MAX_BUF_SIZE {
+                                                                    let new_size = (buf.len() * 2).min(MAX_BUF_SIZE);
+                                                                    buf.resize(new_size, 0);
+                                                                }
                                                             }
                                                             Err(e) => {
                                                                 debug!("Read error from local X Server (connection_id={}): {}", conn_id, e);
@@ -400,7 +411,7 @@ impl LocalConnector {
                                             x11_connections.lock().await.remove(&conn_id);
                                         }
                                     }
-                                    Frame::CompressedDataX11 { connection_id, original_len, data } => {
+                                    Frame::CompressedDataX11 { connection_id, sequence_id: _, original_len, data } => {
                                         let conn_id = connection_id;
                                         let algo = match compression_algo {
                                             Some(a) => a,
@@ -421,7 +432,7 @@ impl LocalConnector {
                                         };
 
                                         if let Some(tx) = tx {
-                                            if tx.send(decompressed).await.is_err() {
+                                            if tx.send(bytes::Bytes::from(decompressed)).await.is_err() {
                                                 debug!("Local X11 connection gone for connection_id={}", conn_id);
                                                 x11_connections.lock().await.remove(&conn_id);
                                             }
@@ -448,6 +459,9 @@ impl LocalConnector {
                                               Frame::Error(msg) => {
                                                   error!("Error from relay (code={}): {}", msg.code, msg.message);
                                                   break;
+                                              }
+                                              Frame::FlowControl(msg) => {
+                                                  debug!("FlowControl from relay: action={:?} conn={:?}", msg.action, msg.connection_id);
                                               }
                                               _ => {
                                                  warn!("Unexpected frame from relay: {:?}", frame.msg_type());
