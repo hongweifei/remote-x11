@@ -204,10 +204,10 @@ async fn handle_client(
     let tid = transport_id.clone();
 
     let (x11_event_tx, mut x11_event_rx) =
-        tokio::sync::mpsc::channel::<X11ConnToRelay>(256);
+        tokio::sync::mpsc::channel::<X11ConnToRelay>(512);
 
     let (outbound_tx, mut outbound_rx) =
-        tokio::sync::mpsc::channel::<Frame>(256);
+        tokio::sync::mpsc::channel::<Frame>(512);
 
     let outbound_tx_clone = outbound_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
@@ -363,9 +363,9 @@ async fn handle_client(
                                 warn!("Client {} sent data for unowned connection_id={}", tid, msg.connection_id);
                                 continue;
                             }
-                            session_mgr.send_to_x11_connection(msg.connection_id, msg.data).await;
+                            session_mgr.send_to_x11_connection(msg.connection_id, msg.data.to_vec()).await;
                         }
-                        Ok(Frame::CompressedDataX11 { connection_id, original_len, data }) => {
+                        Ok(Frame::CompressedDataX11 { connection_id, sequence_id: _, original_len, data }) => {
                             if !session_mgr.owns_connection(connection_id, &tid).await {
                                 warn!("Client {} sent compressed data for unowned connection_id={}", tid, connection_id);
                                 continue;
@@ -390,6 +390,17 @@ async fn handle_client(
                             heartbeat_deadline = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(SERVER_HEARTBEAT_TIMEOUT_SECS);
                         }
+                        Ok(Frame::FlowControl(msg)) => {
+                            let target_conn = msg.connection_id;
+                            match msg.action {
+                                FlowControlAction::Pause => {
+                                    warn!("Client {} requests pause for connection {:?}", tid, target_conn);
+                                }
+                                FlowControlAction::Resume => {
+                                    warn!("Client {} requests resume for connection {:?}", tid, target_conn);
+                                }
+                            }
+                        }
                         Ok(frame) => {
                             warn!("Unexpected frame from client {}: {:?}", tid, frame.msg_type());
                         }
@@ -413,25 +424,26 @@ async fn handle_client(
                                 break;
                             }
                         }
-                        Some(X11ConnToRelay::Data { display, connection_id, data }) => {
+                        Some(X11ConnToRelay::Data { display: _, connection_id, data }) => {
                             let frame = if let Some(algo) = compression_algo {
-                                if let Some(compressed) = algo.compress(&data) {
+                                if let Some(compressed) = algo.compress_to_bytes(&data) {
                                     Frame::CompressedDataX11 {
                                         connection_id,
+                                        sequence_id: 0,
                                         original_len: data.len(),
                                         data: compressed,
                                     }
                                 } else {
                                     Frame::DataX11(X11DataMessage {
-                                        display,
                                         connection_id,
+                                        sequence_id: 0,
                                         data,
                                     })
                                 }
                             } else {
                                 Frame::DataX11(X11DataMessage {
-                                    display,
                                     connection_id,
+                                    sequence_id: 0,
                                     data,
                                 })
                             };

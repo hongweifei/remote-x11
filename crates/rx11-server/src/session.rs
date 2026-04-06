@@ -22,13 +22,18 @@ pub struct Session {
 
 pub enum X11ConnToRelay {
     Connected { display: u16, connection_id: u32 },
-    Data { display: u16, connection_id: u32, data: Vec<u8> },
+    Data { display: u16, connection_id: u32, data: bytes::Bytes },
     Disconnected { display: u16, connection_id: u32 },
 }
 
 pub enum X11RelayToConn {
-    Data(Vec<u8>),
+    Data(bytes::Bytes),
     Close,
+}
+
+struct ConnState {
+    display: u16,
+    sender: mpsc::Sender<X11RelayToConn>,
 }
 
 #[derive(Clone)]
@@ -36,9 +41,8 @@ pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<u16, Session>>>,
     x11_listener: Arc<RwLock<Option<Arc<X11Listener>>>>,
     conn_to_relay: Arc<RwLock<HashMap<u16, mpsc::Sender<X11ConnToRelay>>>>,
-    relay_to_conn: Arc<Mutex<HashMap<u32, mpsc::Sender<X11RelayToConn>>>>,
+    connections: Arc<Mutex<HashMap<u32, ConnState>>>,
     display_conns: Arc<Mutex<HashMap<u16, HashSet<u32>>>>,
-    conn_display_map: Arc<Mutex<HashMap<u32, u16>>>,
     grace_tasks: Arc<Mutex<HashMap<u16, Arc<AtomicBool>>>>,
 }
 
@@ -54,9 +58,8 @@ impl SessionManager {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             x11_listener: Arc::new(RwLock::new(None)),
             conn_to_relay: Arc::new(RwLock::new(HashMap::new())),
-            relay_to_conn: Arc::new(Mutex::new(HashMap::new())),
+            connections: Arc::new(Mutex::new(HashMap::new())),
             display_conns: Arc::new(Mutex::new(HashMap::new())),
-            conn_display_map: Arc::new(Mutex::new(HashMap::new())),
             grace_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -66,7 +69,7 @@ impl SessionManager {
         *x11 = Some(listener);
     }
 
-    pub async fn create_session(
+    async fn create_session_inner(
         &self,
         disp: u16,
         auth_name: String,
@@ -118,8 +121,17 @@ impl SessionManager {
             client_id,
         };
         sessions.insert(disp, session.clone());
-
         Ok(session)
+    }
+
+    pub async fn create_session(
+        &self,
+        disp: u16,
+        auth_name: String,
+        auth_data: Vec<u8>,
+        client_id: String,
+    ) -> rx11_core::error::Result<Session> {
+        self.create_session_inner(disp, auth_name, auth_data, client_id).await
     }
 
     pub async fn create_session_auto(
@@ -136,52 +148,7 @@ impl SessionManager {
                     rx11_core::error::Rx11Error::Protocol("No available display number".into())
                 })?
         };
-        rx11_core::protocol::validate_display(disp)?;
-
-        let listener = self.x11_listener.read().await;
-        let listener_ref = listener.as_ref().ok_or_else(|| {
-            rx11_core::error::Rx11Error::Protocol("X11Listener not initialized".into())
-        })?;
-        if let Err(e) = listener_ref.bind_display(disp).await {
-            return Err(rx11_core::error::Rx11Error::Protocol(format!(
-                "Failed to bind X11 port for display :{}: {}",
-                disp, e
-            )));
-        }
-        drop(listener);
-
-        if let Err(e) = xauth_add(disp, &auth_data, &auth_name).await {
-            let listeners = self.x11_listener.read().await;
-            if let Some(ref l) = *listeners {
-                l.unbind_display(disp).await;
-            }
-            return Err(rx11_core::error::Rx11Error::Protocol(format!(
-                "xauth setup failed for display :{}: {}",
-                disp, e
-            )));
-        }
-
-        let mut sessions = self.sessions.write().await;
-        if sessions.contains_key(&disp) {
-            drop(sessions);
-            if let Some(listener) = self.x11_listener.read().await.as_ref() {
-                listener.unbind_display(disp).await;
-            }
-            self.xauth_remove_quiet(disp).await;
-            return Err(rx11_core::error::Rx11Error::Protocol(format!(
-                "Display :{} already in use",
-                disp
-            )));
-        }
-        let session = Session {
-            id: uuid::Uuid::new_v4().to_string(),
-            display: disp,
-            auth_name,
-            auth_data,
-            client_id,
-        };
-        sessions.insert(disp, session.clone());
-        Ok(session)
+        self.create_session_inner(disp, auth_name, auth_data, client_id).await
     }
 
     pub async fn try_resume_session(
@@ -230,9 +197,9 @@ impl SessionManager {
     }
 
     pub async fn owns_connection(&self, conn_id: u32, client_id: &str) -> bool {
-        let disp = self.conn_display_map.lock().await.get(&conn_id).copied();
-        match disp {
-            Some(d) => self.owns_session(d, client_id).await,
+        let conns = self.connections.lock().await;
+        match conns.get(&conn_id) {
+            Some(state) => self.owns_session(state.display, client_id).await,
             None => false,
         }
     }
@@ -308,10 +275,10 @@ impl SessionManager {
 
         let conn_ids: Option<HashSet<u32>> = self.display_conns.lock().await.remove(&disp);
         if let Some(ids) = conn_ids {
-            let mut relay_to_conn = self.relay_to_conn.lock().await;
+            let mut connections = self.connections.lock().await;
             for conn_id in ids {
-                if let Some(tx) = relay_to_conn.remove(&conn_id) {
-                    let _ = tx.send(X11RelayToConn::Close).await;
+                if let Some(state) = connections.remove(&conn_id) {
+                    let _ = state.sender.send(X11RelayToConn::Close).await;
                 }
             }
         }
@@ -334,7 +301,12 @@ impl SessionManager {
         self.conn_to_relay.read().await.get(&disp).cloned()
     }
 
-    pub async fn register_x11_connection(&self, conn_id: u32, disp: u16, sender: mpsc::Sender<X11RelayToConn>) -> rx11_core::error::Result<()> {
+    pub async fn register_x11_connection(
+        &self,
+        conn_id: u32,
+        disp: u16,
+        sender: mpsc::Sender<X11RelayToConn>,
+    ) -> rx11_core::error::Result<()> {
         {
             let display_conns = self.display_conns.lock().await;
             let count = display_conns.get(&disp).map(|s| s.len()).unwrap_or(0);
@@ -345,15 +317,25 @@ impl SessionManager {
                 )));
             }
         }
-        self.relay_to_conn.lock().await.insert(conn_id, sender);
-        self.display_conns.lock().await.entry(disp).or_default().insert(conn_id);
-        self.conn_display_map.lock().await.insert(conn_id, disp);
+        self.connections.lock().await.insert(
+            conn_id,
+            ConnState {
+                display: disp,
+                sender,
+            },
+        );
+        self.display_conns
+            .lock()
+            .await
+            .entry(disp)
+            .or_default()
+            .insert(conn_id);
         Ok(())
     }
 
     pub async fn unregister_x11_connection(&self, conn_id: u32) {
-        self.relay_to_conn.lock().await.remove(&conn_id);
-        if let Some(disp) = self.conn_display_map.lock().await.remove(&conn_id) {
+        if let Some(state) = self.connections.lock().await.remove(&conn_id) {
+            let disp = state.display;
             if let Some(set) = self.display_conns.lock().await.get_mut(&disp) {
                 set.remove(&conn_id);
             }
@@ -361,8 +343,10 @@ impl SessionManager {
     }
 
     pub async fn send_to_x11_connection(&self, conn_id: u32, data: Vec<u8>) {
-        if let Some(tx) = self.relay_to_conn.lock().await.get(&conn_id) {
-            let _ = tx.send(X11RelayToConn::Data(data)).await;
+        if let Some(state) = self.connections.lock().await.get(&conn_id) {
+            if state.sender.send(X11RelayToConn::Data(bytes::Bytes::from(data))).await.is_err() {
+                warn!("Failed to send data to x11 connection {}, channel full or closed", conn_id);
+            }
         }
     }
 

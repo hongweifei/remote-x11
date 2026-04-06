@@ -8,6 +8,9 @@ use tracing::{error, info, warn};
 
 use crate::session::{SessionManager, X11ConnToRelay, X11RelayToConn};
 
+const INITIAL_BUF_SIZE: usize = 64 * 1024;
+const MAX_BUF_SIZE: usize = 256 * 1024;
+
 static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 fn next_connection_id() -> u32 {
@@ -103,7 +106,7 @@ async fn handle_x11_connection(
         .await
         .ok_or_else(|| anyhow::anyhow!("No relay registered for display :{}", disp))?;
 
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(256);
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(512);
     session_mgr
         .register_x11_connection(connection_id, disp, relay_tx)
         .await?;
@@ -124,12 +127,12 @@ async fn handle_x11_connection(
     let event_tx_clone = event_tx.clone();
 
     let socket_to_relay = async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
         loop {
             match read_half.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
-                    let data = buf[..n].to_vec();
+                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                     if event_tx_clone
                         .send(X11ConnToRelay::Data {
                             display: disp,
@@ -140,6 +143,10 @@ async fn handle_x11_connection(
                         .is_err()
                     {
                         break;
+                    }
+                    if buf.len() < MAX_BUF_SIZE {
+                        let new_size = (buf.len() * 2).min(MAX_BUF_SIZE);
+                        buf.resize(new_size, 0);
                     }
                 }
                 Err(_) => break,
