@@ -1,6 +1,5 @@
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -8,9 +7,7 @@ use tokio::process::Command;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-const HEALTH_CHECK_INTERVAL_SECS: u64 = 10;
-const HEALTH_CHECK_TIMEOUT_SECS: u64 = 5;
-const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+use rx11_core::config::SshDefaults;
 
 pub struct SshTunnel {
     child: tokio::process::Child,
@@ -71,7 +68,7 @@ impl SshTunnel {
 }
 
 async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(HEALTH_CHECK_INTERVAL_SECS));
+    let mut interval = tokio::time::interval(SshDefaults::HEALTH_CHECK_INTERVAL);
     interval.tick().await;
 
     let mut consecutive_failures: u32 = 0;
@@ -90,12 +87,12 @@ async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
                     consecutive_failures += 1;
                     warn!(
                         "SSH tunnel health check failed ({}/{})",
-                        consecutive_failures, MAX_CONSECUTIVE_FAILURES
+                        consecutive_failures, SshDefaults::MAX_CONSECUTIVE_FAILURES
                     );
-                    if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+                    if consecutive_failures >= SshDefaults::MAX_CONSECUTIVE_FAILURES {
                         warn!(
                             "SSH tunnel health check failed {} consecutive times, tunnel appears dead",
-                            MAX_CONSECUTIVE_FAILURES
+                            SshDefaults::MAX_CONSECUTIVE_FAILURES
                         );
                         break;
                     }
@@ -107,7 +104,7 @@ async fn health_check_loop(local_addr: &str, cancel: Arc<Notify>) {
 
 async fn check_tunnel_health(addr: &str) -> bool {
     let result = tokio::time::timeout(
-        Duration::from_secs(HEALTH_CHECK_TIMEOUT_SECS),
+        SshDefaults::HEALTH_CHECK_TIMEOUT,
         async {
             let mut stream = TcpStream::connect(addr).await?;
             stream.shutdown().await?;
