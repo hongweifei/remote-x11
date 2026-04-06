@@ -1,9 +1,24 @@
 use bytes::BytesMut;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+use tracing::warn;
 
 use crate::error::Rx11Error;
-use crate::protocol::{decode_frame, encode_frame, Frame};
+use crate::protocol::{decode_frame, encode_frame, MAGIC_BYTES, MAX_FRAME_SIZE, Frame};
+
+const MAX_READ_BUF: usize = MAX_FRAME_SIZE + 256;
+
+fn scan_for_magic(data: &[u8]) -> usize {
+    if data.len() <= 4 {
+        return 0;
+    }
+    for i in 1..data.len() - 3 {
+        if data[i..i + 4] == MAGIC_BYTES {
+            return i;
+        }
+    }
+    0
+}
 
 pub struct Rx11Transport {
     read_buf: BytesMut,
@@ -32,10 +47,30 @@ impl Rx11Transport {
     pub async fn recv_frame(&mut self) -> crate::error::Result<Frame> {
         loop {
             if self.read_buf.len() >= 9 {
-                if let Some((frame, consumed)) = decode_frame(&self.read_buf)? {
-                    let _ = self.read_buf.split_to(consumed);
-                    return Ok(frame);
+                match decode_frame(&self.read_buf) {
+                    Ok(Some((frame, consumed))) => {
+                        let _ = self.read_buf.split_to(consumed);
+                        return Ok(frame);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        let skipped = scan_for_magic(&self.read_buf);
+                        if skipped == 0 {
+                            return Err(Rx11Error::Protocol(
+                                "Invalid frame and no recovery possible".into(),
+                            ));
+                        }
+                        warn!("Skipped {} bytes to resync frame boundary", skipped);
+                        let _ = self.read_buf.split_to(skipped);
+                        continue;
+                    }
                 }
+            }
+
+            if self.read_buf.len() > MAX_READ_BUF {
+                return Err(Rx11Error::Protocol(
+                    "read buffer exceeded maximum size".into(),
+                ));
             }
 
             self.read_buf.reserve(8192);
@@ -76,10 +111,30 @@ impl Rx11TransportReadHalf {
     pub async fn recv_frame(&mut self) -> crate::error::Result<Frame> {
         loop {
             if self.read_buf.len() >= 9 {
-                if let Some((frame, consumed)) = decode_frame(&self.read_buf)? {
-                    let _ = self.read_buf.split_to(consumed);
-                    return Ok(frame);
+                match decode_frame(&self.read_buf) {
+                    Ok(Some((frame, consumed))) => {
+                        let _ = self.read_buf.split_to(consumed);
+                        return Ok(frame);
+                    }
+                    Ok(None) => {}
+                    Err(_) => {
+                        let skipped = scan_for_magic(&self.read_buf);
+                        if skipped == 0 {
+                            return Err(Rx11Error::Protocol(
+                                "Invalid frame and no recovery possible".into(),
+                            ));
+                        }
+                        warn!("Skipped {} bytes to resync frame boundary", skipped);
+                        let _ = self.read_buf.split_to(skipped);
+                        continue;
+                    }
                 }
+            }
+
+            if self.read_buf.len() > MAX_READ_BUF {
+                return Err(Rx11Error::Protocol(
+                    "read buffer exceeded maximum size".into(),
+                ));
             }
 
             self.read_buf.reserve(8192);
