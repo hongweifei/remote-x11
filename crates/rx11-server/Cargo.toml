@@ -1,0 +1,12 @@
+[package]
+name = "rx11-server"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rx11-core = { path = "../rx11-core" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+hex = { workspace = true }

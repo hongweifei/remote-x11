@@ -1,0 +1,23 @@
+[package]
+name = "rx11-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rx11"
+path = "src/main.rs"
+
+[dependencies]
+rx11-core = { path = "../rx11-core" }
+rx11-server = { path = "../rx11-server" }
+rx11-client = { path = "../rx11-client" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+toml = { workspace = true }
+serde = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
