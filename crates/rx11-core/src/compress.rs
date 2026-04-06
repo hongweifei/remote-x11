@@ -116,12 +116,7 @@ pub fn decompress_frame_data(
     msg: &crate::protocol::CompressedX11DataMessage,
     algo: CompressionAlgo,
 ) -> Option<Vec<u8>> {
-    let decompressed = algo.decompress(&msg.data, msg.original_len)?;
-    if decompressed.len() == msg.original_len {
-        Some(decompressed)
-    } else {
-        None
-    }
+    algo.decompress(&msg.data, msg.original_len)
 }
 
 fn compress_lz4(data: &[u8]) -> Option<Bytes> {

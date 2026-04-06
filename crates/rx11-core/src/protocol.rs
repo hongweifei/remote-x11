@@ -342,17 +342,17 @@ macro_rules! define_frame_types {
                                     json.len(), MAX_FRAME_SIZE
                                 )));
                             }
-                            Ok(encode_raw(MessageType::$JVar as u8, &json))
+                            encode_raw(MessageType::$JVar as u8, &json)
                         }
                     )*
                     $(
                         Frame::$BVar(msg) => {
                             let payload = < $BPayload as BinaryMessageCodec >::encode_payload(msg)?;
-                            Ok(encode_raw(MessageType::$BVar as u8, &payload))
+                            encode_raw(MessageType::$BVar as u8, &payload)
                         }
                     )*
                     $(
-                        Frame::$EVar => Ok(encode_raw(MessageType::$EVar as u8, &[])),
+                        Frame::$EVar => encode_raw(MessageType::$EVar as u8, &[]),
                     )*
                 }
             }
@@ -430,17 +430,17 @@ define_frame_types! {
     }
 }
 
-fn encode_raw(msg_type: u8, payload: &[u8]) -> Bytes {
+fn encode_raw(msg_type: u8, payload: &[u8]) -> Result<Bytes> {
     let len: u32 = payload
         .len()
         .try_into()
-        .expect("payload already validated against MAX_FRAME_SIZE");
+        .map_err(|_| Rx11Error::Protocol("payload exceeds u32 max".into()))?;
     let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + payload.len());
     buf.extend_from_slice(&MAGIC_BYTES);
     buf.extend_from_slice(&[msg_type]);
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(payload);
-    buf.freeze()
+    Ok(buf.freeze())
 }
 
 pub fn encode_frame(frame: &Frame) -> Result<Bytes> {
@@ -479,6 +479,7 @@ pub const fn frame_header_size() -> usize {
 pub struct HandshakeResult {
     pub session_id: SessionId,
     pub compression: Option<CompressionAlgo>,
+    pub resume_session_id: Option<SessionId>,
 }
 
 pub async fn server_handshake(
@@ -585,6 +586,7 @@ pub async fn server_handshake(
     Ok(HandshakeResult {
         session_id,
         compression,
+        resume_session_id: hello.resume_session_id,
     })
 }
 
@@ -653,6 +655,7 @@ pub async fn client_handshake(
     Ok(HandshakeResult {
         session_id: hello_ack.session_id,
         compression: hello_ack.compression,
+        resume_session_id: resume_session_id.cloned(),
     })
 }
 

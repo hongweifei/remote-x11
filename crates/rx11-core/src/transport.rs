@@ -3,6 +3,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
 
+use crate::config::BufferDefaults;
 use crate::error::Rx11Error;
 use crate::protocol::{decode_frame, encode_frame, Frame, MAGIC_BYTES, MAX_FRAME_SIZE};
 
@@ -69,7 +70,7 @@ impl Rx11Transport {
     pub fn new(stream: TcpStream) -> crate::error::Result<Self> {
         stream.set_nodelay(true)?;
         Ok(Self {
-            read_buf: BytesMut::with_capacity(64 * 1024),
+            read_buf: BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF),
             stream,
         })
     }
