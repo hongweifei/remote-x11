@@ -63,7 +63,20 @@ impl LocalConnector {
                 let retriable = e
                     .downcast_ref::<rx11_core::error::Rx11Error>()
                     .map(|re| re.is_retriable())
-                    .unwrap_or(true);
+                    .or_else(|| {
+                        e.downcast_ref::<std::io::Error>().map(|io| {
+                            matches!(
+                                io.kind(),
+                                std::io::ErrorKind::ConnectionRefused
+                                    | std::io::ErrorKind::ConnectionReset
+                                    | std::io::ErrorKind::ConnectionAborted
+                                    | std::io::ErrorKind::BrokenPipe
+                                    | std::io::ErrorKind::TimedOut
+                                    | std::io::ErrorKind::UnexpectedEof
+                            )
+                        })
+                    })
+                    .unwrap_or(false);
 
                 if !retriable {
                     return Err(e);
@@ -154,7 +167,7 @@ impl LocalConnector {
         let mut transport = Rx11Transport::new(stream)?;
 
         let resume_sid = resume_session_id
-            .map(|s| SessionId::new(s))
+            .map(SessionId::new)
             .transpose()?;
 
         let token = Token::new(self.auth_token.clone())?;
@@ -265,18 +278,17 @@ impl LocalConnector {
                                         let seq = seq_counter.clone();
 
                                         let handle = tokio::spawn(async move {
-                                            proxy_local_x11_connection(
+                                            let ctx = ProxyContext {
                                                 conn_id,
-                                                display,
-                                                &mut local_read,
-                                                &mut local_write,
-                                                &mut write_rx,
-                                                &outbound,
-                                                &stats_clone,
-                                                &x11_conns_clone,
-                                                compress,
-                                                &seq,
-                                            ).await;
+                                                local_read: &mut local_read,
+                                                local_write: &mut local_write,
+                                                relay_rx: &mut write_rx,
+                                                outbound: &outbound,
+                                                stats: &stats_clone,
+                                                compression: compress,
+                                                seq: &seq,
+                                            };
+                                            proxy_local_x11_connection(ctx).await;
                                             let _ = outbound
                                                 .send(Frame::X11Disconnect(X11DisconnectMessage {
                                                     display,
@@ -312,13 +324,15 @@ impl LocalConnector {
                                             Some(a) => a,
                                             None => continue,
                                         };
+                                        let original_len = msg.original_len;
                                         let decompressed = match rx11_core::compress::decompress_frame_data(&msg, algo) {
-                                            Some(d) if d.len() == msg.original_len => d,
-                                            _ => {
+                                            Some(d) => d,
+                                            None => {
                                                 warn!("Decompression failed for {}, dropping frame", msg.connection_id);
                                                 continue;
                                             }
                                         };
+                                        stats.add_compression_saved(original_len.saturating_sub(decompressed.len()) as u64);
                                         stats.add_bytes_received(decompressed.len() as u64);
                                         send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
                                     }
@@ -372,54 +386,59 @@ impl LocalConnector {
     }
 }
 
-async fn proxy_local_x11_connection(
+struct ProxyContext<'a> {
     conn_id: ConnectionId,
-    _display: DisplayNumber,
-    local_read: &mut tokio::io::ReadHalf<TcpStream>,
-    local_write: &mut tokio::io::WriteHalf<TcpStream>,
-    relay_rx: &mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
-    outbound: &tokio::sync::mpsc::Sender<Frame>,
-    stats: &ConnectionStats,
-    _x11_conns: &SharedX11Conns,
+    local_read: &'a mut tokio::io::ReadHalf<TcpStream>,
+    local_write: &'a mut tokio::io::WriteHalf<TcpStream>,
+    relay_rx: &'a mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    outbound: &'a tokio::sync::mpsc::Sender<Frame>,
+    stats: &'a ConnectionStats,
     compression: Option<CompressionAlgo>,
-    seq: &Arc<AtomicU32>,
-) {
+    seq: &'a Arc<AtomicU32>,
+}
+
+async fn proxy_local_x11_connection(ctx: ProxyContext<'_>) {
     let mut buf = vec![0u8; BufferDefaults::INITIAL_READ_BUF];
     loop {
         tokio::select! {
-            result = local_read.read(&mut buf) => {
+            result = ctx.local_read.read(&mut buf) => {
                 match result {
                     Ok(0) => break,
                     Ok(n) => {
                         let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                        let seq_id = seq.fetch_add(1, Ordering::Relaxed);
+                        let seq_id = ctx.seq.fetch_add(1, Ordering::Relaxed);
 
                         let frame = rx11_core::compress::maybe_compress_frame(
-                            conn_id,
+                            ctx.conn_id,
                             seq_id,
-                            data,
-                            compression,
+                            data.clone(),
+                            ctx.compression,
                         );
-                        if outbound.send(frame).await.is_err() {
+                        if ctx.outbound.send(frame).await.is_err() {
                             break;
                         }
-                        stats.add_bytes_sent(n as u64);
+                        if ctx.compression.is_some() {
+                            if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
+                                ctx.stats.add_compression_saved(data.len().saturating_sub(n) as u64);
+                            }
+                        }
+                        ctx.stats.add_bytes_sent(n as u64);
                         if buf.len() < BufferDefaults::MAX_READ_BUF {
                             let new_size = (buf.len() * 2).min(BufferDefaults::MAX_READ_BUF);
                             buf.resize(new_size, 0);
                         }
                     }
                     Err(e) => {
-                        debug!("Read error from local X Server ({}): {}", conn_id, e);
+                        debug!("Read error from local X Server ({}): {}", ctx.conn_id, e);
                         break;
                     }
                 }
             }
-            data = relay_rx.recv() => {
+            data = ctx.relay_rx.recv() => {
                 match data {
                     Some(data) => {
-                        if local_write.write_all(&data).await.is_err()
-                            || local_write.flush().await.is_err()
+                        if ctx.local_write.write_all(&data).await.is_err()
+                            || ctx.local_write.flush().await.is_err()
                         {
                             break;
                         }
@@ -448,7 +467,6 @@ async fn send_data_to_local(
         }
     } else {
         debug!("No local connection for {}", conn_id);
-        x11_connections.lock().await.remove(&conn_id.get());
     }
 }
 
