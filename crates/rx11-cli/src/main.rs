@@ -485,7 +485,7 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
 
-            let mut ssh_child = rx11_client::ssh::SshClient::create_forward_tunnel(
+            let mut ssh_tunnel = rx11_client::ssh::SshTunnel::create(
                 &host,
                 port,
                 user.as_deref(),
@@ -495,9 +495,9 @@ async fn main() -> anyhow::Result<()> {
             )
             .await?;
 
-            let local_addr = format!("127.0.0.1:{}", local_bind_port);
+            let local_addr = ssh_tunnel.local_addr().to_string();
             if let Err(e) = wait_for_port(&local_addr, std::time::Duration::from_secs(10)).await {
-                let _ = ssh_child.kill().await;
+                let _ = ssh_tunnel.kill().await;
                 return Err(e.context("SSH tunnel failed to become ready"));
             }
 
@@ -510,7 +510,7 @@ async fn main() -> anyhow::Result<()> {
 
             tokio::select! {
                 r = connector.connect_and_serve() => r?,
-                status = ssh_child.wait() => {
+                status = ssh_tunnel.wait() => {
                     anyhow::bail!("SSH tunnel exited with status: {:?}", status?);
                 }
             }
