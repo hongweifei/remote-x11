@@ -97,6 +97,10 @@ async fn handle_client(
     let transport_id = handshake.session_id.clone();
     let compression = handshake.compression;
 
+    if let Some(ref sid) = handshake.resume_session_id {
+        info!("Client {} requests session resume: {}", transport_id, sid);
+    }
+
     info!("Client {} authenticated successfully", transport_id);
 
     let (mut read_half, write_half) = transport.split();
@@ -115,17 +119,18 @@ async fn handle_client(
 
     let tid = transport_id.as_str().to_string();
 
-    let result = relay_loop(
-        &mut read_half,
-        &outbound_tx,
-        &mut x11_event_rx,
-        &session_mgr,
-        &tid,
+    let mut ctx = RelayContext {
+        read_half: &mut read_half,
+        outbound: &outbound_tx,
+        x11_events: &mut x11_event_rx,
+        session_mgr: &session_mgr,
+        transport_id: &tid,
         compression,
-        &mut heartbeat_deadline,
-        &x11_event_tx,
-    )
-    .await;
+        heartbeat_deadline: &mut heartbeat_deadline,
+        x11_event_tx: &x11_event_tx,
+    };
+
+    let result = relay_loop(&mut ctx).await;
 
     heartbeat_task.abort();
     drop(outbound_tx);
@@ -166,42 +171,55 @@ fn spawn_sender(
     })
 }
 
-async fn relay_loop(
-    read_half: &mut rx11_core::transport::Rx11TransportReadHalf,
-    outbound: &tokio::sync::mpsc::Sender<Frame>,
-    x11_events: &mut tokio::sync::mpsc::Receiver<X11ConnToRelay>,
-    session_mgr: &Arc<SessionManager>,
-    transport_id: &str,
+struct RelayContext<'a> {
+    read_half: &'a mut rx11_core::transport::Rx11TransportReadHalf,
+    outbound: &'a tokio::sync::mpsc::Sender<Frame>,
+    x11_events: &'a mut tokio::sync::mpsc::Receiver<X11ConnToRelay>,
+    session_mgr: &'a Arc<SessionManager>,
+    transport_id: &'a str,
     compression: Option<CompressionAlgo>,
-    heartbeat_deadline: &mut tokio::time::Instant,
-    x11_event_tx: &tokio::sync::mpsc::Sender<X11ConnToRelay>,
-) -> rx11_core::error::Result<()> {
+    heartbeat_deadline: &'a mut tokio::time::Instant,
+    x11_event_tx: &'a tokio::sync::mpsc::Sender<X11ConnToRelay>,
+}
+
+enum RelayAction {
+    Continue,
+    Disconnect,
+}
+
+async fn relay_loop(ctx: &mut RelayContext<'_>) -> rx11_core::error::Result<()> {
     loop {
         tokio::select! {
-            frame_result = read_half.recv_frame() => {
+            frame_result = ctx.read_half.recv_frame() => {
                 match frame_result {
                     Ok(frame) => {
-                        if handle_inbound_frame(frame, outbound, session_mgr, transport_id, compression, heartbeat_deadline, x11_event_tx).await {
+                        if matches!(
+                            handle_inbound_frame(frame, ctx).await,
+                            RelayAction::Disconnect
+                        ) {
                             break;
                         }
                     }
                     Err(rx11_core::error::Rx11Error::ConnectionClosed) => {
-                        info!("Client {} disconnected", transport_id);
+                        info!("Client {} disconnected", ctx.transport_id);
                         break;
                     }
                     Err(e) => {
-                        warn!("Error on client {}: {}", transport_id, e);
+                        warn!("Error on client {}: {}", ctx.transport_id, e);
                         break;
                     }
                 }
             }
-            event = x11_events.recv() => {
-                if handle_x11_event(event, outbound, session_mgr, compression).await {
+            event = ctx.x11_events.recv() => {
+                if matches!(
+                    handle_x11_event(event, ctx.outbound, ctx.session_mgr, ctx.compression).await,
+                    RelayAction::Disconnect
+                ) {
                     break;
                 }
             }
-            _ = tokio::time::sleep_until(*heartbeat_deadline) => {
-                warn!("Client {} heartbeat timeout, disconnecting", transport_id);
+            _ = tokio::time::sleep_until(*ctx.heartbeat_deadline) => {
+                warn!("Client {} heartbeat timeout, disconnecting", ctx.transport_id);
                 break;
             }
         }
@@ -209,112 +227,100 @@ async fn relay_loop(
     Ok(())
 }
 
-async fn handle_inbound_frame(
-    frame: Frame,
-    outbound: &tokio::sync::mpsc::Sender<Frame>,
-    session_mgr: &Arc<SessionManager>,
-    transport_id: &str,
-    compression: Option<CompressionAlgo>,
-    heartbeat_deadline: &mut tokio::time::Instant,
-    x11_event_tx: &tokio::sync::mpsc::Sender<X11ConnToRelay>,
-) -> bool {
+async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> RelayAction {
     match frame {
         Frame::SessionCreate(msg) => {
-            let result = session_mgr
-                .create_session(msg.display, msg.auth_name, msg.auth_data, transport_id.to_string())
+            let result = ctx
+                .session_mgr
+                .create_session(msg.display, msg.auth_name, msg.auth_data, ctx.transport_id.to_string())
                 .await;
-            send_session_ack(result, outbound, session_mgr, transport_id, x11_event_tx).await
+            send_session_ack(result, ctx).await
         }
         Frame::SessionResume(msg) => {
-            let result = session_mgr
-                .try_resume_session(&msg.session_id, transport_id.to_string())
+            let result = ctx
+                .session_mgr
+                .try_resume_session(&msg.session_id, ctx.transport_id.to_string())
                 .await;
-            send_session_ack(result, outbound, session_mgr, transport_id, x11_event_tx).await
+            send_session_ack(result, ctx).await
         }
         Frame::SessionAutoCreate(msg) => {
-            let result = session_mgr
-                .create_session_auto(msg.auth_name, msg.auth_data, transport_id.to_string())
+            let result = ctx
+                .session_mgr
+                .create_session_auto(msg.auth_name, msg.auth_data, ctx.transport_id.to_string())
                 .await;
-            send_session_ack(result, outbound, session_mgr, transport_id, x11_event_tx).await
+            send_session_ack(result, ctx).await
         }
         Frame::SessionDestroy(msg) => {
             let disp = msg.display;
-            if !session_mgr.owns_session(disp, transport_id).await {
-                warn!("Client {} tried to destroy unowned session for display {}", transport_id, disp);
-                return false;
+            if !ctx.session_mgr.owns_session(disp, ctx.transport_id).await {
+                warn!("Client {} tried to destroy unowned session for display {}", ctx.transport_id, disp);
+                return RelayAction::Continue;
             }
-            session_mgr.unregister_x11_relay(disp).await;
-            session_mgr.destroy_session(disp).await;
+            ctx.session_mgr.unregister_x11_relay(disp).await;
+            ctx.session_mgr.destroy_session(disp).await;
             info!("Session destroyed for display {}", disp);
-            false
+            RelayAction::Continue
         }
         Frame::DataX11(msg) => {
-            if !session_mgr.owns_connection(msg.connection_id, transport_id).await {
-                warn!("Client {} sent data for unowned {}", transport_id, msg.connection_id);
-                return false;
+            if !ctx.session_mgr.owns_connection(msg.connection_id, ctx.transport_id).await {
+                warn!("Client {} sent data for unowned {}", ctx.transport_id, msg.connection_id);
+                return RelayAction::Continue;
             }
-            session_mgr.send_to_x11_connection(msg.connection_id, msg.data.to_vec()).await;
-            false
+            ctx.session_mgr.send_to_x11_connection(msg.connection_id, msg.data.to_vec()).await;
+            RelayAction::Continue
         }
         Frame::CompressedDataX11(msg) => {
-            if !session_mgr.owns_connection(msg.connection_id, transport_id).await {
-                warn!("Client {} sent compressed data for unowned {}", transport_id, msg.connection_id);
-                return false;
+            if !ctx.session_mgr.owns_connection(msg.connection_id, ctx.transport_id).await {
+                warn!("Client {} sent compressed data for unowned {}", ctx.transport_id, msg.connection_id);
+                return RelayAction::Continue;
             }
-            let algo = match compression {
+            let algo = match ctx.compression {
                 Some(a) => a,
                 None => {
                     warn!("CompressedDataX11 received but no compression negotiated, dropping");
-                    return false;
+                    return RelayAction::Continue;
                 }
             };
             match rx11_core::compress::decompress_frame_data(&msg, algo) {
                 Some(decompressed) => {
-                    session_mgr.send_to_x11_connection(msg.connection_id, decompressed).await;
+                    ctx.session_mgr.send_to_x11_connection(msg.connection_id, decompressed).await;
                 }
                 None => {
                     warn!("Decompression failed for {}, dropping frame", msg.connection_id);
                 }
             }
-            false
+            RelayAction::Continue
         }
         Frame::HeartbeatAck => {
-            *heartbeat_deadline = tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
-            false
+            *ctx.heartbeat_deadline = tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
+            RelayAction::Continue
         }
         Frame::FlowControl(msg) => {
-            match msg.action {
-                FlowControlAction::Pause => {
-                    warn!("Client {} requests pause for {:?}", transport_id, msg.connection_id);
-                }
-                FlowControlAction::Resume => {
-                    warn!("Client {} requests resume for {:?}", transport_id, msg.connection_id);
-                }
-            }
-            false
+            warn!(
+                "Client {} FlowControl {:?} for {:?} (not implemented)",
+                ctx.transport_id, msg.action, msg.connection_id
+            );
+            RelayAction::Continue
         }
         frame => {
-            warn!("Unexpected frame from client {}: {:?}", transport_id, frame.msg_type());
-            false
+            warn!("Unexpected frame from client {}: {:?}", ctx.transport_id, frame.msg_type());
+            RelayAction::Continue
         }
     }
 }
 
 async fn send_session_ack(
     result: rx11_core::error::Result<crate::session::Session>,
-    outbound: &tokio::sync::mpsc::Sender<Frame>,
-    session_mgr: &Arc<SessionManager>,
-    transport_id: &str,
-    x11_event_tx: &tokio::sync::mpsc::Sender<X11ConnToRelay>,
-) -> bool {
+    ctx: &RelayContext<'_>,
+) -> RelayAction {
     match result {
         Ok(session) => {
             let disp = session.display;
             let sid = session.id.clone();
-            info!("Session created for display {}", disp);
-            info!("[rx11] Session created: DISPLAY={} (client: {})", disp, transport_id);
-            session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
-            outbound
+            info!("Session created: DISPLAY={} (client: {})", disp, ctx.transport_id);
+            ctx.session_mgr.register_x11_relay(disp, ctx.x11_event_tx.clone()).await;
+            if ctx
+                .outbound
                 .send(Frame::SessionAck(SessionAckMessage {
                     display: disp,
                     success: true,
@@ -323,16 +329,29 @@ async fn send_session_ack(
                 }))
                 .await
                 .is_err()
+            {
+                RelayAction::Disconnect
+            } else {
+                RelayAction::Continue
+            }
         }
-        Err(e) => outbound
-            .send(Frame::SessionAck(SessionAckMessage {
-                display: DisplayNumber::UNSPECIFIED,
-                success: false,
-                error_msg: Some(format!("{}", e)),
-                session_id: None,
-            }))
-            .await
-            .is_err(),
+        Err(e) => {
+            if ctx
+                .outbound
+                .send(Frame::SessionAck(SessionAckMessage {
+                    display: DisplayNumber::UNSPECIFIED,
+                    success: false,
+                    error_msg: Some(format!("{}", e)),
+                    session_id: None,
+                }))
+                .await
+                .is_err()
+            {
+                RelayAction::Disconnect
+            } else {
+                RelayAction::Continue
+            }
+        }
     }
 }
 
@@ -341,29 +360,45 @@ async fn handle_x11_event(
     outbound: &tokio::sync::mpsc::Sender<Frame>,
     session_mgr: &Arc<SessionManager>,
     compression: Option<CompressionAlgo>,
-) -> bool {
+) -> RelayAction {
     match event {
-        Some(X11ConnToRelay::Connected { display, connection_id }) => outbound
-            .send(Frame::X11Connect(X11ConnectMessage {
-                display,
-                connection_id,
-            }))
-            .await
-            .is_err(),
+        Some(X11ConnToRelay::Connected { display, connection_id }) => {
+            if outbound
+                .send(Frame::X11Connect(X11ConnectMessage {
+                    display,
+                    connection_id,
+                }))
+                .await
+                .is_err()
+            {
+                RelayAction::Disconnect
+            } else {
+                RelayAction::Continue
+            }
+        }
         Some(X11ConnToRelay::Data { connection_id, data, .. }) => {
             let frame = maybe_compress_frame(connection_id, 0, data, compression);
-            outbound.send(frame).await.is_err()
+            if outbound.send(frame).await.is_err() {
+                RelayAction::Disconnect
+            } else {
+                RelayAction::Continue
+            }
         }
         Some(X11ConnToRelay::Disconnected { display, connection_id }) => {
             session_mgr.unregister_x11_connection(connection_id).await;
-            outbound
+            if outbound
                 .send(Frame::X11Disconnect(X11DisconnectMessage {
                     display,
                     connection_id,
                 }))
                 .await
                 .is_err()
+            {
+                RelayAction::Disconnect
+            } else {
+                RelayAction::Continue
+            }
         }
-        None => true,
+        None => RelayAction::Disconnect,
     }
 }
