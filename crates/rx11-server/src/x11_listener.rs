@@ -6,7 +6,7 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use rx11_core::config::BufferDefaults;
+use rx11_core::config::{BufferDefaults, ServerDefaults};
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
 use crate::session::{SessionManager, X11ConnToRelay, X11DisplayBinder, X11RelayToConn};
@@ -112,10 +112,20 @@ async fn handle_x11_connection(
 
     let connection_id = next_connection_id();
 
-    let event_tx = session_mgr
-        .get_x11_event_sender(disp)
-        .await
-        .ok_or_else(|| anyhow::anyhow!("No relay registered for display {}", disp))?;
+    let event_tx = tokio::time::timeout(
+        ServerDefaults::HANDSHAKE_TIMEOUT,
+        async {
+            loop {
+                if let Some(tx) = session_mgr.get_x11_event_sender(disp).await {
+                    return Ok::<_, std::convert::Infallible>(tx);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        },
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("Timed out waiting for relay for display {}", disp))?
+    .unwrap();
 
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(BufferDefaults::CHANNEL_BUFFER);
     session_mgr
