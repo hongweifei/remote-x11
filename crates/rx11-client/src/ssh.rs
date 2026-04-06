@@ -48,7 +48,13 @@ impl SshClient {
         };
         args.push(target);
 
-        info!("Starting SSH tunnel: ssh {}", args.join(" "));
+        info!(
+            "Starting SSH tunnel: {}@{}:{} -> 127.0.0.1:{}",
+            ssh_user.unwrap_or("<default>"),
+            ssh_host,
+            ssh_port,
+            local_bind_port
+        );
 
         let child = Command::new("ssh")
             .args(&args)
