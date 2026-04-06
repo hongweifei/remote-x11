@@ -1,13 +1,13 @@
+use rand::RngExt;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use rand::RngExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
-use tracing::{error, info, warn, debug};
+use tracing::{debug, error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
 use rx11_core::protocol::*;
@@ -20,6 +20,8 @@ type SharedX11Conns = Arc<Mutex<X11ConnMap>>;
 const CLIENT_READ_TIMEOUT_SECS: u64 = 100;
 const INITIAL_BUF_SIZE: usize = 64 * 1024;
 const MAX_BUF_SIZE: usize = 256 * 1024;
+const CHANNEL_BUFFER_SIZE: usize = 2048;
+const OUTBOUND_CHANNEL_SIZE: usize = 2048;
 
 pub struct LocalConnector {
     relay_addr: String,
@@ -57,7 +59,10 @@ impl LocalConnector {
         let mut last_session_id: Option<String> = None;
         loop {
             let sid = last_session_id.take();
-            if let Err(e) = self.connect_and_serve_inner(sid, &mut last_session_id).await {
+            if let Err(e) = self
+                .connect_and_serve_inner(sid, &mut last_session_id)
+                .await
+            {
                 let retriable = e
                     .downcast_ref::<rx11_core::error::Rx11Error>()
                     .map(|re| re.is_retriable())
@@ -110,7 +115,11 @@ impl LocalConnector {
         } else {
             let disp = display.unwrap_or(0);
             if disp > MAX_DISPLAY_NUMBER {
-                anyhow::bail!("Display number must be 0-{}, got {}", MAX_DISPLAY_NUMBER, disp);
+                anyhow::bail!(
+                    "Display number must be 0-{}, got {}",
+                    MAX_DISPLAY_NUMBER,
+                    disp
+                );
             }
             transport
                 .send_frame(&Frame::SessionCreate(SessionCreateMessage {
@@ -131,7 +140,9 @@ impl LocalConnector {
                     ));
                 }
                 info!("Session created for display :{}", ack.display);
-                let sid = ack.session_id.ok_or_else(|| anyhow::anyhow!("Missing session_id"))?;
+                let sid = ack
+                    .session_id
+                    .ok_or_else(|| anyhow::anyhow!("Missing session_id"))?;
                 Ok((ack.display, sid))
             }
             _ => Err(anyhow::anyhow!("Expected SessionAck")),
@@ -227,7 +238,8 @@ impl LocalConnector {
                             "Session resume failed: {}, creating new session",
                             ack.error_msg.as_deref().unwrap_or("unknown error")
                         );
-                        let (disp, new_sid) = self.create_session(&mut transport, self.display).await?;
+                        let (disp, new_sid) =
+                            self.create_session(&mut transport, self.display).await?;
                         actual_display = disp;
                         *saved_session_id = Some(new_sid);
                     } else {
@@ -250,7 +262,8 @@ impl LocalConnector {
         let stats = Arc::new(ConnectionStats::new());
         let seq_counter = Arc::new(AtomicU32::new(1));
 
-        let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Frame>(512);
+        let (outbound_tx, mut outbound_rx) =
+            tokio::sync::mpsc::channel::<Frame>(OUTBOUND_CHANNEL_SIZE);
 
         let stats_clone = stats.clone();
         let stats_task = tokio::spawn(async move {
@@ -268,6 +281,7 @@ impl LocalConnector {
                     break;
                 }
             }
+            let _ = write_half.flush().await;
         });
 
         info!(
@@ -295,7 +309,7 @@ impl LocalConnector {
                                         let (mut local_read, mut local_write) = tokio::io::split(local_stream);
 
                                         let (write_tx, mut write_rx) =
-                                            tokio::sync::mpsc::channel::<bytes::Bytes>(512);
+                                            tokio::sync::mpsc::channel::<bytes::Bytes>(CHANNEL_BUFFER_SIZE);
 
                                         let outbound = outbound_tx.clone();
                                         let stats_clone = stats.clone();
@@ -313,14 +327,24 @@ impl LocalConnector {
                                                             Ok(n) => {
                                                                 let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                                                                 let seq_id = seq.fetch_add(1, Ordering::Relaxed);
+
                                                                 let frame = if let Some(algo) = compress {
-                                                                    if let Some(compressed) = algo.compress_to_bytes(&data) {
-                                                                        stats_clone.add_compression_saved((data.len() - compressed.len()) as u64);
-                                                                        Frame::CompressedDataX11 {
-                                                                            connection_id: conn_id,
-                                                                            sequence_id: seq_id,
-                                                                            original_len: data.len(),
-                                                                            data: compressed,
+                                                                    if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
+                                                                        match algo.compress_to_bytes(&data) {
+                                                                            Some(compressed) => {
+                                                                                stats_clone.add_compression_saved((data.len() - compressed.len()) as u64);
+                                                                                Frame::CompressedDataX11 {
+                                                                                    connection_id: conn_id,
+                                                                                    sequence_id: seq_id,
+                                                                                    original_len: data.len(),
+                                                                                    data: compressed,
+                                                                                }
+                                                                            }
+                                                                            None => Frame::DataX11(X11DataMessage {
+                                                                                connection_id: conn_id,
+                                                                                sequence_id: seq_id,
+                                                                                data,
+                                                                            })
                                                                         }
                                                                     } else {
                                                                         Frame::DataX11(X11DataMessage {

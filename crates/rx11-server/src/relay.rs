@@ -16,6 +16,8 @@ const SERVER_HEARTBEAT_INTERVAL_SECS: u64 = 30;
 const SERVER_HEARTBEAT_TIMEOUT_SECS: u64 = 90;
 const MAX_CONNECTIONS: usize = 256;
 const HANDSHAKE_TIMEOUT_SECS: u64 = 30;
+const CHANNEL_BUFFER_SIZE: usize = 2048;
+const OUTBOUND_CHANNEL_SIZE: usize = 2048;
 
 pub struct RelayServer {
     listen_addr: String,
@@ -99,8 +101,15 @@ async fn handle_client(
 
     let hello_frame = tokio::time::timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        transport.recv_frame()
-    ).await.map_err(|_| anyhow::anyhow!("Handshake timeout: no Hello received within {}s", HANDSHAKE_TIMEOUT_SECS))??;
+        transport.recv_frame(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Handshake timeout: no Hello received within {}s",
+            HANDSHAKE_TIMEOUT_SECS
+        )
+    })??;
     let compression_algo: Option<rx11_core::compress::CompressionAlgo>;
     match hello_frame {
         Frame::Hello(hello) => {
@@ -134,7 +143,10 @@ async fn handle_client(
             }
 
             let server_algos = &rx11_core::compress::CompressionAlgo::ALL;
-            compression_algo = rx11_core::compress::CompressionAlgo::negotiate(&hello.compression_algos, server_algos);
+            compression_algo = rx11_core::compress::CompressionAlgo::negotiate(
+                &hello.compression_algos,
+                server_algos,
+            );
             if let Some(algo) = compression_algo {
                 info!("Client {} compression: {}", transport_id, algo.as_str());
             } else {
@@ -162,8 +174,15 @@ async fn handle_client(
 
     let auth_frame = tokio::time::timeout(
         Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
-        transport.recv_frame()
-    ).await.map_err(|_| anyhow::anyhow!("Handshake timeout: no AuthRequest received within {}s", HANDSHAKE_TIMEOUT_SECS))??;
+        transport.recv_frame(),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "Handshake timeout: no AuthRequest received within {}s",
+            HANDSHAKE_TIMEOUT_SECS
+        )
+    })??;
     match auth_frame {
         Frame::AuthRequest(auth_req) => {
             if let Err(e) = rx11_core::protocol::validate_token_len(&auth_req.token) {
@@ -204,14 +223,15 @@ async fn handle_client(
     let tid = transport_id.clone();
 
     let (x11_event_tx, mut x11_event_rx) =
-        tokio::sync::mpsc::channel::<X11ConnToRelay>(512);
+        tokio::sync::mpsc::channel::<X11ConnToRelay>(CHANNEL_BUFFER_SIZE);
 
-    let (outbound_tx, mut outbound_rx) =
-        tokio::sync::mpsc::channel::<Frame>(512);
+    let (outbound_tx, mut outbound_rx) = tokio::sync::mpsc::channel::<Frame>(OUTBOUND_CHANNEL_SIZE);
 
     let outbound_tx_clone = outbound_tx.clone();
     let heartbeat_task = tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(SERVER_HEARTBEAT_INTERVAL_SECS));
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(
+            SERVER_HEARTBEAT_INTERVAL_SECS,
+        ));
         interval.tick().await;
         loop {
             interval.tick().await;
@@ -227,10 +247,11 @@ async fn handle_client(
                 break;
             }
         }
+        let _ = write_half.flush().await;
     });
 
-    let mut heartbeat_deadline = tokio::time::Instant::now()
-        + std::time::Duration::from_secs(SERVER_HEARTBEAT_TIMEOUT_SECS);
+    let mut heartbeat_deadline =
+        tokio::time::Instant::now() + std::time::Duration::from_secs(SERVER_HEARTBEAT_TIMEOUT_SECS);
 
     let result: anyhow::Result<()> = async {
         loop {
@@ -426,12 +447,19 @@ async fn handle_client(
                         }
                         Some(X11ConnToRelay::Data { display: _, connection_id, data }) => {
                             let frame = if let Some(algo) = compression_algo {
-                                if let Some(compressed) = algo.compress_to_bytes(&data) {
-                                    Frame::CompressedDataX11 {
-                                        connection_id,
-                                        sequence_id: 0,
-                                        original_len: data.len(),
-                                        data: compressed,
+                                if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
+                                    match algo.compress_to_bytes(&data) {
+                                        Some(compressed) => Frame::CompressedDataX11 {
+                                            connection_id,
+                                            sequence_id: 0,
+                                            original_len: data.len(),
+                                            data: compressed,
+                                        },
+                                        None => Frame::DataX11(X11DataMessage {
+                                            connection_id,
+                                            sequence_id: 0,
+                                            data,
+                                        })
                                     }
                                 } else {
                                     Frame::DataX11(X11DataMessage {
