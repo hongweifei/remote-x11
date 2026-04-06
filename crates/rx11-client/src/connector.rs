@@ -88,7 +88,7 @@ impl LocalConnector {
         let backoff_ms = base_ms.saturating_mul(1u64 << attempt.min(10));
         let capped_ms = backoff_ms.min(max_ms);
         let jitter = rand::rng().random_range(0..=(capped_ms / 4));
-        Duration::from_millis(capped_ms + jitter)
+        Duration::from_millis((capped_ms + jitter).min(max_ms))
     }
 
     async fn create_session(
@@ -141,7 +141,12 @@ impl LocalConnector {
         saved_session_id: &mut Option<String>,
     ) -> anyhow::Result<()> {
         info!("Connecting to relay at {}", self.relay_addr);
-        let stream = TcpStream::connect(&self.relay_addr).await?;
+        let stream = tokio::time::timeout(
+            Duration::from_secs(30),
+            TcpStream::connect(&self.relay_addr),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
         let mut transport = Rx11Transport::new(stream)?;
 
         transport
@@ -200,7 +205,9 @@ impl LocalConnector {
             _ => return Err(anyhow::anyhow!("Expected AuthResponse")),
         }
 
-        let actual_display: Option<u16>;
+        rx11_core::protocol::validate_token_len(&self.auth_token)?;
+
+        let actual_display: u16;
 
         if let Some(ref sid) = resume_session_id {
             transport
@@ -218,10 +225,10 @@ impl LocalConnector {
                             ack.error_msg.as_deref().unwrap_or("unknown error")
                         );
                         let (disp, new_sid) = self.create_session(&mut transport, self.display).await?;
-                        actual_display = Some(disp);
+                        actual_display = disp;
                         *saved_session_id = Some(new_sid);
                     } else {
-                        actual_display = Some(ack.display);
+                        actual_display = ack.display;
                         info!("Session resumed for display :{}", ack.display);
                         *saved_session_id = ack.session_id.clone();
                     }
@@ -230,7 +237,7 @@ impl LocalConnector {
             }
         } else {
             let (disp, sid) = self.create_session(&mut transport, self.display).await?;
-            actual_display = Some(disp);
+            actual_display = disp;
             *saved_session_id = Some(sid);
         }
 
@@ -336,10 +343,11 @@ impl LocalConnector {
                                                     data = write_rx.recv() => {
                                                         match data {
                                                             Some(data) => {
-                                                                if local_write.write_all(&data).await.is_err() {
+                                                                if local_write.write_all(&data).await.is_err()
+                                                                    || local_write.flush().await.is_err()
+                                                                {
                                                                     break;
                                                                 }
-                                                                let _ = local_write.flush().await;
                                                             }
                                                             None => break,
                                                         }
@@ -437,37 +445,37 @@ impl LocalConnector {
                                                   let mut conns = x11_connections.lock().await;
                                                   conns.remove(&conn_id);
                                               }
+                                              Frame::Error(msg) => {
+                                                  error!("Error from relay (code={}): {}", msg.code, msg.message);
+                                                  break;
+                                              }
                                               _ => {
                                                  warn!("Unexpected frame from relay: {:?}", frame.msg_type());
                                              }
                                          }
                                      }
                                  }
+                              }
+                             Ok(Err(e)) => {
+                                 error!("Connection error: {}", e);
+                                 return Err(e.into());
                              }
-                            Ok(Err(e)) => {
-                                error!("Connection error: {}", e);
-                                return Err(e.into());
-                            }
-                            Err(_) => {
-                                error!(
-                                    "Read timeout ({:?}), no data from relay",
-                                    Duration::from_secs(CLIENT_READ_TIMEOUT_SECS)
-                                );
-                                return Err(rx11_core::error::Rx11Error::Timeout.into());
-                            }
-                        }
-                    }
+                             Err(_) => {
+                                 error!(
+                                     "Read timeout ({:?}), no data from relay",
+                                     Duration::from_secs(CLIENT_READ_TIMEOUT_SECS)
+                                 );
+                                 return Err(rx11_core::error::Rx11Error::Timeout.into());
+                             }
+                         }
+                     }
                     _ = tokio::signal::ctrl_c() => {
                         info!("Received shutdown signal, sending SessionDestroy...");
-                        if let Some(disp) = actual_display {
-                            let _ = outbound_tx
-                                .send(Frame::SessionDestroy(SessionDestroyMessage {
-                                    display: disp,
-                                }))
-                                .await;
-                        } else {
-                            warn!("Cannot send SessionDestroy: display number unknown (auto_display)");
-                        }
+                        let _ = outbound_tx
+                            .send(Frame::SessionDestroy(SessionDestroyMessage {
+                                display: actual_display,
+                            }))
+                            .await;
                         break;
                     }
                 }
@@ -476,10 +484,14 @@ impl LocalConnector {
         }
         .await;
 
-        drop(outbound_tx);
-        let _ = sender_task.await;
         stats_task.abort();
-        cleanup_connections(&x11_connections).await;
+        cleanup_connections(&x11_connections, &stats).await;
+        drop(outbound_tx);
+        if let Err(e) = sender_task.await {
+            if !e.is_cancelled() {
+                error!("Sender task panicked: {}", e);
+            }
+        }
 
         if let Err(e) = &result {
             error!("Session ended with error: {}", e);
@@ -491,8 +503,12 @@ impl LocalConnector {
     }
 }
 
-async fn cleanup_connections(x11_connections: &SharedX11Conns) {
+async fn cleanup_connections(x11_connections: &SharedX11Conns, stats: &Arc<ConnectionStats>) {
     let mut conns = x11_connections.lock().await;
+    let count = conns.len() as u32;
+    for _ in 0..count {
+        stats.dec_x11_connections();
+    }
     for (_, (_, handle)) in conns.drain() {
         handle.abort();
     }
