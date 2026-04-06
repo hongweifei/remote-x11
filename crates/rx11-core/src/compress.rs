@@ -1,5 +1,6 @@
 use std::io::{Read, Write};
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 pub const COMPRESSION_THRESHOLD: usize = 64;
@@ -28,6 +29,10 @@ impl CompressionAlgo {
     }
 
     pub fn compress(&self, data: &[u8]) -> Option<Vec<u8>> {
+        self.compress_to_bytes(data).map(|b| b.to_vec())
+    }
+
+    pub fn compress_to_bytes(&self, data: &[u8]) -> Option<Bytes> {
         if data.len() < COMPRESSION_THRESHOLD {
             return None;
         }
@@ -67,27 +72,27 @@ impl CompressionAlgo {
     }
 }
 
-fn compress_zstd(data: &[u8]) -> Option<Vec<u8>> {
-    zstd::encode_all(data, 3).ok()
+fn compress_zstd(data: &[u8]) -> Option<Bytes> {
+    zstd::encode_all(data, 3).ok().map(Bytes::from)
 }
 
 fn decompress_zstd(compressed: &[u8]) -> Option<Vec<u8>> {
     zstd::decode_all(compressed).ok()
 }
 
-fn compress_lz4(data: &[u8]) -> Option<Vec<u8>> {
-    Some(lz4_flex::compress_prepend_size(data))
+fn compress_lz4(data: &[u8]) -> Option<Bytes> {
+    Some(Bytes::from(lz4_flex::compress_prepend_size(data)))
 }
 
 fn decompress_lz4(compressed: &[u8]) -> Option<Vec<u8>> {
     lz4_flex::decompress_size_prepended(compressed).ok()
 }
 
-fn compress_zlib(data: &[u8]) -> Option<Vec<u8>> {
+fn compress_zlib(data: &[u8]) -> Option<Bytes> {
     use flate2::{write::ZlibEncoder, Compression};
     let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(3));
     encoder.write_all(data).ok()?;
-    encoder.finish().ok()
+    encoder.finish().ok().map(Bytes::from)
 }
 
 fn decompress_zlib(compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
@@ -219,6 +224,20 @@ mod tests {
                 "should reject wrong original_len: {:?}",
                 algo
             );
+        }
+    }
+
+    #[test]
+    fn test_compress_to_bytes_roundtrip() {
+        let data = vec![0xCD; 4096];
+        for algo in &CompressionAlgo::ALL {
+            let compressed = algo
+                .compress_to_bytes(&data)
+                .expect(&format!("compress_to_bytes failed: {:?}", algo));
+            let decompressed = algo
+                .decompress(&compressed, data.len())
+                .expect(&format!("decompress failed: {:?}", algo));
+            assert_eq!(data, decompressed, "roundtrip failed: {:?}", algo);
         }
     }
 }
