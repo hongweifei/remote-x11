@@ -3,7 +3,10 @@ use std::io::{Read, Write};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-pub const COMPRESSION_THRESHOLD: usize = 64;
+pub const COMPRESSION_THRESHOLD: usize = 256;
+
+const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+const ZLIB_COMPRESSION_LEVEL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
 #[non_exhaustive]
@@ -73,7 +76,7 @@ impl CompressionAlgo {
 }
 
 fn compress_zstd(data: &[u8]) -> Option<Bytes> {
-    zstd::encode_all(data, 3).ok().map(Bytes::from)
+    zstd::encode_all(data, ZSTD_COMPRESSION_LEVEL).ok().map(Bytes::from)
 }
 
 fn decompress_zstd(compressed: &[u8]) -> Option<Vec<u8>> {
@@ -90,7 +93,7 @@ fn decompress_lz4(compressed: &[u8]) -> Option<Vec<u8>> {
 
 fn compress_zlib(data: &[u8]) -> Option<Bytes> {
     use flate2::{write::ZlibEncoder, Compression};
-    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(3));
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::new(ZLIB_COMPRESSION_LEVEL));
     encoder.write_all(data).ok()?;
     encoder.finish().ok().map(Bytes::from)
 }

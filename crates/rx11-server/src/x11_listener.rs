@@ -10,6 +10,7 @@ use crate::session::{SessionManager, X11ConnToRelay, X11RelayToConn};
 
 const INITIAL_BUF_SIZE: usize = 64 * 1024;
 const MAX_BUF_SIZE: usize = 256 * 1024;
+const CHANNEL_BUFFER_SIZE: usize = 2048;
 
 static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -106,7 +107,7 @@ async fn handle_x11_connection(
         .await
         .ok_or_else(|| anyhow::anyhow!("No relay registered for display :{}", disp))?;
 
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(512);
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(CHANNEL_BUFFER_SIZE);
     session_mgr
         .register_x11_connection(connection_id, disp, relay_tx)
         .await?;
