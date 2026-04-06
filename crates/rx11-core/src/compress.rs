@@ -76,11 +76,52 @@ impl CompressionAlgo {
 }
 
 fn compress_zstd(data: &[u8]) -> Option<Bytes> {
-    zstd::encode_all(data, ZSTD_COMPRESSION_LEVEL).ok().map(Bytes::from)
+    zstd::encode_all(data, ZSTD_COMPRESSION_LEVEL)
+        .ok()
+        .map(Bytes::from)
 }
 
 fn decompress_zstd(compressed: &[u8]) -> Option<Vec<u8>> {
     zstd::decode_all(compressed).ok()
+}
+
+pub fn maybe_compress_frame(
+    connection_id: crate::types::ConnectionId,
+    sequence_id: u32,
+    data: Bytes,
+    compression_algo: Option<CompressionAlgo>,
+) -> crate::protocol::Frame {
+    use crate::protocol::{CompressedX11DataMessage, Frame, X11DataMessage};
+
+    if let Some(algo) = compression_algo {
+        if data.len() >= COMPRESSION_THRESHOLD {
+            if let Some(compressed) = algo.compress_to_bytes(&data) {
+                return Frame::CompressedDataX11(CompressedX11DataMessage {
+                    connection_id,
+                    sequence_id,
+                    original_len: data.len(),
+                    data: compressed,
+                });
+            }
+        }
+    }
+    Frame::DataX11(X11DataMessage {
+        connection_id,
+        sequence_id,
+        data,
+    })
+}
+
+pub fn decompress_frame_data(
+    msg: &crate::protocol::CompressedX11DataMessage,
+    algo: CompressionAlgo,
+) -> Option<Vec<u8>> {
+    let decompressed = algo.decompress(&msg.data, msg.original_len)?;
+    if decompressed.len() == msg.original_len {
+        Some(decompressed)
+    } else {
+        None
+    }
 }
 
 fn compress_lz4(data: &[u8]) -> Option<Bytes> {

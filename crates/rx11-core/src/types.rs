@@ -66,6 +66,8 @@ impl_newtype!(Token, String, MAX_TOKEN_LEN, "Token");
 pub struct DisplayNumber(pub u16);
 
 impl DisplayNumber {
+    pub const UNSPECIFIED: Self = Self(0);
+
     pub fn new(disp: u16) -> crate::error::Result<Self> {
         if disp > MAX_DISPLAY_NUMBER {
             return Err(crate::error::Rx11Error::Protocol(format!(
