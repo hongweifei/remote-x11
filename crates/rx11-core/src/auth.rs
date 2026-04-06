@@ -6,6 +6,9 @@ pub fn generate_token() -> String {
 }
 
 pub fn verify_token(provided: &str, expected: &str) -> bool {
+    if provided.is_empty() || expected.is_empty() {
+        return false;
+    }
     if provided.len() != expected.len() {
         let dummy: u8 = provided.bytes().fold(0u8, |acc, b| acc.wrapping_add(b));
         let _ = dummy;
@@ -64,7 +67,7 @@ mod tests {
 
     #[test]
     fn test_verify_token_empty() {
-        assert!(verify_token("", ""));
+        assert!(!verify_token("", ""));
         assert!(!verify_token("", "a"));
         assert!(!verify_token("a", ""));
     }

@@ -43,19 +43,23 @@ impl CompressionAlgo {
     }
 
     pub fn decompress(&self, compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
-        match self {
-            CompressionAlgo::Zstd => decompress_zstd(compressed, original_len),
-            CompressionAlgo::Lz4 => decompress_lz4(compressed, original_len),
-            CompressionAlgo::Zlib => decompress_zlib(compressed),
+        let result = match self {
+            CompressionAlgo::Zstd => decompress_zstd(compressed)?,
+            CompressionAlgo::Lz4 => decompress_lz4(compressed)?,
+            CompressionAlgo::Zlib => decompress_zlib(compressed, original_len)?,
+        };
+        if result.len() != original_len {
+            return None;
         }
+        Some(result)
     }
 
     pub fn negotiate(
         client_algos: &[CompressionAlgo],
         server_algos: &[CompressionAlgo],
     ) -> Option<CompressionAlgo> {
-        for algo in server_algos {
-            if client_algos.contains(algo) {
+        for algo in &CompressionAlgo::ALL {
+            if client_algos.contains(algo) && server_algos.contains(algo) {
                 return Some(*algo);
             }
         }
@@ -67,7 +71,7 @@ fn compress_zstd(data: &[u8]) -> Option<Vec<u8>> {
     zstd::encode_all(data, 3).ok()
 }
 
-fn decompress_zstd(compressed: &[u8], _original_len: usize) -> Option<Vec<u8>> {
+fn decompress_zstd(compressed: &[u8]) -> Option<Vec<u8>> {
     zstd::decode_all(compressed).ok()
 }
 
@@ -75,7 +79,7 @@ fn compress_lz4(data: &[u8]) -> Option<Vec<u8>> {
     Some(lz4_flex::compress_prepend_size(data))
 }
 
-fn decompress_lz4(compressed: &[u8], _original_len: usize) -> Option<Vec<u8>> {
+fn decompress_lz4(compressed: &[u8]) -> Option<Vec<u8>> {
     lz4_flex::decompress_size_prepended(compressed).ok()
 }
 
@@ -86,11 +90,14 @@ fn compress_zlib(data: &[u8]) -> Option<Vec<u8>> {
     encoder.finish().ok()
 }
 
-fn decompress_zlib(compressed: &[u8]) -> Option<Vec<u8>> {
+fn decompress_zlib(compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
     use flate2::read::ZlibDecoder;
     let mut decoder = ZlibDecoder::new(compressed);
-    let mut output = Vec::new();
+    let mut output = Vec::with_capacity(original_len);
     decoder.read_to_end(&mut output).ok()?;
+    if output.len() != original_len {
+        return None;
+    }
     Some(output)
 }
 
@@ -175,7 +182,7 @@ mod tests {
         ];
         assert_eq!(
             CompressionAlgo::negotiate(&client, &server),
-            Some(CompressionAlgo::Lz4)
+            Some(CompressionAlgo::Zstd)
         );
     }
 
@@ -198,5 +205,20 @@ mod tests {
         assert_eq!(CompressionAlgo::Zstd.as_str(), "zstd");
         assert_eq!(CompressionAlgo::Lz4.as_str(), "lz4");
         assert_eq!(CompressionAlgo::Zlib.as_str(), "zlib");
+    }
+
+    #[test]
+    fn test_decompress_wrong_original_len() {
+        let data = vec![0xAB; 4096];
+        for algo in &CompressionAlgo::ALL {
+            let compressed = algo
+                .compress(&data)
+                .expect(&format!("compress failed: {:?}", algo));
+            assert!(
+                algo.decompress(&compressed, data.len() + 1).is_none(),
+                "should reject wrong original_len: {:?}",
+                algo
+            );
+        }
     }
 }

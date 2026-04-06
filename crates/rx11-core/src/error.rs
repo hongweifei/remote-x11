@@ -34,7 +34,7 @@ impl Rx11Error {
                     | ErrorKind::Interrupted
                     | ErrorKind::UnexpectedEof
             ),
-            Rx11Error::Timeout => true,
+            Rx11Error::Timeout | Rx11Error::ConnectionClosed => true,
             _ => false,
         }
     }
@@ -86,8 +86,8 @@ mod tests {
     }
 
     #[test]
-    fn test_connection_closed_is_not_retriable() {
-        assert!(!Rx11Error::ConnectionClosed.is_retriable());
+    fn test_connection_closed_is_retriable() {
+        assert!(Rx11Error::ConnectionClosed.is_retriable());
     }
 
     #[test]

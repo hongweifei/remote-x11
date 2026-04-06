@@ -38,7 +38,7 @@ impl ConnectionStats {
     }
 
     pub fn inc_x11_connections(&self) {
-        self.x11_connections_active.fetch_add(1, Ordering::Release);
+        self.x11_connections_active.fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn dec_x11_connections(&self) {
@@ -53,7 +53,7 @@ impl ConnectionStats {
     pub fn summary(&self) -> String {
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         let recv = self.bytes_received.load(Ordering::Relaxed);
-        let active = self.x11_connections_active.load(Ordering::Acquire);
+        let active = self.x11_connections_active.load(Ordering::Relaxed);
         let saved = self.compression_saved.load(Ordering::Relaxed);
         let frames = self.compression_frames.load(Ordering::Relaxed);
         let uptime = self.start_time.elapsed();

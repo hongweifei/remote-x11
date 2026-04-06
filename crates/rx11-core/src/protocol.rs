@@ -303,10 +303,12 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
             serde_json::from_slice(payload)
                 .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
         ),
-        0x10 => Frame::SessionCreate(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
+        0x10 => {
+            let msg: SessionCreateMessage = serde_json::from_slice(payload)
+                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?;
+            validate_auth_fields(&msg.auth_name, &msg.auth_data)?;
+            Frame::SessionCreate(msg)
+        }
         0x11 => Frame::SessionAck(
             serde_json::from_slice(payload)
                 .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
@@ -319,10 +321,12 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
             serde_json::from_slice(payload)
                 .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
         ),
-        0x14 => Frame::SessionAutoCreate(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
+        0x14 => {
+            let msg: SessionAutoCreateMessage = serde_json::from_slice(payload)
+                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?;
+            validate_auth_fields(&msg.auth_name, &msg.auth_data)?;
+            Frame::SessionAutoCreate(msg)
+        }
         0x20 => {
             if payload.len() < 4 {
                 return Err(crate::error::Rx11Error::Protocol(
@@ -397,6 +401,8 @@ pub const fn frame_header_size() -> usize {
 
 const MAX_TOKEN_LEN: usize = 256;
 const MAX_SESSION_ID_LEN: usize = 256;
+const MAX_AUTH_NAME_LEN: usize = 256;
+const MAX_AUTH_DATA_LEN: usize = 4096;
 
 pub fn validate_display(display: u16) -> crate::error::Result<()> {
     if display > MAX_DISPLAY_NUMBER {
@@ -425,6 +431,24 @@ pub fn validate_session_id(session_id: &str) -> crate::error::Result<()> {
             "Session ID length must be 1-{} bytes, got {}",
             MAX_SESSION_ID_LEN,
             session_id.len()
+        )));
+    }
+    Ok(())
+}
+
+fn validate_auth_fields(auth_name: &str, auth_data: &[u8]) -> crate::error::Result<()> {
+    if auth_name.len() > MAX_AUTH_NAME_LEN {
+        return Err(crate::error::Rx11Error::Protocol(format!(
+            "auth_name too long: {} bytes (max {})",
+            auth_name.len(),
+            MAX_AUTH_NAME_LEN
+        )));
+    }
+    if auth_data.len() > MAX_AUTH_DATA_LEN {
+        return Err(crate::error::Rx11Error::Protocol(format!(
+            "auth_data too long: {} bytes (max {})",
+            auth_data.len(),
+            MAX_AUTH_DATA_LEN
         )));
     }
     Ok(())
