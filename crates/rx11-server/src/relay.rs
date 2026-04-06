@@ -101,6 +101,7 @@ async fn handle_client(
         Duration::from_secs(HANDSHAKE_TIMEOUT_SECS),
         transport.recv_frame()
     ).await.map_err(|_| anyhow::anyhow!("Handshake timeout: no Hello received within {}s", HANDSHAKE_TIMEOUT_SECS))??;
+    let compression_algo: Option<rx11_core::compress::CompressionAlgo>;
     match hello_frame {
         Frame::Hello(hello) => {
             if hello.version != PROTOCOL_VERSION {
@@ -113,6 +114,7 @@ async fn handle_client(
                             "Version mismatch: got {} expected {}",
                             hello.version, PROTOCOL_VERSION
                         )),
+                        compression: None,
                     }))
                     .await?;
                 return Ok(());
@@ -125,9 +127,18 @@ async fn handle_client(
                         session_id: String::new(),
                         success: false,
                         error_msg: Some("Expected Client mode".into()),
+                        compression: None,
                     }))
                     .await?;
                 return Ok(());
+            }
+
+            let server_algos = &rx11_core::compress::CompressionAlgo::ALL;
+            compression_algo = rx11_core::compress::CompressionAlgo::negotiate(&hello.compression_algos, server_algos);
+            if let Some(algo) = compression_algo {
+                info!("Client {} compression: {}", transport_id, algo.as_str());
+            } else {
+                info!("Client {} compression: disabled", transport_id);
             }
 
             let resume_session_id = hello.resume_session_id;
@@ -140,6 +151,7 @@ async fn handle_client(
                     session_id: transport_id.clone(),
                     success: true,
                     error_msg: None,
+                    compression: compression_algo,
                 }))
                 .await?;
         }
@@ -345,6 +357,20 @@ async fn handle_client(
                         Ok(Frame::DataX11(msg)) => {
                             session_mgr.send_to_x11_connection(msg.connection_id, msg.data).await;
                         }
+                        Ok(Frame::CompressedDataX11 { connection_id, original_len, data }) => {
+                            let algo = match compression_algo {
+                                Some(a) => a,
+                                None => continue,
+                            };
+                            match algo.decompress(&data, original_len) {
+                                Some(decompressed) if decompressed.len() == original_len => {
+                                    session_mgr.send_to_x11_connection(connection_id, decompressed).await;
+                                }
+                                _ => {
+                                    warn!("Decompression failed for connection_id={}, dropping frame", connection_id);
+                                }
+                            }
+                        }
                         Ok(Frame::HeartbeatAck) => {
                             heartbeat_deadline = tokio::time::Instant::now()
                                 + std::time::Duration::from_secs(SERVER_HEARTBEAT_TIMEOUT_SECS);
@@ -373,11 +399,28 @@ async fn handle_client(
                             }
                         }
                         Some(X11ConnToRelay::Data { display, connection_id, data }) => {
-                            if outbound_tx.send(Frame::DataX11(X11DataMessage {
-                                display,
-                                connection_id,
-                                data,
-                            })).await.is_err() {
+                            let frame = if let Some(algo) = compression_algo {
+                                if let Some(compressed) = algo.compress(&data) {
+                                    Frame::CompressedDataX11 {
+                                        connection_id,
+                                        original_len: data.len(),
+                                        data: compressed,
+                                    }
+                                } else {
+                                    Frame::DataX11(X11DataMessage {
+                                        display,
+                                        connection_id,
+                                        data,
+                                    })
+                                }
+                            } else {
+                                Frame::DataX11(X11DataMessage {
+                                    display,
+                                    connection_id,
+                                    data,
+                                })
+                            };
+                            if outbound_tx.send(frame).await.is_err() {
                                 break;
                             }
                         }

@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 pub const MAGIC_BYTES: [u8; 4] = [b'R', b'X', b'1', b'1'];
 pub const DEFAULT_RELAY_PORT: u16 = 7000;
 pub const DEFAULT_X11_PORT: u16 = 6000;
@@ -21,6 +21,7 @@ pub enum MessageType {
     SessionResume = 0x13,
     SessionAutoCreate = 0x14,
     DataX11 = 0x20,
+    CompressedDataX11 = 0x21,
     X11Connect = 0x22,
     X11Disconnect = 0x23,
     Heartbeat = 0x30,
@@ -34,6 +35,12 @@ pub struct HelloMessage {
     pub mode: ConnectionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_session_id: Option<String>,
+    #[serde(default = "default_compression_algos")]
+    pub compression_algos: Vec<crate::compress::CompressionAlgo>,
+}
+
+fn default_compression_algos() -> Vec<crate::compress::CompressionAlgo> {
+    crate::compress::CompressionAlgo::ALL.to_vec()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +49,8 @@ pub struct HelloAckMessage {
     pub session_id: String,
     pub success: bool,
     pub error_msg: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compression: Option<crate::compress::CompressionAlgo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +141,11 @@ pub enum Frame {
     SessionResume(SessionResumeMessage),
     SessionAutoCreate(SessionAutoCreateMessage),
     DataX11(X11DataMessage),
+    CompressedDataX11 {
+        connection_id: u32,
+        original_len: usize,
+        data: Vec<u8>,
+    },
     X11Connect(X11ConnectMessage),
     X11Disconnect(X11DisconnectMessage),
     Heartbeat,
@@ -152,6 +166,7 @@ impl Frame {
             Frame::SessionResume(_) => MessageType::SessionResume,
             Frame::SessionAutoCreate(_) => MessageType::SessionAutoCreate,
             Frame::DataX11(_) => MessageType::DataX11,
+            Frame::CompressedDataX11 { .. } => MessageType::CompressedDataX11,
             Frame::X11Connect(_) => MessageType::X11Connect,
             Frame::X11Disconnect(_) => MessageType::X11Disconnect,
             Frame::Heartbeat => MessageType::Heartbeat,
@@ -190,6 +205,27 @@ pub fn encode_frame(frame: &Frame) -> crate::error::Result<Vec<u8>> {
                 if buf.len() > MAX_FRAME_SIZE {
                     return Err(crate::error::Rx11Error::Protocol(format!(
                         "DataX11 payload too large: {} bytes (max {})",
+                        buf.len(),
+                        MAX_FRAME_SIZE
+                    )));
+                }
+                return Ok(encode_raw(msg_type, &buf));
+            }
+            Frame::CompressedDataX11 {
+                connection_id,
+                original_len,
+                data,
+            } => {
+                let len_u32: u32 = (*original_len).try_into().map_err(|_| {
+                    crate::error::Rx11Error::Protocol("original_len exceeds u32".into())
+                })?;
+                let mut buf = Vec::with_capacity(4 + 4 + data.len());
+                buf.extend_from_slice(&connection_id.to_be_bytes());
+                buf.extend_from_slice(&len_u32.to_be_bytes());
+                buf.extend_from_slice(data);
+                if buf.len() > MAX_FRAME_SIZE {
+                    return Err(crate::error::Rx11Error::Protocol(format!(
+                        "CompressedDataX11 payload too large: {} bytes (max {})",
                         buf.len(),
                         MAX_FRAME_SIZE
                     )));
@@ -301,6 +337,22 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
                 data: payload[4..].to_vec(),
             })
         }
+        0x21 => {
+            if payload.len() < 8 {
+                return Err(crate::error::Rx11Error::Protocol(
+                    "CompressedDataX11 payload too short".into(),
+                ));
+            }
+            let connection_id =
+                u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+            let original_len =
+                u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]) as usize;
+            Frame::CompressedDataX11 {
+                connection_id,
+                original_len,
+                data: payload[8..].to_vec(),
+            }
+        }
         0x22 => Frame::X11Connect(
             serde_json::from_slice(payload)
                 .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
@@ -388,6 +440,7 @@ mod tests {
             version: 1,
             mode: ConnectionMode::Client,
             resume_session_id: None,
+            compression_algos: vec![],
         });
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
@@ -408,6 +461,7 @@ mod tests {
             session_id: "test-session".into(),
             success: true,
             error_msg: None,
+            compression: None,
         });
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();

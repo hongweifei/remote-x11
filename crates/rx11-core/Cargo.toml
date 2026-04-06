@@ -12,3 +12,6 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 hex = { workspace = true }
 rand = { workspace = true }
+flate2 = { workspace = true }
+lz4_flex = { workspace = true }
+zstd = { workspace = true }

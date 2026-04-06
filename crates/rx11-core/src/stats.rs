@@ -5,6 +5,8 @@ pub struct ConnectionStats {
     pub bytes_sent: AtomicU64,
     pub bytes_received: AtomicU64,
     pub x11_connections_active: AtomicU32,
+    compression_saved: AtomicU64,
+    compression_frames: AtomicU64,
     start_time: Instant,
 }
 
@@ -14,6 +16,8 @@ impl ConnectionStats {
             bytes_sent: AtomicU64::new(0),
             bytes_received: AtomicU64::new(0),
             x11_connections_active: AtomicU32::new(0),
+            compression_saved: AtomicU64::new(0),
+            compression_frames: AtomicU64::new(0),
             start_time: Instant::now(),
         }
     }
@@ -24,6 +28,13 @@ impl ConnectionStats {
 
     pub fn add_bytes_received(&self, n: u64) {
         self.bytes_received.fetch_add(n, Ordering::Relaxed);
+    }
+
+    pub fn add_compression_saved(&self, saved: u64) {
+        if saved > 0 {
+            self.compression_saved.fetch_add(saved, Ordering::Relaxed);
+            self.compression_frames.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     pub fn inc_x11_connections(&self) {
@@ -43,6 +54,8 @@ impl ConnectionStats {
         let sent = self.bytes_sent.load(Ordering::Relaxed);
         let recv = self.bytes_received.load(Ordering::Relaxed);
         let active = self.x11_connections_active.load(Ordering::Acquire);
+        let saved = self.compression_saved.load(Ordering::Relaxed);
+        let frames = self.compression_frames.load(Ordering::Relaxed);
         let uptime = self.start_time.elapsed();
 
         let conn_str = if active == 1 {
@@ -51,14 +64,23 @@ impl ConnectionStats {
             "connections".to_string()
         };
 
-        format!(
-            "{} active X11 {} | Sent: {} | Recv: {} | Uptime: {}",
-            active,
-            conn_str,
-            format_bytes(sent),
-            format_bytes(recv),
-            format_duration(uptime),
-        )
+        let mut parts = vec![
+            format!("{} active X11 {}", active, conn_str),
+            format!("Sent: {}", format_bytes(sent)),
+            format!("Recv: {}", format_bytes(recv)),
+        ];
+
+        if saved > 0 {
+            parts.push(format!(
+                "Compressed: saved {} ({} frames)",
+                format_bytes(saved),
+                frames
+            ));
+        }
+
+        parts.push(format!("Uptime: {}", format_duration(uptime)));
+
+        parts.join(" | ")
     }
 }
 
