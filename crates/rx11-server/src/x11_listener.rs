@@ -6,6 +6,8 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use rx11_core::types::{ConnectionId, DisplayNumber};
+
 use crate::session::{SessionManager, X11ConnToRelay, X11RelayToConn};
 
 const INITIAL_BUF_SIZE: usize = 64 * 1024;
@@ -14,12 +16,12 @@ const CHANNEL_BUFFER_SIZE: usize = 2048;
 
 static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-fn next_connection_id() -> u32 {
+fn next_connection_id() -> ConnectionId {
     loop {
         let raw = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let id = (raw & 0xFFFFFFFF) as u32;
         if id != 0 {
-            return id;
+            return ConnectionId::new(id);
         }
     }
 }
@@ -52,22 +54,22 @@ impl X11Listener {
         info!("X11 listening on port {} (display :{})", port, disp);
 
         let session_mgr = self.session_mgr.clone();
-        let disp_clone = disp;
+        let disp_num = DisplayNumber::new(disp).unwrap_or_else(|_| DisplayNumber::new(0).unwrap());
 
         let handle = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, addr)) => {
-                        info!("X11 connection on display :{} from {}", disp_clone, addr);
+                        info!("X11 connection on display {} from {}", disp_num, addr);
                         let mgr = session_mgr.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_x11_connection(stream, disp_clone, mgr).await {
-                                warn!("X11 connection error on display :{}: {}", disp_clone, e);
+                            if let Err(e) = handle_x11_connection(stream, disp_num, mgr).await {
+                                warn!("X11 connection error on display {}: {}", disp_num, e);
                             }
                         });
                     }
                     Err(e) => {
-                        error!("X11 accept error on display :{}: {}", disp_clone, e);
+                        error!("X11 accept error on display {}: {}", disp_num, e);
                     }
                 }
             }
@@ -95,7 +97,7 @@ impl X11Listener {
 
 async fn handle_x11_connection(
     x11_stream: TcpStream,
-    disp: u16,
+    disp: DisplayNumber,
     session_mgr: Arc<SessionManager>,
 ) -> anyhow::Result<()> {
     x11_stream.set_nodelay(true)?;
@@ -105,7 +107,7 @@ async fn handle_x11_connection(
     let event_tx = session_mgr
         .get_x11_event_sender(disp)
         .await
-        .ok_or_else(|| anyhow::anyhow!("No relay registered for display :{}", disp))?;
+        .ok_or_else(|| anyhow::anyhow!("No relay registered for display {}", disp))?;
 
     let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(CHANNEL_BUFFER_SIZE);
     session_mgr
@@ -121,7 +123,7 @@ async fn handle_x11_connection(
         .is_err()
     {
         session_mgr.unregister_x11_connection(connection_id).await;
-        return Err(anyhow::anyhow!("Relay gone for display :{}", disp));
+        return Err(anyhow::anyhow!("Relay gone for display {}", disp));
     }
 
     let (mut read_half, write_half) = tokio::io::split(x11_stream);

@@ -6,6 +6,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
 use rx11_core::auth;
+use rx11_core::compress::CompressionAlgo;
 use rx11_core::protocol::*;
 use rx11_core::transport::Rx11Transport;
 
@@ -110,14 +111,14 @@ async fn handle_client(
             HANDSHAKE_TIMEOUT_SECS
         )
     })??;
-    let compression_algo: Option<rx11_core::compress::CompressionAlgo>;
+    let compression_algo: Option<CompressionAlgo>;
     match hello_frame {
         Frame::Hello(hello) => {
             if hello.version != PROTOCOL_VERSION {
                 transport
                     .send_frame(&Frame::HelloAck(HelloAckMessage {
                         version: PROTOCOL_VERSION,
-                        session_id: String::new(),
+                        session_id: rx11_core::types::SessionId::new(String::new())?,
                         success: false,
                         error_msg: Some(format!(
                             "Version mismatch: got {} expected {}",
@@ -133,7 +134,7 @@ async fn handle_client(
                 transport
                     .send_frame(&Frame::HelloAck(HelloAckMessage {
                         version: PROTOCOL_VERSION,
-                        session_id: String::new(),
+                        session_id: rx11_core::types::SessionId::new(String::new())?,
                         success: false,
                         error_msg: Some("Expected Client mode".into()),
                         compression: None,
@@ -142,8 +143,8 @@ async fn handle_client(
                 return Ok(());
             }
 
-            let server_algos = &rx11_core::compress::CompressionAlgo::ALL;
-            compression_algo = rx11_core::compress::CompressionAlgo::negotiate(
+            let server_algos = &CompressionAlgo::ALL;
+            compression_algo = CompressionAlgo::negotiate(
                 &hello.compression_algos,
                 server_algos,
             );
@@ -160,7 +161,7 @@ async fn handle_client(
             transport
                 .send_frame(&Frame::HelloAck(HelloAckMessage {
                     version: PROTOCOL_VERSION,
-                    session_id: transport_id.clone(),
+                    session_id: rx11_core::types::SessionId::new(transport_id.clone())?,
                     success: true,
                     error_msg: None,
                     compression: compression_algo,
@@ -185,7 +186,7 @@ async fn handle_client(
     })??;
     match auth_frame {
         Frame::AuthRequest(auth_req) => {
-            if let Err(e) = rx11_core::protocol::validate_token_len(&auth_req.token) {
+            if let Err(e) = rx11_core::types::Token::new(auth_req.token.0.clone()) {
                 transport
                     .send_frame(&Frame::AuthResponse(AuthResponseMessage {
                         success: false,
@@ -194,7 +195,7 @@ async fn handle_client(
                     .await?;
                 return Ok(());
             }
-            if !auth::verify_token(&auth_req.token, &auth_token) {
+            if !auth::verify_token(auth_req.token.as_str(), &auth_token) {
                 transport
                     .send_frame(&Frame::AuthResponse(AuthResponseMessage {
                         success: false,
@@ -272,8 +273,8 @@ async fn handle_client(
                                 Ok(session) => {
                                     let disp = session.display;
                                     let sid = session.id.clone();
-                                    info!("Session created for display :{}", disp);
-                                    eprintln!("[rx11] Session created: DISPLAY=:{} (client: {})", disp, tid);
+                                    info!("Session created for display {}", disp);
+                                    eprintln!("[rx11] Session created: DISPLAY={} (client: {})", disp, tid);
                                     session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
                                         display: disp,
@@ -287,7 +288,7 @@ async fn handle_client(
                                 Err(e) => {
                                     let err_msg = format!("{}", e);
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
-                                        display: u16::MAX,
+                                        display: rx11_core::types::DisplayNumber::new(u16::MAX).unwrap_or_else(|_| rx11_core::types::DisplayNumber::new(0).unwrap()),
                                         success: false,
                                         error_msg: Some(err_msg),
                                         session_id: None,
@@ -306,8 +307,8 @@ async fn handle_client(
                                 Ok(session) => {
                                     let disp = session.display;
                                     let sid = session.id.clone();
-                                    info!("Session resumed for display :{}", disp);
-                                    eprintln!("[rx11] Session resumed: DISPLAY=:{} (client: {})", disp, tid);
+                                    info!("Session resumed for display {}", disp);
+                                    eprintln!("[rx11] Session resumed: DISPLAY={} (client: {})", disp, tid);
                                     session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
                                         display: disp,
@@ -321,7 +322,7 @@ async fn handle_client(
                                 Err(e) => {
                                     let err_msg = format!("{}", e);
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
-                                        display: u16::MAX,
+                                        display: rx11_core::types::DisplayNumber::new(u16::MAX).unwrap_or_else(|_| rx11_core::types::DisplayNumber::new(0).unwrap()),
                                         success: false,
                                         error_msg: Some(err_msg),
                                         session_id: None,
@@ -343,8 +344,8 @@ async fn handle_client(
                                 Ok(session) => {
                                     let disp = session.display;
                                     let sid = session.id.clone();
-                                    info!("Session auto-created for display :{}", disp);
-                                    eprintln!("[rx11] Session created: DISPLAY=:{} (client: {})", disp, tid);
+                                    info!("Session auto-created for display {}", disp);
+                                    eprintln!("[rx11] Session created: DISPLAY={} (client: {})", disp, tid);
                                     session_mgr.register_x11_relay(disp, x11_event_tx.clone()).await;
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
                                         display: disp,
@@ -358,7 +359,7 @@ async fn handle_client(
                                 Err(e) => {
                                     let err_msg = format!("{}", e);
                                     if outbound_tx.send(Frame::SessionAck(SessionAckMessage {
-                                        display: u16::MAX,
+                                        display: rx11_core::types::DisplayNumber::new(u16::MAX).unwrap_or_else(|_| rx11_core::types::DisplayNumber::new(0).unwrap()),
                                         success: false,
                                         error_msg: Some(err_msg),
                                         session_id: None,
@@ -371,24 +372,26 @@ async fn handle_client(
                         Ok(Frame::SessionDestroy(msg)) => {
                             let disp = msg.display;
                             if !session_mgr.owns_session(disp, &tid).await {
-                                warn!("Client {} tried to destroy unowned session for display :{}", tid, disp);
+                                warn!("Client {} tried to destroy unowned session for display {}", tid, disp);
                                 continue;
                             }
                             session_mgr.unregister_x11_relay(disp).await;
                             session_mgr.destroy_session(disp).await;
-                            info!("Session destroyed for display :{}", disp);
-                            eprintln!("[rx11] Session destroyed: DISPLAY=:{}", disp);
+                            info!("Session destroyed for display {}", disp);
+                            eprintln!("[rx11] Session destroyed: DISPLAY={}", disp);
                         }
                         Ok(Frame::DataX11(msg)) => {
-                            if !session_mgr.owns_connection(msg.connection_id, &tid).await {
-                                warn!("Client {} sent data for unowned connection_id={}", tid, msg.connection_id);
+                            let conn_id = msg.connection_id;
+                            if !session_mgr.owns_connection(conn_id, &tid).await {
+                                warn!("Client {} sent data for unowned {}", tid, conn_id);
                                 continue;
                             }
-                            session_mgr.send_to_x11_connection(msg.connection_id, msg.data.to_vec()).await;
+                            session_mgr.send_to_x11_connection(conn_id, msg.data.to_vec()).await;
                         }
-                        Ok(Frame::CompressedDataX11 { connection_id, sequence_id: _, original_len, data }) => {
-                            if !session_mgr.owns_connection(connection_id, &tid).await {
-                                warn!("Client {} sent compressed data for unowned connection_id={}", tid, connection_id);
+                        Ok(Frame::CompressedDataX11(msg)) => {
+                            let conn_id = msg.connection_id;
+                            if !session_mgr.owns_connection(conn_id, &tid).await {
+                                warn!("Client {} sent compressed data for unowned {}", tid, conn_id);
                                 continue;
                             }
                             let algo = match compression_algo {
@@ -398,12 +401,12 @@ async fn handle_client(
                                     continue;
                                 }
                             };
-                            match algo.decompress(&data, original_len) {
-                                Some(decompressed) if decompressed.len() == original_len => {
-                                    session_mgr.send_to_x11_connection(connection_id, decompressed).await;
+                            match algo.decompress(&msg.data, msg.original_len) {
+                                Some(decompressed) if decompressed.len() == msg.original_len => {
+                                    session_mgr.send_to_x11_connection(conn_id, decompressed).await;
                                 }
                                 _ => {
-                                    warn!("Decompression failed for connection_id={}, dropping frame", connection_id);
+                                    warn!("Decompression failed for {}, dropping frame", conn_id);
                                 }
                             }
                         }
@@ -415,10 +418,10 @@ async fn handle_client(
                             let target_conn = msg.connection_id;
                             match msg.action {
                                 FlowControlAction::Pause => {
-                                    warn!("Client {} requests pause for connection {:?}", tid, target_conn);
+                                    warn!("Client {} requests pause for {:?}", tid, target_conn);
                                 }
                                 FlowControlAction::Resume => {
-                                    warn!("Client {} requests resume for connection {:?}", tid, target_conn);
+                                    warn!("Client {} requests resume for {:?}", tid, target_conn);
                                 }
                             }
                         }
@@ -446,35 +449,12 @@ async fn handle_client(
                             }
                         }
                         Some(X11ConnToRelay::Data { display: _, connection_id, data }) => {
-                            let frame = if let Some(algo) = compression_algo {
-                                if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
-                                    match algo.compress_to_bytes(&data) {
-                                        Some(compressed) => Frame::CompressedDataX11 {
-                                            connection_id,
-                                            sequence_id: 0,
-                                            original_len: data.len(),
-                                            data: compressed,
-                                        },
-                                        None => Frame::DataX11(X11DataMessage {
-                                            connection_id,
-                                            sequence_id: 0,
-                                            data,
-                                        })
-                                    }
-                                } else {
-                                    Frame::DataX11(X11DataMessage {
-                                        connection_id,
-                                        sequence_id: 0,
-                                        data,
-                                    })
-                                }
-                            } else {
-                                Frame::DataX11(X11DataMessage {
-                                    connection_id,
-                                    sequence_id: 0,
-                                    data,
-                                })
-                            };
+                            let frame = maybe_compress_x11_data(
+                                connection_id,
+                                0,
+                                data,
+                                compression_algo,
+                            );
                             if outbound_tx.send(frame).await.is_err() {
                                 break;
                             }
@@ -511,4 +491,29 @@ async fn handle_client(
     mgr.release_session(&tid).await;
     info!("Client disconnected from {}", addr);
     result
+}
+
+fn maybe_compress_x11_data(
+    connection_id: rx11_core::types::ConnectionId,
+    sequence_id: u32,
+    data: bytes::Bytes,
+    compression_algo: Option<CompressionAlgo>,
+) -> Frame {
+    if let Some(algo) = compression_algo {
+        if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
+            if let Some(compressed) = algo.compress_to_bytes(&data) {
+                return Frame::CompressedDataX11(CompressedX11DataMessage {
+                    connection_id,
+                    sequence_id,
+                    original_len: data.len(),
+                    data: compressed,
+                });
+            }
+        }
+    }
+    Frame::DataX11(X11DataMessage {
+        connection_id,
+        sequence_id,
+        data,
+    })
 }

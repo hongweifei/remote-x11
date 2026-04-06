@@ -10,9 +10,11 @@ use tokio::task::JoinHandle;
 use tracing::{debug, error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
+use rx11_core::compress::CompressionAlgo;
 use rx11_core::protocol::*;
 use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::Rx11Transport;
+use rx11_core::types::{ConnectionId, DisplayNumber, SessionId, Token};
 
 type X11ConnMap = HashMap<u32, (tokio::sync::mpsc::Sender<bytes::Bytes>, JoinHandle<()>)>;
 type SharedX11Conns = Arc<Mutex<X11ConnMap>>;
@@ -103,7 +105,7 @@ impl LocalConnector {
         &self,
         transport: &mut Rx11Transport,
         display: Option<u16>,
-    ) -> anyhow::Result<(u16, String)> {
+    ) -> anyhow::Result<(DisplayNumber, SessionId)> {
         let cookie = generate_display_cookie();
         if self.auto_display {
             transport
@@ -114,16 +116,9 @@ impl LocalConnector {
                 .await?;
         } else {
             let disp = display.unwrap_or(0);
-            if disp > MAX_DISPLAY_NUMBER {
-                anyhow::bail!(
-                    "Display number must be 0-{}, got {}",
-                    MAX_DISPLAY_NUMBER,
-                    disp
-                );
-            }
             transport
                 .send_frame(&Frame::SessionCreate(SessionCreateMessage {
-                    display: disp,
+                    display: DisplayNumber::new(disp)?,
                     auth_name: "MIT-MAGIC-COOKIE-1".to_string(),
                     auth_data: cookie,
                 }))
@@ -139,7 +134,7 @@ impl LocalConnector {
                         ack.error_msg.as_deref().unwrap_or("unknown error")
                     ));
                 }
-                info!("Session created for display :{}", ack.display);
+                info!("Session created for display {}", ack.display);
                 let sid = ack
                     .session_id
                     .ok_or_else(|| anyhow::anyhow!("Missing session_id"))?;
@@ -163,17 +158,21 @@ impl LocalConnector {
         .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
         let mut transport = Rx11Transport::new(stream)?;
 
+        let resume_sid = resume_session_id
+            .map(|s| SessionId::new(s))
+            .transpose()?;
+
         transport
             .send_frame(&Frame::Hello(HelloMessage {
                 version: PROTOCOL_VERSION,
                 mode: ConnectionMode::Client,
-                resume_session_id: resume_session_id.clone(),
-                compression_algos: rx11_core::compress::CompressionAlgo::ALL.to_vec(),
+                resume_session_id: resume_sid.clone(),
+                compression_algos: CompressionAlgo::ALL.to_vec(),
             }))
             .await?;
 
         let ack = transport.recv_frame().await?;
-        let compression_algo: Option<rx11_core::compress::CompressionAlgo>;
+        let compression_algo: Option<CompressionAlgo>;
         match ack {
             Frame::HelloAck(hello_ack) => {
                 if !hello_ack.success {
@@ -199,10 +198,9 @@ impl LocalConnector {
             _ => return Err(anyhow::anyhow!("Expected HelloAck")),
         }
 
+        let token = Token::new(self.auth_token.clone())?;
         transport
-            .send_frame(&Frame::AuthRequest(AuthRequestMessage {
-                token: self.auth_token.clone(),
-            }))
+            .send_frame(&Frame::AuthRequest(AuthRequestMessage { token }))
             .await?;
 
         let auth_resp = transport.recv_frame().await?;
@@ -219,11 +217,9 @@ impl LocalConnector {
             _ => return Err(anyhow::anyhow!("Expected AuthResponse")),
         }
 
-        rx11_core::protocol::validate_token_len(&self.auth_token)?;
+        let actual_display: DisplayNumber;
 
-        let actual_display: u16;
-
-        if let Some(ref sid) = resume_session_id {
+        if let Some(ref sid) = resume_sid {
             transport
                 .send_frame(&Frame::SessionResume(SessionResumeMessage {
                     session_id: sid.clone(),
@@ -241,11 +237,11 @@ impl LocalConnector {
                         let (disp, new_sid) =
                             self.create_session(&mut transport, self.display).await?;
                         actual_display = disp;
-                        *saved_session_id = Some(new_sid);
+                        *saved_session_id = Some(new_sid.into_inner());
                     } else {
                         actual_display = ack.display;
-                        info!("Session resumed for display :{}", ack.display);
-                        *saved_session_id = ack.session_id.clone();
+                        info!("Session resumed for display {}", ack.display);
+                        *saved_session_id = ack.session_id.clone().map(|s| s.into_inner());
                     }
                 }
                 _ => return Err(anyhow::anyhow!("Expected SessionAck for resume")),
@@ -253,7 +249,7 @@ impl LocalConnector {
         } else {
             let (disp, sid) = self.create_session(&mut transport, self.display).await?;
             actual_display = disp;
-            *saved_session_id = Some(sid);
+            *saved_session_id = Some(sid.into_inner());
         }
 
         let (mut read_half, mut write_half) = transport.split();
@@ -300,7 +296,7 @@ impl LocalConnector {
                             Ok(Ok(Frame::X11Connect(msg))) => {
                                 let conn_id = msg.connection_id;
                                 let display = msg.display;
-                                info!("X11 client connected (connection_id={})", conn_id);
+                                info!("X11 client connected ({})", conn_id);
                                 stats.inc_x11_connections();
 
                                 match TcpStream::connect(&self.local_x11_addr).await {
@@ -328,38 +324,13 @@ impl LocalConnector {
                                                                 let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                                                                 let seq_id = seq.fetch_add(1, Ordering::Relaxed);
 
-                                                                let frame = if let Some(algo) = compress {
-                                                                    if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
-                                                                        match algo.compress_to_bytes(&data) {
-                                                                            Some(compressed) => {
-                                                                                stats_clone.add_compression_saved((data.len() - compressed.len()) as u64);
-                                                                                Frame::CompressedDataX11 {
-                                                                                    connection_id: conn_id,
-                                                                                    sequence_id: seq_id,
-                                                                                    original_len: data.len(),
-                                                                                    data: compressed,
-                                                                                }
-                                                                            }
-                                                                            None => Frame::DataX11(X11DataMessage {
-                                                                                connection_id: conn_id,
-                                                                                sequence_id: seq_id,
-                                                                                data,
-                                                                            })
-                                                                        }
-                                                                    } else {
-                                                                        Frame::DataX11(X11DataMessage {
-                                                                            connection_id: conn_id,
-                                                                            sequence_id: seq_id,
-                                                                            data,
-                                                                        })
-                                                                    }
-                                                                } else {
-                                                                    Frame::DataX11(X11DataMessage {
-                                                                        connection_id: conn_id,
-                                                                        sequence_id: seq_id,
-                                                                        data,
-                                                                    })
-                                                                };
+                                                                let frame = maybe_compress_x11_data_with_stats(
+                                                                    conn_id,
+                                                                    seq_id,
+                                                                    data,
+                                                                    compress,
+                                                                    &stats_clone,
+                                                                );
                                                                 if outbound.send(frame).await.is_err() {
                                                                     break;
                                                                 }
@@ -370,7 +341,7 @@ impl LocalConnector {
                                                                 }
                                                             }
                                                             Err(e) => {
-                                                                debug!("Read error from local X Server (connection_id={}): {}", conn_id, e);
+                                                                debug!("Read error from local X Server ({}): {}", conn_id, e);
                                                                 break;
                                                             }
                                                         }
@@ -396,14 +367,14 @@ impl LocalConnector {
                                                     connection_id: conn_id,
                                                 }))
                                                 .await;
-                                            x11_conns_clone.lock().await.remove(&conn_id);
+                                            x11_conns_clone.lock().await.remove(&conn_id.get());
                                             stats_clone.dec_x11_connections();
                                         });
 
-                                        x11_connections.lock().await.insert(conn_id, (write_tx, handle));
+                                        x11_connections.lock().await.insert(conn_id.get(), (write_tx, handle));
                                     }
                                     Err(e) => {
-                                        error!("Failed to connect to local X Server for connection_id={}: {}", conn_id, e);
+                                        error!("Failed to connect to local X Server for {}: {}", conn_id, e);
                                         stats.dec_x11_connections();
                                         let _ = outbound_tx
                                             .send(Frame::X11Disconnect(X11DisconnectMessage {
@@ -422,29 +393,29 @@ impl LocalConnector {
 
                                         let tx = {
                                             let conns = x11_connections.lock().await;
-                                            conns.get(&conn_id).map(|(tx, _)| tx.clone())
+                                            conns.get(&conn_id.get()).map(|(tx, _)| tx.clone())
                                         };
 
                                         if let Some(tx) = tx {
                                             if tx.send(msg.data).await.is_err() {
-                                                debug!("Local X11 connection gone for connection_id={}", conn_id);
-                                                x11_connections.lock().await.remove(&conn_id);
+                                                debug!("Local X11 connection gone for {}", conn_id);
+                                                x11_connections.lock().await.remove(&conn_id.get());
                                             }
                                         } else {
-                                            debug!("No local connection for connection_id={}", conn_id);
-                                            x11_connections.lock().await.remove(&conn_id);
+                                            debug!("No local connection for {}", conn_id);
+                                            x11_connections.lock().await.remove(&conn_id.get());
                                         }
                                     }
-                                    Frame::CompressedDataX11 { connection_id, sequence_id: _, original_len, data } => {
-                                        let conn_id = connection_id;
+                                    Frame::CompressedDataX11(msg) => {
+                                        let conn_id = msg.connection_id;
                                         let algo = match compression_algo {
                                             Some(a) => a,
                                             None => continue,
                                         };
-                                        let decompressed = match algo.decompress(&data, original_len) {
-                                            Some(d) if d.len() == original_len => d,
+                                        let decompressed = match algo.decompress(&msg.data, msg.original_len) {
+                                            Some(d) if d.len() == msg.original_len => d,
                                             _ => {
-                                                warn!("Decompression failed for connection_id={}, dropping frame", conn_id);
+                                                warn!("Decompression failed for {}, dropping frame", conn_id);
                                                 continue;
                                             }
                                         };
@@ -452,17 +423,17 @@ impl LocalConnector {
 
                                         let tx = {
                                             let conns = x11_connections.lock().await;
-                                            conns.get(&conn_id).map(|(tx, _)| tx.clone())
+                                            conns.get(&conn_id.get()).map(|(tx, _)| tx.clone())
                                         };
 
                                         if let Some(tx) = tx {
                                             if tx.send(bytes::Bytes::from(decompressed)).await.is_err() {
-                                                debug!("Local X11 connection gone for connection_id={}", conn_id);
-                                                x11_connections.lock().await.remove(&conn_id);
+                                                debug!("Local X11 connection gone for {}", conn_id);
+                                                x11_connections.lock().await.remove(&conn_id.get());
                                             }
                                         } else {
-                                            debug!("No local connection for connection_id={}", conn_id);
-                                            x11_connections.lock().await.remove(&conn_id);
+                                            debug!("No local connection for {}", conn_id);
+                                            x11_connections.lock().await.remove(&conn_id.get());
                                         }
                                     }
                                      _ => {
@@ -471,14 +442,14 @@ impl LocalConnector {
                                                  let _ = outbound_tx.send(Frame::HeartbeatAck).await;
                                              }
                                               Frame::SessionDestroy(msg) => {
-                                                  info!("Session destroyed for display :{}", msg.display);
+                                                  info!("Session destroyed for display {}", msg.display);
                                                   break;
                                               }
                                               Frame::X11Disconnect(msg) => {
                                                   let conn_id = msg.connection_id;
-                                                  debug!("Remote X11 client disconnected (connection_id={})", conn_id);
+                                                  debug!("Remote X11 client disconnected ({})", conn_id);
                                                   let mut conns = x11_connections.lock().await;
-                                                  conns.remove(&conn_id);
+                                                  conns.remove(&conn_id.get());
                                               }
                                               Frame::Error(msg) => {
                                                   error!("Error from relay (code={}): {}", msg.code, msg.message);
@@ -550,4 +521,31 @@ async fn cleanup_connections(x11_connections: &SharedX11Conns, stats: &Arc<Conne
     for (_, (_, handle)) in conns.drain() {
         handle.abort();
     }
+}
+
+fn maybe_compress_x11_data_with_stats(
+    connection_id: ConnectionId,
+    sequence_id: u32,
+    data: bytes::Bytes,
+    compression_algo: Option<CompressionAlgo>,
+    stats: &ConnectionStats,
+) -> Frame {
+    if let Some(algo) = compression_algo {
+        if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
+            if let Some(compressed) = algo.compress_to_bytes(&data) {
+                stats.add_compression_saved((data.len() - compressed.len()) as u64);
+                return Frame::CompressedDataX11(CompressedX11DataMessage {
+                    connection_id,
+                    sequence_id,
+                    original_len: data.len(),
+                    data: compressed,
+                });
+            }
+        }
+    }
+    Frame::DataX11(X11DataMessage {
+        connection_id,
+        sequence_id,
+        data,
+    })
 }

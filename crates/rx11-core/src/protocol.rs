@@ -1,11 +1,14 @@
 use bytes::{Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 
+use crate::compress::CompressionAlgo;
+use crate::error::{Result, Rx11Error};
+use crate::types::{validate_auth_fields, ConnectionId, DisplayNumber, SessionId, Token};
+
 pub const PROTOCOL_VERSION: u32 = 3;
 pub const MAGIC_BYTES: [u8; 4] = [b'R', b'X', b'1', b'1'];
 pub const DEFAULT_RELAY_PORT: u16 = 7000;
 pub const DEFAULT_X11_PORT: u16 = 6000;
-pub const MAX_DISPLAY_NUMBER: u16 = 255;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
 pub const FRAME_HEADER_SIZE: usize = 9;
 
@@ -37,23 +40,23 @@ pub struct HelloMessage {
     pub version: u32,
     pub mode: ConnectionMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub resume_session_id: Option<String>,
+    pub resume_session_id: Option<SessionId>,
     #[serde(default = "default_compression_algos")]
-    pub compression_algos: Vec<crate::compress::CompressionAlgo>,
+    pub compression_algos: Vec<CompressionAlgo>,
 }
 
-fn default_compression_algos() -> Vec<crate::compress::CompressionAlgo> {
-    crate::compress::CompressionAlgo::ALL.to_vec()
+fn default_compression_algos() -> Vec<CompressionAlgo> {
+    CompressionAlgo::ALL.to_vec()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HelloAckMessage {
     pub version: u32,
-    pub session_id: String,
+    pub session_id: SessionId,
     pub success: bool,
     pub error_msg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub compression: Option<crate::compress::CompressionAlgo>,
+    pub compression: Option<CompressionAlgo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,7 +68,7 @@ pub enum ConnectionMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthRequestMessage {
-    pub token: String,
+    pub token: Token,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,28 +79,28 @@ pub struct AuthResponseMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionCreateMessage {
-    pub display: u16,
+    pub display: DisplayNumber,
     pub auth_name: String,
     pub auth_data: Vec<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionAckMessage {
-    pub display: u16,
+    pub display: DisplayNumber,
     pub success: bool,
     pub error_msg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub session_id: Option<String>,
+    pub session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionDestroyMessage {
-    pub display: u16,
+    pub display: DisplayNumber,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResumeMessage {
-    pub session_id: String,
+    pub session_id: SessionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,21 +117,29 @@ pub struct ErrorMessage {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X11DataMessage {
-    pub connection_id: u32,
+    pub connection_id: ConnectionId,
     pub sequence_id: u32,
     pub data: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressedX11DataMessage {
+    pub connection_id: ConnectionId,
+    pub sequence_id: u32,
+    pub original_len: usize,
+    pub data: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X11ConnectMessage {
-    pub display: u16,
-    pub connection_id: u32,
+    pub display: DisplayNumber,
+    pub connection_id: ConnectionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X11DisconnectMessage {
-    pub display: u16,
-    pub connection_id: u32,
+    pub display: DisplayNumber,
+    pub connection_id: ConnectionId,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,7 +153,111 @@ pub enum FlowControlAction {
 pub struct FlowControlMessage {
     pub action: FlowControlAction,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_id: Option<u32>,
+    pub connection_id: Option<ConnectionId>,
+}
+
+pub enum PayloadEncoding {
+    Json,
+    Binary,
+    Empty,
+}
+
+pub trait FramePayload: serde::Serialize {
+    const MSG_TYPE: MessageType;
+    const ENCODING: PayloadEncoding;
+
+    fn encode_payload(&self) -> Result<Bytes> {
+        match Self::ENCODING {
+            PayloadEncoding::Json => {
+                let json =
+                    serde_json::to_vec(self).map_err(|e| Rx11Error::Protocol(e.to_string()))?;
+                if json.len() > MAX_FRAME_SIZE {
+                    return Err(Rx11Error::Protocol(format!(
+                        "Frame payload too large: {} bytes (max {})",
+                        json.len(),
+                        MAX_FRAME_SIZE
+                    )));
+                }
+                Ok(Bytes::from(json))
+            }
+            PayloadEncoding::Empty => Ok(Bytes::new()),
+            PayloadEncoding::Binary => Err(Rx11Error::Protocol(
+                "Binary encoding requires custom encode_payload implementation".into(),
+            )),
+        }
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self>
+    where
+        Self: serde::de::DeserializeOwned + Sized,
+    {
+        serde_json::from_slice(data).map_err(|e| Rx11Error::Protocol(e.to_string()))
+    }
+}
+
+impl FramePayload for HelloMessage {
+    const MSG_TYPE: MessageType = MessageType::Hello;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for HelloAckMessage {
+    const MSG_TYPE: MessageType = MessageType::HelloAck;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for AuthRequestMessage {
+    const MSG_TYPE: MessageType = MessageType::AuthRequest;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for AuthResponseMessage {
+    const MSG_TYPE: MessageType = MessageType::AuthResponse;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for SessionCreateMessage {
+    const MSG_TYPE: MessageType = MessageType::SessionCreate;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for SessionAckMessage {
+    const MSG_TYPE: MessageType = MessageType::SessionAck;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for SessionDestroyMessage {
+    const MSG_TYPE: MessageType = MessageType::SessionDestroy;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for SessionResumeMessage {
+    const MSG_TYPE: MessageType = MessageType::SessionResume;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for SessionAutoCreateMessage {
+    const MSG_TYPE: MessageType = MessageType::SessionAutoCreate;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for X11ConnectMessage {
+    const MSG_TYPE: MessageType = MessageType::X11Connect;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for X11DisconnectMessage {
+    const MSG_TYPE: MessageType = MessageType::X11Disconnect;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for FlowControlMessage {
+    const MSG_TYPE: MessageType = MessageType::FlowControl;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
+}
+
+impl FramePayload for ErrorMessage {
+    const MSG_TYPE: MessageType = MessageType::Error;
+    const ENCODING: PayloadEncoding = PayloadEncoding::Json;
 }
 
 #[derive(Debug, Clone)]
@@ -158,12 +273,7 @@ pub enum Frame {
     SessionResume(SessionResumeMessage),
     SessionAutoCreate(SessionAutoCreateMessage),
     DataX11(X11DataMessage),
-    CompressedDataX11 {
-        connection_id: u32,
-        sequence_id: u32,
-        original_len: usize,
-        data: Bytes,
-    },
+    CompressedDataX11(CompressedX11DataMessage),
     X11Connect(X11ConnectMessage),
     X11Disconnect(X11DisconnectMessage),
     Heartbeat,
@@ -185,7 +295,7 @@ impl Frame {
             Frame::SessionResume(_) => MessageType::SessionResume,
             Frame::SessionAutoCreate(_) => MessageType::SessionAutoCreate,
             Frame::DataX11(_) => MessageType::DataX11,
-            Frame::CompressedDataX11 { .. } => MessageType::CompressedDataX11,
+            Frame::CompressedDataX11(_) => MessageType::CompressedDataX11,
             Frame::X11Connect(_) => MessageType::X11Connect,
             Frame::X11Disconnect(_) => MessageType::X11Disconnect,
             Frame::Heartbeat => MessageType::Heartbeat,
@@ -194,84 +304,76 @@ impl Frame {
             Frame::Error(_) => MessageType::Error,
         }
     }
+
+    pub fn encode_json_payload<P: FramePayload>(msg: &P) -> Result<Bytes> {
+        msg.encode_payload()
+    }
+
+    pub fn decode_json_payload<P: FramePayload + serde::de::DeserializeOwned>(
+        data: &[u8],
+    ) -> Result<P> {
+        P::decode_payload(data)
+    }
 }
 
-pub fn encode_frame(frame: &Frame) -> crate::error::Result<Bytes> {
+pub fn encode_frame(frame: &Frame) -> Result<Bytes> {
     let msg_type = frame.msg_type() as u8;
     let payload_bytes = match frame {
         Frame::DataX11(m) => {
             if m.data.len() > MAX_FRAME_SIZE {
-                return Err(crate::error::Rx11Error::Protocol(format!(
+                return Err(Rx11Error::Protocol(format!(
                     "DataX11 payload too large: {} bytes (max {})",
                     m.data.len(),
                     MAX_FRAME_SIZE
                 )));
             }
             let mut buf = BytesMut::with_capacity(4 + 4 + m.data.len());
-            buf.extend_from_slice(&m.connection_id.to_be_bytes());
+            buf.extend_from_slice(&m.connection_id.get().to_be_bytes());
             buf.extend_from_slice(&m.sequence_id.to_be_bytes());
             buf.extend_from_slice(&m.data);
             return Ok(encode_raw(msg_type, &buf.freeze()));
         }
-        Frame::CompressedDataX11 {
-            connection_id,
-            sequence_id,
-            original_len,
-            data,
-        } => {
-            let len_u32: u32 = (*original_len).try_into().map_err(|_| {
-                crate::error::Rx11Error::Protocol("original_len exceeds u32".into())
-            })?;
-            if data.len() > MAX_FRAME_SIZE {
-                return Err(crate::error::Rx11Error::Protocol(format!(
+        Frame::CompressedDataX11(m) => {
+            let len_u32: u32 = (m.original_len)
+                .try_into()
+                .map_err(|_| Rx11Error::Protocol("original_len exceeds u32".into()))?;
+            if m.data.len() > MAX_FRAME_SIZE {
+                return Err(Rx11Error::Protocol(format!(
                     "CompressedDataX11 payload too large: {} bytes (max {})",
-                    data.len(),
+                    m.data.len(),
                     MAX_FRAME_SIZE
                 )));
             }
-            let mut buf = BytesMut::with_capacity(4 + 4 + 4 + data.len());
-            buf.extend_from_slice(&connection_id.to_be_bytes());
-            buf.extend_from_slice(&sequence_id.to_be_bytes());
+            let mut buf = BytesMut::with_capacity(4 + 4 + 4 + m.data.len());
+            buf.extend_from_slice(&m.connection_id.get().to_be_bytes());
+            buf.extend_from_slice(&m.sequence_id.to_be_bytes());
             buf.extend_from_slice(&len_u32.to_be_bytes());
-            buf.extend_from_slice(data);
+            buf.extend_from_slice(&m.data);
             return Ok(encode_raw(msg_type, &buf.freeze()));
         }
         Frame::Heartbeat | Frame::HeartbeatAck => Bytes::new(),
         _ => {
-            let json_bytes = encode_control_payload(frame)?;
-            if json_bytes.len() > MAX_FRAME_SIZE {
-                return Err(crate::error::Rx11Error::Protocol(format!(
-                    "Frame payload too large: {} bytes (max {})",
-                    json_bytes.len(),
-                    MAX_FRAME_SIZE
-                )));
-            }
+            let json_bytes = match frame {
+                Frame::Hello(m) => Frame::encode_json_payload(m),
+                Frame::HelloAck(m) => Frame::encode_json_payload(m),
+                Frame::AuthRequest(m) => Frame::encode_json_payload(m),
+                Frame::AuthResponse(m) => Frame::encode_json_payload(m),
+                Frame::SessionCreate(m) => Frame::encode_json_payload(m),
+                Frame::SessionAck(m) => Frame::encode_json_payload(m),
+                Frame::SessionDestroy(m) => Frame::encode_json_payload(m),
+                Frame::SessionResume(m) => Frame::encode_json_payload(m),
+                Frame::SessionAutoCreate(m) => Frame::encode_json_payload(m),
+                Frame::X11Connect(m) => Frame::encode_json_payload(m),
+                Frame::X11Disconnect(m) => Frame::encode_json_payload(m),
+                Frame::FlowControl(m) => Frame::encode_json_payload(m),
+                Frame::Error(m) => Frame::encode_json_payload(m),
+                Frame::DataX11(_) | Frame::CompressedDataX11 { .. } => unreachable!(),
+                Frame::Heartbeat | Frame::HeartbeatAck => unreachable!(),
+            }?;
             json_bytes
         }
     };
     Ok(encode_raw(msg_type, &payload_bytes))
-}
-
-fn encode_control_payload(frame: &Frame) -> crate::error::Result<Bytes> {
-    let json = match frame {
-        Frame::Hello(m) => serde_json::to_vec(m),
-        Frame::HelloAck(m) => serde_json::to_vec(m),
-        Frame::AuthRequest(m) => serde_json::to_vec(m),
-        Frame::AuthResponse(m) => serde_json::to_vec(m),
-        Frame::SessionCreate(m) => serde_json::to_vec(m),
-        Frame::SessionAck(m) => serde_json::to_vec(m),
-        Frame::SessionDestroy(m) => serde_json::to_vec(m),
-        Frame::SessionResume(m) => serde_json::to_vec(m),
-        Frame::SessionAutoCreate(m) => serde_json::to_vec(m),
-        Frame::X11Connect(m) => serde_json::to_vec(m),
-        Frame::X11Disconnect(m) => serde_json::to_vec(m),
-        Frame::FlowControl(m) => serde_json::to_vec(m),
-        Frame::Error(m) => serde_json::to_vec(m),
-        Frame::DataX11(_) | Frame::CompressedDataX11 { .. } => unreachable!(),
-        Frame::Heartbeat | Frame::HeartbeatAck => unreachable!(),
-    }
-    .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?;
-    Ok(Bytes::from(json))
 }
 
 fn encode_raw(msg_type: u8, payload: &[u8]) -> Bytes {
@@ -287,19 +389,17 @@ fn encode_raw(msg_type: u8, payload: &[u8]) -> Bytes {
     buf.freeze()
 }
 
-pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>> {
+pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
     if data.len() < FRAME_HEADER_SIZE {
         return Ok(None);
     }
     if data[0..4] != MAGIC_BYTES {
-        return Err(crate::error::Rx11Error::Protocol(
-            "Invalid magic bytes".into(),
-        ));
+        return Err(Rx11Error::Protocol("Invalid magic bytes".into()));
     }
     let msg_type = data[4];
     let payload_len = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
     if payload_len > MAX_FRAME_SIZE {
-        return Err(crate::error::Rx11Error::Protocol(format!(
+        return Err(Rx11Error::Protocol(format!(
             "Frame payload too large: {} bytes (max {})",
             payload_len, MAX_FRAME_SIZE
         )));
@@ -310,64 +410,39 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
     }
     let payload = &data[FRAME_HEADER_SIZE..total];
     let frame = match msg_type {
-        0x01 => Frame::Hello(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0x02 => Frame::HelloAck(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0x03 => Frame::AuthRequest(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0x04 => Frame::AuthResponse(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
+        0x01 => Frame::Hello(Frame::decode_json_payload(payload)?),
+        0x02 => Frame::HelloAck(Frame::decode_json_payload(payload)?),
+        0x03 => Frame::AuthRequest(Frame::decode_json_payload(payload)?),
+        0x04 => Frame::AuthResponse(Frame::decode_json_payload(payload)?),
         0x10 => {
-            let msg: SessionCreateMessage = serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?;
+            let msg: SessionCreateMessage = Frame::decode_json_payload(payload)?;
             validate_auth_fields(&msg.auth_name, &msg.auth_data)?;
             Frame::SessionCreate(msg)
         }
-        0x11 => Frame::SessionAck(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0x12 => Frame::SessionDestroy(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0x13 => Frame::SessionResume(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
+        0x11 => Frame::SessionAck(Frame::decode_json_payload(payload)?),
+        0x12 => Frame::SessionDestroy(Frame::decode_json_payload(payload)?),
+        0x13 => Frame::SessionResume(Frame::decode_json_payload(payload)?),
         0x14 => {
-            let msg: SessionAutoCreateMessage = serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?;
+            let msg: SessionAutoCreateMessage = Frame::decode_json_payload(payload)?;
             validate_auth_fields(&msg.auth_name, &msg.auth_data)?;
             Frame::SessionAutoCreate(msg)
         }
         0x20 => {
             if payload.len() < 8 {
-                return Err(crate::error::Rx11Error::Protocol(
-                    "DataX11 payload too short".into(),
-                ));
+                return Err(Rx11Error::Protocol("DataX11 payload too short".into()));
             }
             let connection_id =
                 u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
             let sequence_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
             Frame::DataX11(X11DataMessage {
-                connection_id,
+                connection_id: ConnectionId::new(connection_id),
                 sequence_id,
                 data: Bytes::copy_from_slice(&payload[8..]),
             })
         }
         0x21 => {
             if payload.len() < 12 {
-                return Err(crate::error::Rx11Error::Protocol(
+                return Err(Rx11Error::Protocol(
                     "CompressedDataX11 payload too short".into(),
                 ));
             }
@@ -376,24 +451,18 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
             let sequence_id = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
             let original_len =
                 u32::from_be_bytes([payload[8], payload[9], payload[10], payload[11]]) as usize;
-            Frame::CompressedDataX11 {
-                connection_id,
+            Frame::CompressedDataX11(CompressedX11DataMessage {
+                connection_id: ConnectionId::new(connection_id),
                 sequence_id,
                 original_len,
                 data: Bytes::copy_from_slice(&payload[12..]),
-            }
+            })
         }
-        0x22 => Frame::X11Connect(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0x23 => Frame::X11Disconnect(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
+        0x22 => Frame::X11Connect(Frame::decode_json_payload(payload)?),
+        0x23 => Frame::X11Disconnect(Frame::decode_json_payload(payload)?),
         0x30 => {
             if !payload.is_empty() {
-                return Err(crate::error::Rx11Error::Protocol(
+                return Err(Rx11Error::Protocol(
                     "Heartbeat frame must have empty payload".into(),
                 ));
             }
@@ -401,22 +470,16 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
         }
         0x31 => {
             if !payload.is_empty() {
-                return Err(crate::error::Rx11Error::Protocol(
+                return Err(Rx11Error::Protocol(
                     "HeartbeatAck frame must have empty payload".into(),
                 ));
             }
             Frame::HeartbeatAck
         }
-        0x40 => Frame::FlowControl(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
-        0xFF => Frame::Error(
-            serde_json::from_slice(payload)
-                .map_err(|e| crate::error::Rx11Error::Protocol(e.to_string()))?,
-        ),
+        0x40 => Frame::FlowControl(Frame::decode_json_payload(payload)?),
+        0xFF => Frame::Error(Frame::decode_json_payload(payload)?),
         _ => {
-            return Err(crate::error::Rx11Error::Protocol(format!(
+            return Err(Rx11Error::Protocol(format!(
                 "Unknown frame type: 0x{:02x}",
                 msg_type
             )))
@@ -427,61 +490,6 @@ pub fn decode_frame(data: &[u8]) -> crate::error::Result<Option<(Frame, usize)>>
 
 pub const fn frame_header_size() -> usize {
     FRAME_HEADER_SIZE
-}
-
-const MAX_TOKEN_LEN: usize = 256;
-const MAX_SESSION_ID_LEN: usize = 256;
-const MAX_AUTH_NAME_LEN: usize = 256;
-const MAX_AUTH_DATA_LEN: usize = 4096;
-
-pub fn validate_display(display: u16) -> crate::error::Result<()> {
-    if display > MAX_DISPLAY_NUMBER {
-        return Err(crate::error::Rx11Error::Protocol(format!(
-            "Display number must be 0-{}, got {}",
-            MAX_DISPLAY_NUMBER, display
-        )));
-    }
-    Ok(())
-}
-
-pub fn validate_token_len(token: &str) -> crate::error::Result<()> {
-    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
-        return Err(crate::error::Rx11Error::Protocol(format!(
-            "Token length must be 1-{} bytes, got {}",
-            MAX_TOKEN_LEN,
-            token.len()
-        )));
-    }
-    Ok(())
-}
-
-pub fn validate_session_id(session_id: &str) -> crate::error::Result<()> {
-    if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_LEN {
-        return Err(crate::error::Rx11Error::Protocol(format!(
-            "Session ID length must be 1-{} bytes, got {}",
-            MAX_SESSION_ID_LEN,
-            session_id.len()
-        )));
-    }
-    Ok(())
-}
-
-fn validate_auth_fields(auth_name: &str, auth_data: &[u8]) -> crate::error::Result<()> {
-    if auth_name.len() > MAX_AUTH_NAME_LEN {
-        return Err(crate::error::Rx11Error::Protocol(format!(
-            "auth_name too long: {} bytes (max {})",
-            auth_name.len(),
-            MAX_AUTH_NAME_LEN
-        )));
-    }
-    if auth_data.len() > MAX_AUTH_DATA_LEN {
-        return Err(crate::error::Rx11Error::Protocol(format!(
-            "auth_data too long: {} bytes (max {})",
-            auth_data.len(),
-            MAX_AUTH_DATA_LEN
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -512,7 +520,7 @@ mod tests {
     fn test_encode_decode_hello_ack() {
         let frame = Frame::HelloAck(HelloAckMessage {
             version: 1,
-            session_id: "test-session".into(),
+            session_id: SessionId::new("test-session".to_string()).unwrap(),
             success: true,
             error_msg: None,
             compression: None,
@@ -521,7 +529,7 @@ mod tests {
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
             Frame::HelloAck(m) => {
-                assert_eq!(m.session_id, "test-session");
+                assert_eq!(m.session_id.as_str(), "test-session");
                 assert!(m.success);
             }
             _ => panic!("Expected HelloAck frame"),
@@ -531,12 +539,12 @@ mod tests {
     #[test]
     fn test_encode_decode_auth_request() {
         let frame = Frame::AuthRequest(AuthRequestMessage {
-            token: "my-token".into(),
+            token: Token::new("my-token".to_string()).unwrap(),
         });
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
-            Frame::AuthRequest(m) => assert_eq!(m.token, "my-token"),
+            Frame::AuthRequest(m) => assert_eq!(m.token.as_str(), "my-token"),
             _ => panic!("Expected AuthRequest frame"),
         }
     }
@@ -561,7 +569,7 @@ mod tests {
     #[test]
     fn test_encode_decode_session_create() {
         let frame = Frame::SessionCreate(SessionCreateMessage {
-            display: 0,
+            display: DisplayNumber::new(0).unwrap(),
             auth_name: "MIT-MAGIC-COOKIE-1".into(),
             auth_data: vec![1, 2, 3, 4],
         });
@@ -569,7 +577,7 @@ mod tests {
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
             Frame::SessionCreate(m) => {
-                assert_eq!(m.display, 0);
+                assert_eq!(m.display.get(), 0);
                 assert_eq!(m.auth_data, vec![1, 2, 3, 4]);
             }
             _ => panic!("Expected SessionCreate frame"),
@@ -579,7 +587,7 @@ mod tests {
     #[test]
     fn test_encode_decode_data_x11() {
         let frame = Frame::DataX11(X11DataMessage {
-            connection_id: 42,
+            connection_id: ConnectionId::new(42),
             sequence_id: 7,
             data: Bytes::from_static(&[0xAA, 0xBB, 0xCC]),
         });
@@ -587,7 +595,7 @@ mod tests {
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
             Frame::DataX11(m) => {
-                assert_eq!(m.connection_id, 42);
+                assert_eq!(m.connection_id.get(), 42);
                 assert_eq!(m.sequence_id, 7);
                 assert_eq!(&m.data[..], &[0xAA, 0xBB, 0xCC]);
             }
@@ -598,15 +606,15 @@ mod tests {
     #[test]
     fn test_encode_decode_x11_connect() {
         let frame = Frame::X11Connect(X11ConnectMessage {
-            display: 5,
-            connection_id: 100,
+            display: DisplayNumber::new(5).unwrap(),
+            connection_id: ConnectionId::new(100),
         });
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
             Frame::X11Connect(m) => {
-                assert_eq!(m.display, 5);
-                assert_eq!(m.connection_id, 100);
+                assert_eq!(m.display.get(), 5);
+                assert_eq!(m.connection_id.get(), 100);
             }
             _ => panic!("Expected X11Connect frame"),
         }
@@ -641,14 +649,14 @@ mod tests {
     fn test_encode_decode_flow_control() {
         let frame = Frame::FlowControl(FlowControlMessage {
             action: FlowControlAction::Pause,
-            connection_id: Some(42),
+            connection_id: Some(ConnectionId::new(42)),
         });
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
             Frame::FlowControl(m) => {
                 assert_eq!(m.action, FlowControlAction::Pause);
-                assert_eq!(m.connection_id, Some(42));
+                assert_eq!(m.connection_id.unwrap().get(), 42);
             }
             _ => panic!("Expected FlowControl frame"),
         }
@@ -656,25 +664,20 @@ mod tests {
 
     #[test]
     fn test_encode_decode_compressed_data_x11() {
-        let frame = Frame::CompressedDataX11 {
-            connection_id: 42,
+        let frame = Frame::CompressedDataX11(CompressedX11DataMessage {
+            connection_id: ConnectionId::new(42),
             sequence_id: 5,
             original_len: 1000,
             data: Bytes::from_static(&[0x01, 0x02, 0x03]),
-        };
+        });
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
-            Frame::CompressedDataX11 {
-                connection_id,
-                sequence_id,
-                original_len,
-                data,
-            } => {
-                assert_eq!(connection_id, 42);
-                assert_eq!(sequence_id, 5);
-                assert_eq!(original_len, 1000);
-                assert_eq!(&data[..], &[0x01, 0x02, 0x03]);
+            Frame::CompressedDataX11(m) => {
+                assert_eq!(m.connection_id.get(), 42);
+                assert_eq!(m.sequence_id, 5);
+                assert_eq!(m.original_len, 1000);
+                assert_eq!(&m.data[..], &[0x01, 0x02, 0x03]);
             }
             _ => panic!("Expected CompressedDataX11 frame"),
         }
@@ -722,13 +725,15 @@ mod tests {
 
     #[test]
     fn test_msg_type_roundtrip() {
-        let frame = Frame::SessionDestroy(SessionDestroyMessage { display: 3 });
+        let frame = Frame::SessionDestroy(SessionDestroyMessage {
+            display: DisplayNumber::new(3).unwrap(),
+        });
         assert_eq!(frame.msg_type(), MessageType::SessionDestroy);
 
         let encoded = encode_frame(&frame).unwrap();
         let (decoded, _) = decode_frame(&encoded).unwrap().unwrap();
         match decoded {
-            Frame::SessionDestroy(m) => assert_eq!(m.display, 3),
+            Frame::SessionDestroy(m) => assert_eq!(m.display.get(), 3),
             _ => panic!("Expected SessionDestroy frame"),
         }
     }
