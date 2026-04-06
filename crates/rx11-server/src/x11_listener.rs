@@ -6,13 +6,10 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
+use rx11_core::config::BufferDefaults;
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
-use crate::session::{SessionManager, X11ConnToRelay, X11RelayToConn};
-
-const INITIAL_BUF_SIZE: usize = 64 * 1024;
-const MAX_BUF_SIZE: usize = 256 * 1024;
-const CHANNEL_BUFFER_SIZE: usize = 2048;
+use crate::session::{SessionManager, X11ConnToRelay, X11DisplayBinder, X11RelayToConn};
 
 static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
@@ -54,7 +51,7 @@ impl X11Listener {
         info!("X11 listening on port {} (display :{})", port, disp);
 
         let session_mgr = self.session_mgr.clone();
-        let disp_num = DisplayNumber::new(disp).unwrap_or_else(|_| DisplayNumber::new(0).unwrap());
+        let disp_num = DisplayNumber::new(disp).unwrap_or(DisplayNumber::UNSPECIFIED);
 
         let handle = tokio::spawn(async move {
             loop {
@@ -95,6 +92,17 @@ impl X11Listener {
     }
 }
 
+#[async_trait::async_trait]
+impl X11DisplayBinder for X11Listener {
+    async fn bind_display(&self, disp: u16) -> anyhow::Result<()> {
+        Self::bind_display(self, disp).await
+    }
+
+    async fn unbind_display(&self, disp: u16) {
+        Self::unbind_display(self, disp).await
+    }
+}
+
 async fn handle_x11_connection(
     x11_stream: TcpStream,
     disp: DisplayNumber,
@@ -109,7 +117,7 @@ async fn handle_x11_connection(
         .await
         .ok_or_else(|| anyhow::anyhow!("No relay registered for display {}", disp))?;
 
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(CHANNEL_BUFFER_SIZE);
+    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(BufferDefaults::CHANNEL_BUFFER);
     session_mgr
         .register_x11_connection(connection_id, disp, relay_tx)
         .await?;
@@ -130,7 +138,7 @@ async fn handle_x11_connection(
     let event_tx_clone = event_tx.clone();
 
     let socket_to_relay = async move {
-        let mut buf = vec![0u8; INITIAL_BUF_SIZE];
+        let mut buf = vec![0u8; BufferDefaults::INITIAL_READ_BUF];
         loop {
             match read_half.read(&mut buf).await {
                 Ok(0) => break,
@@ -147,8 +155,8 @@ async fn handle_x11_connection(
                     {
                         break;
                     }
-                    if buf.len() < MAX_BUF_SIZE {
-                        let new_size = (buf.len() * 2).min(MAX_BUF_SIZE);
+                    if buf.len() < BufferDefaults::MAX_READ_BUF {
+                        let new_size = (buf.len() * 2).min(BufferDefaults::MAX_READ_BUF);
                         buf.resize(new_size, 0);
                     }
                 }

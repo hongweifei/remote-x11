@@ -1,17 +1,18 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::process::Command;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
-use crate::x11_listener::X11Listener;
-
+use rx11_core::config::ServerDefaults;
 use rx11_core::types::{ConnectionId, DisplayNumber, SessionId};
 
-const SESSION_GRACE_PERIOD_SECS: u64 = 60;
-const MAX_X11_CONNECTIONS_PER_DISPLAY: usize = 64;
+#[async_trait::async_trait]
+pub trait X11DisplayBinder: Send + Sync {
+    async fn bind_display(&self, disp: u16) -> anyhow::Result<()>;
+    async fn unbind_display(&self, disp: u16);
+}
 
 #[derive(Debug, Clone)]
 pub struct Session {
@@ -51,7 +52,7 @@ struct ConnState {
 #[derive(Clone)]
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<u16, Session>>>,
-    x11_listener: Arc<RwLock<Option<Arc<X11Listener>>>>,
+    x11_listener: Arc<RwLock<Option<Arc<dyn X11DisplayBinder>>>>,
     conn_to_relay: Arc<RwLock<HashMap<u16, mpsc::Sender<X11ConnToRelay>>>>,
     connections: Arc<Mutex<HashMap<u32, ConnState>>>,
     display_conns: Arc<Mutex<HashMap<u16, HashSet<u32>>>>,
@@ -76,7 +77,7 @@ impl SessionManager {
         }
     }
 
-    pub async fn set_x11_listener(&self, listener: Arc<X11Listener>) {
+    pub async fn set_x11_listener(&self, listener: Arc<dyn X11DisplayBinder>) {
         let mut x11 = self.x11_listener.write().await;
         *x11 = Some(listener);
     }
@@ -230,7 +231,7 @@ impl SessionManager {
         for (disp, session_id) in &to_release {
             info!(
                 "Client {} disconnected, session {} for display :{} enters grace period ({}s)",
-                client_id, session_id, disp, SESSION_GRACE_PERIOD_SECS
+                client_id, session_id, disp, ServerDefaults::SESSION_GRACE_PERIOD.as_secs()
             );
         }
 
@@ -251,7 +252,7 @@ impl SessionManager {
         let mgr = self.clone();
         let client_id_owned = client_id.to_string();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(SESSION_GRACE_PERIOD_SECS)).await;
+            tokio::time::sleep(ServerDefaults::SESSION_GRACE_PERIOD).await;
             if cancelled.load(Ordering::Relaxed) {
                 return;
             }
@@ -267,7 +268,9 @@ impl SessionManager {
 
             for disp in &to_destroy {
                 warn!("Grace period expired for display :{}, destroying session", disp);
-                mgr.destroy_session(DisplayNumber::new(*disp).unwrap_or_else(|_| DisplayNumber::new(0).unwrap())).await;
+                if let Ok(disp_num) = DisplayNumber::new(*disp) {
+                    mgr.destroy_session(disp_num).await;
+                }
             }
 
             let mut tasks = mgr.grace_tasks.lock().await;
@@ -327,10 +330,10 @@ impl SessionManager {
         {
             let display_conns = self.display_conns.lock().await;
             let count = display_conns.get(&disp_val).map(|s| s.len()).unwrap_or(0);
-            if count >= MAX_X11_CONNECTIONS_PER_DISPLAY {
+            if count >= ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY {
                 return Err(rx11_core::error::Rx11Error::Protocol(format!(
                     "Too many X11 connections for display :{} (max {})",
-                    disp_val, MAX_X11_CONNECTIONS_PER_DISPLAY
+                    disp_val, ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY
                 )));
             }
         }
@@ -379,7 +382,9 @@ impl SessionManager {
             sessions.keys().cloned().collect()
         };
         for disp in displays {
-            self.destroy_session(DisplayNumber::new(disp).unwrap_or_else(|_| DisplayNumber::new(0).unwrap())).await;
+            if let Ok(disp_num) = DisplayNumber::new(disp) {
+                self.destroy_session(disp_num).await;
+            }
         }
         info!("All sessions destroyed");
     }

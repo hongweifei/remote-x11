@@ -11,3 +11,4 @@ anyhow = { workspace = true }
 uuid = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
+async-trait = { workspace = true }
