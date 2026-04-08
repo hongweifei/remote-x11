@@ -119,6 +119,43 @@ pub fn decompress_frame_data(
     algo.decompress(&msg.data, msg.original_len)
 }
 
+pub fn maybe_incremental_or_compress_frame(
+    connection_id: crate::types::ConnectionId,
+    sequence_id: u32,
+    data: Bytes,
+    compression_algo: Option<CompressionAlgo>,
+    incremental_cache: Option<&mut crate::incremental::ConnectionDataCache>,
+) -> crate::protocol::Frame {
+    use crate::protocol::{CompressedX11DataMessage, Frame, X11DataMessage};
+
+    if let Some(cache) = incremental_cache {
+        if let Some(incremental_msg) = cache.compute_incremental(connection_id, sequence_id, &data)
+        {
+            cache.update_cache(connection_id, sequence_id, &data);
+            return Frame::IncrementalDataX11(incremental_msg);
+        }
+        cache.update_cache(connection_id, sequence_id, &data);
+    }
+
+    if let Some(algo) = compression_algo {
+        if data.len() >= COMPRESSION_THRESHOLD {
+            if let Some(compressed) = algo.compress_to_bytes(&data) {
+                return Frame::CompressedDataX11(CompressedX11DataMessage {
+                    connection_id,
+                    sequence_id,
+                    original_len: data.len(),
+                    data: compressed,
+                });
+            }
+        }
+    }
+    Frame::DataX11(X11DataMessage {
+        connection_id,
+        sequence_id,
+        data,
+    })
+}
+
 fn compress_lz4(data: &[u8]) -> Option<Bytes> {
     Some(Bytes::from(lz4_flex::compress_prepend_size(data)))
 }

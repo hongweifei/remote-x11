@@ -27,6 +27,7 @@ pub enum MessageType {
     SessionAutoCreate = 0x14,
     DataX11 = 0x20,
     CompressedDataX11 = 0x21,
+    IncrementalDataX11 = 0x24,
     X11Connect = 0x22,
     X11Disconnect = 0x23,
     Heartbeat = 0x30,
@@ -51,6 +52,7 @@ impl TryFrom<u8> for MessageType {
             0x14 => Ok(MessageType::SessionAutoCreate),
             0x20 => Ok(MessageType::DataX11),
             0x21 => Ok(MessageType::CompressedDataX11),
+            0x24 => Ok(MessageType::IncrementalDataX11),
             0x22 => Ok(MessageType::X11Connect),
             0x23 => Ok(MessageType::X11Disconnect),
             0x30 => Ok(MessageType::Heartbeat),
@@ -79,6 +81,7 @@ impl std::fmt::Display for MessageType {
             MessageType::SessionAutoCreate => f.write_str("SessionAutoCreate"),
             MessageType::DataX11 => f.write_str("DataX11"),
             MessageType::CompressedDataX11 => f.write_str("CompressedDataX11"),
+            MessageType::IncrementalDataX11 => f.write_str("IncrementalDataX11"),
             MessageType::X11Connect => f.write_str("X11Connect"),
             MessageType::X11Disconnect => f.write_str("X11Disconnect"),
             MessageType::Heartbeat => f.write_str("Heartbeat"),
@@ -181,6 +184,22 @@ pub struct CompressedX11DataMessage {
     pub connection_id: ConnectionId,
     pub sequence_id: u32,
     pub original_len: usize,
+    pub data: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalX11DataMessage {
+    pub connection_id: ConnectionId,
+    pub sequence_id: u32,
+    pub base_sequence_id: u32,
+    pub total_len: usize,
+    pub chunks: Vec<IncrementalChunk>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalChunk {
+    pub offset: usize,
+    pub length: usize,
     pub data: Bytes,
 }
 
@@ -289,6 +308,111 @@ impl BinaryMessageCodec for CompressedX11DataMessage {
             sequence_id,
             original_len,
             data: Bytes::copy_from_slice(&data[MIN_LEN..]),
+        })
+    }
+}
+
+impl BinaryMessageCodec for IncrementalX11DataMessage {
+    fn encode_payload(&self) -> Result<Bytes> {
+        let mut buf = BytesMut::new();
+        
+        buf.extend_from_slice(&self.connection_id.get().to_be_bytes());
+        buf.extend_from_slice(&self.sequence_id.to_be_bytes());
+        buf.extend_from_slice(&self.base_sequence_id.to_be_bytes());
+        
+        let total_len_u32: u32 = self.total_len
+            .try_into()
+            .map_err(|_| Rx11Error::Protocol("total_len exceeds u32".into()))?;
+        buf.extend_from_slice(&total_len_u32.to_be_bytes());
+        
+        let chunk_count_u16: u16 = self.chunks.len()
+            .try_into()
+            .map_err(|_| Rx11Error::Protocol("too many chunks".into()))?;
+        buf.extend_from_slice(&chunk_count_u16.to_be_bytes());
+        
+        for chunk in &self.chunks {
+            let offset_u32: u32 = chunk.offset
+                .try_into()
+                .map_err(|_| Rx11Error::Protocol("chunk offset exceeds u32".into()))?;
+            let length_u32: u32 = chunk.length
+                .try_into()
+                .map_err(|_| Rx11Error::Protocol("chunk length exceeds u32".into()))?;
+            
+            buf.extend_from_slice(&offset_u32.to_be_bytes());
+            buf.extend_from_slice(&length_u32.to_be_bytes());
+            buf.extend_from_slice(&chunk.data);
+        }
+        
+        if buf.len() > MAX_FRAME_SIZE {
+            return Err(Rx11Error::Protocol(format!(
+                "IncrementalDataX11 payload too large: {} bytes (max {})",
+                buf.len(),
+                MAX_FRAME_SIZE
+            )));
+        }
+        
+        Ok(buf.freeze())
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        const MIN_LEN: usize = 4 + 4 + 4 + 4 + 2;
+        if data.len() < MIN_LEN {
+            return Err(Rx11Error::Protocol(format!(
+                "IncrementalDataX11 payload too short: {} bytes (min {})",
+                data.len(),
+                MIN_LEN
+            )));
+        }
+        
+        let mut offset = 0;
+        
+        let connection_id = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+        offset += 4;
+        
+        let sequence_id = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+        offset += 4;
+        
+        let base_sequence_id = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]);
+        offset += 4;
+        
+        let total_len = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+        offset += 4;
+        
+        let chunk_count = u16::from_be_bytes([data[offset], data[offset+1]]) as usize;
+        offset += 2;
+        
+        let mut chunks = Vec::with_capacity(chunk_count);
+        for _ in 0..chunk_count {
+            if offset + 8 > data.len() {
+                return Err(Rx11Error::Protocol("Invalid IncrementalDataX11 chunk header".into()));
+            }
+            
+            let chunk_offset = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+            offset += 4;
+            
+            let chunk_length = u32::from_be_bytes([data[offset], data[offset+1], data[offset+2], data[offset+3]]) as usize;
+            offset += 4;
+            
+            if offset + chunk_length > data.len() {
+                return Err(Rx11Error::Protocol("Invalid IncrementalDataX11 chunk data".into()));
+            }
+            
+            let chunk_data = Bytes::copy_from_slice(&data[offset..offset+chunk_length]);
+            offset += chunk_length;
+            
+            chunks.push(IncrementalChunk {
+                offset: chunk_offset,
+                length: chunk_length,
+                data: chunk_data,
+            });
+        }
+        
+        Ok(Self {
+            connection_id: ConnectionId::new(connection_id),
+            sequence_id,
+            base_sequence_id,
+            total_len,
+            chunks,
         })
     }
 }
@@ -423,6 +547,7 @@ define_frame_types! {
     binary {
         DataX11(X11DataMessage),
         CompressedDataX11(CompressedX11DataMessage),
+        IncrementalDataX11(IncrementalX11DataMessage),
     }
     empty {
         Heartbeat,

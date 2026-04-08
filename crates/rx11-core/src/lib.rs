@@ -6,3 +6,4 @@ pub mod stats;
 pub mod compress;
 pub mod types;
 pub mod config;
+pub mod incremental;

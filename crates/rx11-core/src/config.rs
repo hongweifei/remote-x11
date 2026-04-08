@@ -35,3 +35,11 @@ impl BufferDefaults {
     pub const INITIAL_READ_BUF: usize = 64 * 1024;
     pub const MAX_READ_BUF: usize = 256 * 1024;
 }
+
+pub struct IncrementalDefaults;
+
+impl IncrementalDefaults {
+    pub const DEFAULT_CHUNK_SIZE: usize = 4096;
+    pub const MIN_BLOCK_SIZE_FOR_DIFF: usize = 1024;
+    pub const MIN_SAVINGS_RATIO: f64 = 0.1;
+}

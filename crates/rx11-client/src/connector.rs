@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 use rx11_core::auth::generate_display_cookie;
 use rx11_core::compress::CompressionAlgo;
 use rx11_core::config::{BufferDefaults, ClientDefaults};
+use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
 use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::Rx11Transport;
@@ -221,6 +222,7 @@ impl LocalConnector {
         let x11_connections: SharedX11Conns = Arc::new(Mutex::new(HashMap::new()));
         let stats = Arc::new(ConnectionStats::new());
         let seq_counter = Arc::new(AtomicU32::new(1));
+        let mut incremental_cache = ConnectionDataCache::new();
 
         let (outbound_tx, mut outbound_rx) =
             tokio::sync::mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
@@ -317,6 +319,7 @@ impl LocalConnector {
                                 match frame {
                                     Frame::DataX11(msg) => {
                                         stats.add_bytes_received(msg.data.len() as u64);
+                                        incremental_cache.update_cache(msg.connection_id, msg.sequence_id, &msg.data);
                                         send_data_to_local(&x11_connections, msg.connection_id, msg.data).await;
                                     }
                                     Frame::CompressedDataX11(msg) => {
@@ -325,6 +328,7 @@ impl LocalConnector {
                                             None => continue,
                                         };
                                         let original_len = msg.original_len;
+                                        let compressed_len = msg.data.len();
                                         let decompressed = match rx11_core::compress::decompress_frame_data(&msg, algo) {
                                             Some(d) => d,
                                             None => {
@@ -332,11 +336,28 @@ impl LocalConnector {
                                                 continue;
                                             }
                                         };
-                                        stats.add_compression_saved(original_len.saturating_sub(decompressed.len()) as u64);
+                                        stats.add_compression_saved(original_len.saturating_sub(compressed_len) as u64);
+                                        stats.add_bytes_received(decompressed.len() as u64);
+                                        incremental_cache.update_cache(msg.connection_id, msg.sequence_id, &decompressed);
+                                        send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
+                                    }
+                                    Frame::IncrementalDataX11(msg) => {
+                                        let total_len = msg.total_len;
+                                        let decompressed = match incremental_cache.apply_incremental(&msg) {
+                                            Some(d) => d,
+                                            None => {
+                                                warn!("Incremental data apply failed for {}, will request full data", msg.connection_id);
+                                                continue;
+                                            }
+                                        };
+                                        let saved_bytes = total_len.saturating_sub(
+                                            msg.chunks.iter().map(|c| c.data.len()).sum::<usize>()
+                                        );
+                                        stats.add_incremental_saved(saved_bytes as u64);
                                         stats.add_bytes_received(decompressed.len() as u64);
                                         send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
                                     }
-                                    _ => handle_other_frame(frame, &outbound_tx, &x11_connections, &stats).await,
+                                    _ => handle_other_frame(frame, &outbound_tx, &x11_connections, &stats, Some(&mut incremental_cache)).await,
                                 }
                             }
                             Ok(Err(e)) => {
@@ -475,6 +496,7 @@ async fn handle_other_frame(
     outbound: &tokio::sync::mpsc::Sender<Frame>,
     x11_connections: &SharedX11Conns,
     _stats: &ConnectionStats,
+    incremental_cache: Option<&mut ConnectionDataCache>,
 ) {
     match frame {
         Frame::Heartbeat => {
@@ -488,6 +510,9 @@ async fn handle_other_frame(
             debug!("Remote X11 client disconnected ({})", conn_id);
             let mut conns = x11_connections.lock().await;
             conns.remove(&conn_id.get());
+            if let Some(cache) = incremental_cache {
+                cache.clear_connection(conn_id);
+            }
         }
         Frame::Error(msg) => {
             error!("Error from relay (code={}): {}", msg.code, msg.message);

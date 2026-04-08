@@ -5,8 +5,9 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tracing::{info, warn};
 
-use rx11_core::compress::{maybe_compress_frame, CompressionAlgo};
+use rx11_core::compress::{maybe_incremental_or_compress_frame, CompressionAlgo};
 use rx11_core::config::{BufferDefaults, ServerDefaults};
+use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
 use rx11_core::transport::Rx11Transport;
 use rx11_core::types::DisplayNumber;
@@ -118,6 +119,7 @@ async fn handle_client(
         tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
 
     let tid = transport_id.as_str().to_string();
+    let mut incremental_cache = ConnectionDataCache::new();
 
     let mut ctx = RelayContext {
         read_half: &mut read_half,
@@ -128,6 +130,7 @@ async fn handle_client(
         compression,
         heartbeat_deadline: &mut heartbeat_deadline,
         x11_event_tx: &x11_event_tx,
+        incremental_cache: &mut incremental_cache,
     };
 
     let result = relay_loop(&mut ctx).await;
@@ -180,6 +183,7 @@ struct RelayContext<'a> {
     compression: Option<CompressionAlgo>,
     heartbeat_deadline: &'a mut tokio::time::Instant,
     x11_event_tx: &'a tokio::sync::mpsc::Sender<X11ConnToRelay>,
+    incremental_cache: &'a mut ConnectionDataCache,
 }
 
 enum RelayAction {
@@ -212,7 +216,7 @@ async fn relay_loop(ctx: &mut RelayContext<'_>) -> rx11_core::error::Result<()> 
             }
             event = ctx.x11_events.recv() => {
                 if matches!(
-                    handle_x11_event(event, ctx.outbound, ctx.session_mgr, ctx.compression).await,
+                    handle_x11_event(event, ctx.outbound, ctx.session_mgr, ctx.compression, ctx.incremental_cache).await,
                     RelayAction::Disconnect
                 ) {
                     break;
@@ -360,6 +364,7 @@ async fn handle_x11_event(
     outbound: &tokio::sync::mpsc::Sender<Frame>,
     session_mgr: &Arc<SessionManager>,
     compression: Option<CompressionAlgo>,
+    incremental_cache: &mut ConnectionDataCache,
 ) -> RelayAction {
     match event {
         Some(X11ConnToRelay::Connected { display, connection_id }) => {
@@ -377,7 +382,13 @@ async fn handle_x11_event(
             }
         }
         Some(X11ConnToRelay::Data { connection_id, data, .. }) => {
-            let frame = maybe_compress_frame(connection_id, 0, data, compression);
+            let frame = maybe_incremental_or_compress_frame(
+                connection_id, 
+                0, 
+                data, 
+                compression, 
+                Some(incremental_cache)
+            );
             if outbound.send(frame).await.is_err() {
                 RelayAction::Disconnect
             } else {
@@ -386,6 +397,7 @@ async fn handle_x11_event(
         }
         Some(X11ConnToRelay::Disconnected { display, connection_id }) => {
             session_mgr.unregister_x11_connection(connection_id).await;
+            incremental_cache.clear_connection(connection_id);
             if outbound
                 .send(Frame::X11Disconnect(X11DisconnectMessage {
                     display,
