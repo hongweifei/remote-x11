@@ -234,6 +234,7 @@ impl LocalConnector {
             loop {
                 interval.tick().await;
                 info!("[rx11] Status: connected | {}", stats_clone.summary());
+                stats_clone.reset_period();
             }
         });
 

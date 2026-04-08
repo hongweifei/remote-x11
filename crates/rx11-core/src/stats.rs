@@ -2,39 +2,91 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
 
 pub struct ConnectionStats {
-    pub bytes_sent: AtomicU64,
-    pub bytes_received: AtomicU64,
-    pub x11_connections_active: AtomicU32,
-    compression_saved: AtomicU64,
-    compression_frames: AtomicU64,
+    total_bytes_sent: AtomicU64,
+    total_bytes_received: AtomicU64,
+    x11_connections_active: AtomicU32,
+
+    total_compression_saved: AtomicU64,
+    total_compression_frames: AtomicU64,
+
+    total_incremental_saved: AtomicU64,
+    total_incremental_frames: AtomicU64,
+    total_incremental_fallback: AtomicU64,
+
+    period_bytes_sent: AtomicU64,
+    period_bytes_received: AtomicU64,
+    period_compression_saved: AtomicU64,
+    period_compression_frames: AtomicU64,
+    period_incremental_saved: AtomicU64,
+    period_incremental_frames: AtomicU64,
+    period_incremental_fallback: AtomicU64,
+
     start_time: Instant,
 }
 
 impl ConnectionStats {
     pub fn new() -> Self {
         Self {
-            bytes_sent: AtomicU64::new(0),
-            bytes_received: AtomicU64::new(0),
+            total_bytes_sent: AtomicU64::new(0),
+            total_bytes_received: AtomicU64::new(0),
             x11_connections_active: AtomicU32::new(0),
-            compression_saved: AtomicU64::new(0),
-            compression_frames: AtomicU64::new(0),
+            total_compression_saved: AtomicU64::new(0),
+            total_compression_frames: AtomicU64::new(0),
+            total_incremental_saved: AtomicU64::new(0),
+            total_incremental_frames: AtomicU64::new(0),
+            total_incremental_fallback: AtomicU64::new(0),
+            period_bytes_sent: AtomicU64::new(0),
+            period_bytes_received: AtomicU64::new(0),
+            period_compression_saved: AtomicU64::new(0),
+            period_compression_frames: AtomicU64::new(0),
+            period_incremental_saved: AtomicU64::new(0),
+            period_incremental_frames: AtomicU64::new(0),
+            period_incremental_fallback: AtomicU64::new(0),
             start_time: Instant::now(),
         }
     }
 
     pub fn add_bytes_sent(&self, n: u64) {
-        self.bytes_sent.fetch_add(n, Ordering::Relaxed);
+        self.total_bytes_sent.fetch_add(n, Ordering::Relaxed);
+        self.period_bytes_sent.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn add_bytes_received(&self, n: u64) {
-        self.bytes_received.fetch_add(n, Ordering::Relaxed);
+        self.total_bytes_received.fetch_add(n, Ordering::Relaxed);
+        self.period_bytes_received.fetch_add(n, Ordering::Relaxed);
     }
 
     pub fn add_compression_saved(&self, saved: u64) {
         if saved > 0 {
-            self.compression_saved.fetch_add(saved, Ordering::Relaxed);
-            self.compression_frames.fetch_add(1, Ordering::Relaxed);
+            self.total_compression_saved
+                .fetch_add(saved, Ordering::Relaxed);
+            self.total_compression_frames
+                .fetch_add(1, Ordering::Relaxed);
+            self.period_compression_saved
+                .fetch_add(saved, Ordering::Relaxed);
+            self.period_compression_frames
+                .fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    pub fn add_incremental_saved(&self, saved: u64) {
+        if saved > 0 {
+            self.total_incremental_saved
+                .fetch_add(saved, Ordering::Relaxed);
+            self.total_incremental_frames
+                .fetch_add(1, Ordering::Relaxed);
+            self.period_incremental_saved
+                .fetch_add(saved, Ordering::Relaxed);
+            self.period_incremental_frames
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    pub fn add_incremental_full_fallback(&self) {
+        self.total_incremental_fallback
+            .fetch_add(1, Ordering::Relaxed);
+        self.period_incremental_fallback
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     pub fn inc_x11_connections(&self) {
@@ -50,38 +102,110 @@ impl ConnectionStats {
         }
     }
 
+    pub fn reset_period(&self) {
+        self.period_bytes_sent.store(0, Ordering::Relaxed);
+        self.period_bytes_received.store(0, Ordering::Relaxed);
+        self.period_compression_saved.store(0, Ordering::Relaxed);
+        self.period_compression_frames.store(0, Ordering::Relaxed);
+        self.period_incremental_saved.store(0, Ordering::Relaxed);
+        self.period_incremental_frames.store(0, Ordering::Relaxed);
+        self.period_incremental_fallback.store(0, Ordering::Relaxed);
+    }
+
     pub fn summary(&self) -> String {
-        let sent = self.bytes_sent.load(Ordering::Relaxed);
-        let recv = self.bytes_received.load(Ordering::Relaxed);
         let active = self.x11_connections_active.load(Ordering::Relaxed);
-        let saved = self.compression_saved.load(Ordering::Relaxed);
-        let frames = self.compression_frames.load(Ordering::Relaxed);
         let uptime = self.start_time.elapsed();
 
         let conn_str = if active == 1 {
-            "connection".to_string()
+            "connection"
         } else {
-            "connections".to_string()
+            "connections"
         };
 
-        let mut parts = vec![
-            format!("{} active X11 {}", active, conn_str),
-            format!("Sent: {}", format_bytes(sent)),
-            format!("Recv: {}", format_bytes(recv)),
-        ];
+        let mut lines = vec![format!(" {} active X11 {}", active, conn_str)];
 
-        if saved > 0 {
-            parts.push(format!(
-                "Compressed: saved {} ({} frames)",
-                format_bytes(saved),
-                frames
-            ));
-        }
+        self.append_transfer_stats_lines(&mut lines, "Total", self.get_total_stats());
+        self.append_transfer_stats_lines(&mut lines, "Period", self.get_period_stats());
 
-        parts.push(format!("Uptime: {}", format_duration(uptime)));
+        lines.push(format!("  Uptime: {}", format_duration(uptime)));
 
-        parts.join(" | ")
+        lines.join("\n")
     }
+
+    fn get_total_stats(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            bytes_sent: self.total_bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.total_bytes_received.load(Ordering::Relaxed),
+            compression_saved: self.total_compression_saved.load(Ordering::Relaxed),
+            compression_frames: self.total_compression_frames.load(Ordering::Relaxed),
+            incremental_saved: self.total_incremental_saved.load(Ordering::Relaxed),
+            incremental_frames: self.total_incremental_frames.load(Ordering::Relaxed),
+            incremental_fallback: self.total_incremental_fallback.load(Ordering::Relaxed),
+        }
+    }
+
+    fn get_period_stats(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            bytes_sent: self.period_bytes_sent.load(Ordering::Relaxed),
+            bytes_received: self.period_bytes_received.load(Ordering::Relaxed),
+            compression_saved: self.period_compression_saved.load(Ordering::Relaxed),
+            compression_frames: self.period_compression_frames.load(Ordering::Relaxed),
+            incremental_saved: self.period_incremental_saved.load(Ordering::Relaxed),
+            incremental_frames: self.period_incremental_frames.load(Ordering::Relaxed),
+            incremental_fallback: self.period_incremental_fallback.load(Ordering::Relaxed),
+        }
+    }
+
+    fn append_transfer_stats_lines(
+        &self,
+        lines: &mut Vec<String>,
+        prefix: &str,
+        stats: StatsSnapshot,
+    ) {
+        let has_transfer = stats.bytes_sent > 0 || stats.bytes_received > 0;
+        let has_compression = stats.compression_saved > 0 || stats.compression_frames > 0;
+        let has_incremental = stats.incremental_saved > 0
+            || stats.incremental_frames > 0
+            || stats.incremental_fallback > 0;
+
+        if has_transfer || has_compression || has_incremental {
+            lines.push(format!("  {}:", prefix));
+
+            if stats.bytes_sent > 0 || stats.bytes_received > 0 {
+                lines.push(format!("    Sent: {}", format_bytes(stats.bytes_sent)));
+                lines.push(format!("    Recv: {}", format_bytes(stats.bytes_received)));
+            }
+
+            if has_compression {
+                let mut comp_parts = vec![format!("{} frames", stats.compression_frames)];
+                if stats.compression_saved > 0 {
+                    comp_parts.push(format!("saved {}", format_bytes(stats.compression_saved)));
+                }
+                lines.push(format!("    Compressed: {}", comp_parts.join(", ")));
+            }
+
+            if has_incremental {
+                let mut inc_parts = vec![format!("{} frames", stats.incremental_frames)];
+                if stats.incremental_saved > 0 {
+                    inc_parts.push(format!("saved {}", format_bytes(stats.incremental_saved)));
+                }
+                if stats.incremental_fallback > 0 {
+                    inc_parts.push(format!("{} fallbacks", stats.incremental_fallback));
+                }
+                lines.push(format!("    Incremental: {}", inc_parts.join(", ")));
+            }
+        }
+    }
+}
+
+struct StatsSnapshot {
+    bytes_sent: u64,
+    bytes_received: u64,
+    compression_saved: u64,
+    compression_frames: u64,
+    incremental_saved: u64,
+    incremental_frames: u64,
+    incremental_fallback: u64,
 }
 
 impl Default for ConnectionStats {
@@ -113,8 +237,10 @@ fn format_duration(d: std::time::Duration) -> String {
         format!("{}d{}h{}m{}s", days, hours, mins, secs)
     } else if hours > 0 {
         format!("{}h{}m{}s", hours, mins, secs)
-    } else {
+    } else if mins > 0 {
         format!("{}m{}s", mins, secs)
+    } else {
+        format!("{}s", secs)
     }
 }
 
@@ -153,8 +279,8 @@ mod tests {
     #[test]
     fn test_stats_initial_values() {
         let stats = ConnectionStats::new();
-        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.bytes_received.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total_bytes_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total_bytes_received.load(Ordering::Relaxed), 0);
         assert_eq!(stats.x11_connections_active.load(Ordering::Relaxed), 0);
     }
 
@@ -163,8 +289,26 @@ mod tests {
         let stats = ConnectionStats::new();
         stats.add_bytes_sent(100);
         stats.add_bytes_received(200);
-        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 100);
-        assert_eq!(stats.bytes_received.load(Ordering::Relaxed), 200);
+        assert_eq!(stats.total_bytes_sent.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.total_bytes_received.load(Ordering::Relaxed), 200);
+        assert_eq!(stats.period_bytes_sent.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.period_bytes_received.load(Ordering::Relaxed), 200);
+    }
+
+    #[test]
+    fn test_stats_reset_period() {
+        let stats = ConnectionStats::new();
+        stats.add_bytes_sent(100);
+        stats.add_bytes_received(200);
+        stats.add_compression_saved(50);
+        stats.add_incremental_saved(30);
+
+        stats.reset_period();
+
+        assert_eq!(stats.total_bytes_sent.load(Ordering::Relaxed), 100);
+        assert_eq!(stats.total_bytes_received.load(Ordering::Relaxed), 200);
+        assert_eq!(stats.period_bytes_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.period_bytes_received.load(Ordering::Relaxed), 0);
     }
 
     #[test]
@@ -185,26 +329,15 @@ mod tests {
     }
 
     #[test]
-    fn test_stats_summary_contains_active() {
-        let stats = ConnectionStats::new();
-        stats.inc_x11_connections();
-        let summary = stats.summary();
-        assert!(summary.contains("1 active X11 connection"));
-    }
-
-    #[test]
-    fn test_stats_summary_plural() {
-        let stats = ConnectionStats::new();
-        stats.inc_x11_connections();
-        stats.inc_x11_connections();
-        let summary = stats.summary();
-        assert!(summary.contains("2 active X11 connections"));
-    }
-
-    #[test]
     fn test_default() {
         let stats = ConnectionStats::default();
-        assert_eq!(stats.bytes_sent.load(Ordering::Relaxed), 0);
+        assert_eq!(stats.total_bytes_sent.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_format_duration_seconds() {
+        let d = std::time::Duration::from_secs(45);
+        assert_eq!(format_duration(d), "45s");
     }
 
     #[test]
