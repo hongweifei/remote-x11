@@ -358,6 +358,51 @@ impl LocalConnector {
                                         stats.add_bytes_received(decompressed.len() as u64);
                                         send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
                                     }
+                                    Frame::CompressedIncrementalDataX11(msg) => {
+                                        let algo = match compression {
+                                            Some(a) => a,
+                                            None => continue,
+                                        };
+                                        let original_len = msg.original_len;
+                                        let compressed_len = msg.data.len();
+                                        
+                                        // 先解压增量数据的二进制内容
+                                        let decompressed_incremental = match rx11_core::compress::decompress_incremental_frame_data(&msg, algo) {
+                                            Some(d) => d,
+                                            None => {
+                                                warn!("Incremental decompression failed for {}, dropping frame", msg.connection_id);
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        stats.add_incremental_compression_saved(original_len.saturating_sub(compressed_len) as u64);
+                                        
+                                        // 再解码增量消息
+                                        let incremental_msg = match rx11_core::protocol::IncrementalX11DataMessage::decode_payload(&decompressed_incremental) {
+                                            Ok(m) => m,
+                                            Err(e) => {
+                                                warn!("Incremental decode failed for {}: {}", msg.connection_id, e);
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        // 应用增量
+                                        let total_len = incremental_msg.total_len;
+                                        let decompressed = match incremental_cache.apply_incremental(&incremental_msg) {
+                                            Some(d) => d,
+                                            None => {
+                                                warn!("Incremental data apply failed for {}, will request full data", msg.connection_id);
+                                                continue;
+                                            }
+                                        };
+                                        
+                                        let saved_bytes = total_len.saturating_sub(
+                                            incremental_msg.chunks.iter().map(|c| c.data.len()).sum::<usize>()
+                                        );
+                                        stats.add_incremental_saved(saved_bytes as u64);
+                                        stats.add_bytes_received(decompressed.len() as u64);
+                                        send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
+                                    }
                                     _ => handle_other_frame(frame, &outbound_tx, &x11_connections, &stats, Some(&mut incremental_cache)).await,
                                 }
                             }

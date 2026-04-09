@@ -28,6 +28,7 @@ pub enum MessageType {
     DataX11 = 0x20,
     CompressedDataX11 = 0x21,
     IncrementalDataX11 = 0x24,
+    CompressedIncrementalDataX11 = 0x25,
     X11Connect = 0x22,
     X11Disconnect = 0x23,
     Heartbeat = 0x30,
@@ -53,6 +54,7 @@ impl TryFrom<u8> for MessageType {
             0x20 => Ok(MessageType::DataX11),
             0x21 => Ok(MessageType::CompressedDataX11),
             0x24 => Ok(MessageType::IncrementalDataX11),
+            0x25 => Ok(MessageType::CompressedIncrementalDataX11),
             0x22 => Ok(MessageType::X11Connect),
             0x23 => Ok(MessageType::X11Disconnect),
             0x30 => Ok(MessageType::Heartbeat),
@@ -82,6 +84,7 @@ impl std::fmt::Display for MessageType {
             MessageType::DataX11 => f.write_str("DataX11"),
             MessageType::CompressedDataX11 => f.write_str("CompressedDataX11"),
             MessageType::IncrementalDataX11 => f.write_str("IncrementalDataX11"),
+            MessageType::CompressedIncrementalDataX11 => f.write_str("CompressedIncrementalDataX11"),
             MessageType::X11Connect => f.write_str("X11Connect"),
             MessageType::X11Disconnect => f.write_str("X11Disconnect"),
             MessageType::Heartbeat => f.write_str("Heartbeat"),
@@ -200,6 +203,14 @@ pub struct IncrementalX11DataMessage {
 pub struct IncrementalChunk {
     pub offset: usize,
     pub length: usize,
+    pub data: Bytes,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompressedIncrementalX11DataMessage {
+    pub connection_id: ConnectionId,
+    pub sequence_id: u32,
+    pub original_len: usize,
     pub data: Bytes,
 }
 
@@ -417,6 +428,47 @@ impl BinaryMessageCodec for IncrementalX11DataMessage {
     }
 }
 
+impl BinaryMessageCodec for CompressedIncrementalX11DataMessage {
+    fn encode_payload(&self) -> Result<Bytes> {
+        let len_u32: u32 = (self.original_len)
+            .try_into()
+            .map_err(|_| Rx11Error::Protocol("original_len exceeds u32".into()))?;
+        if self.data.len() > MAX_FRAME_SIZE {
+            return Err(Rx11Error::Protocol(format!(
+                "CompressedIncrementalDataX11 payload too large: {} bytes (max {})",
+                self.data.len(),
+                MAX_FRAME_SIZE
+            )));
+        }
+        let mut buf = BytesMut::with_capacity(4 + 4 + 4 + self.data.len());
+        buf.extend_from_slice(&self.connection_id.get().to_be_bytes());
+        buf.extend_from_slice(&self.sequence_id.to_be_bytes());
+        buf.extend_from_slice(&len_u32.to_be_bytes());
+        buf.extend_from_slice(&self.data);
+        Ok(buf.freeze())
+    }
+
+    fn decode_payload(data: &[u8]) -> Result<Self> {
+        const MIN_LEN: usize = 12;
+        if data.len() < MIN_LEN {
+            return Err(Rx11Error::Protocol(format!(
+                "CompressedIncrementalDataX11 payload too short: {} bytes (min {})",
+                data.len(),
+                MIN_LEN
+            )));
+        }
+        let connection_id = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        let sequence_id = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let original_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
+        Ok(Self {
+            connection_id: ConnectionId::new(connection_id),
+            sequence_id,
+            original_len,
+            data: Bytes::copy_from_slice(&data[MIN_LEN..]),
+        })
+    }
+}
+
 fn validate_session_create(msg: &SessionCreateMessage) -> Result<()> {
     validate_auth_fields(&msg.auth_name, &msg.auth_data)
 }
@@ -548,6 +600,7 @@ define_frame_types! {
         DataX11(X11DataMessage),
         CompressedDataX11(CompressedX11DataMessage),
         IncrementalDataX11(IncrementalX11DataMessage),
+        CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage),
     }
     empty {
         Heartbeat,

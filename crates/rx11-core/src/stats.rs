@@ -13,6 +13,9 @@ pub struct ConnectionStats {
     total_incremental_frames: AtomicU64,
     total_incremental_fallback: AtomicU64,
 
+    total_incremental_compression_saved: AtomicU64,
+    total_incremental_compression_frames: AtomicU64,
+
     period_bytes_sent: AtomicU64,
     period_bytes_received: AtomicU64,
     period_compression_saved: AtomicU64,
@@ -20,6 +23,8 @@ pub struct ConnectionStats {
     period_incremental_saved: AtomicU64,
     period_incremental_frames: AtomicU64,
     period_incremental_fallback: AtomicU64,
+    period_incremental_compression_saved: AtomicU64,
+    period_incremental_compression_frames: AtomicU64,
 
     start_time: Instant,
 }
@@ -35,6 +40,8 @@ impl ConnectionStats {
             total_incremental_saved: AtomicU64::new(0),
             total_incremental_frames: AtomicU64::new(0),
             total_incremental_fallback: AtomicU64::new(0),
+            total_incremental_compression_saved: AtomicU64::new(0),
+            total_incremental_compression_frames: AtomicU64::new(0),
             period_bytes_sent: AtomicU64::new(0),
             period_bytes_received: AtomicU64::new(0),
             period_compression_saved: AtomicU64::new(0),
@@ -42,6 +49,8 @@ impl ConnectionStats {
             period_incremental_saved: AtomicU64::new(0),
             period_incremental_frames: AtomicU64::new(0),
             period_incremental_fallback: AtomicU64::new(0),
+            period_incremental_compression_saved: AtomicU64::new(0),
+            period_incremental_compression_frames: AtomicU64::new(0),
             start_time: Instant::now(),
         }
     }
@@ -89,6 +98,19 @@ impl ConnectionStats {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    pub fn add_incremental_compression_saved(&self, saved: u64) {
+        if saved > 0 {
+            self.total_incremental_compression_saved
+                .fetch_add(saved, Ordering::Relaxed);
+            self.total_incremental_compression_frames
+                .fetch_add(1, Ordering::Relaxed);
+            self.period_incremental_compression_saved
+                .fetch_add(saved, Ordering::Relaxed);
+            self.period_incremental_compression_frames
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     pub fn inc_x11_connections(&self) {
         self.x11_connections_active.fetch_add(1, Ordering::Relaxed);
     }
@@ -110,6 +132,10 @@ impl ConnectionStats {
         self.period_incremental_saved.store(0, Ordering::Relaxed);
         self.period_incremental_frames.store(0, Ordering::Relaxed);
         self.period_incremental_fallback.store(0, Ordering::Relaxed);
+        self.period_incremental_compression_saved
+            .store(0, Ordering::Relaxed);
+        self.period_incremental_compression_frames
+            .store(0, Ordering::Relaxed);
     }
 
     pub fn summary(&self) -> String {
@@ -141,6 +167,12 @@ impl ConnectionStats {
             incremental_saved: self.total_incremental_saved.load(Ordering::Relaxed),
             incremental_frames: self.total_incremental_frames.load(Ordering::Relaxed),
             incremental_fallback: self.total_incremental_fallback.load(Ordering::Relaxed),
+            incremental_compression_saved: self
+                .total_incremental_compression_saved
+                .load(Ordering::Relaxed),
+            incremental_compression_frames: self
+                .total_incremental_compression_frames
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -153,6 +185,12 @@ impl ConnectionStats {
             incremental_saved: self.period_incremental_saved.load(Ordering::Relaxed),
             incremental_frames: self.period_incremental_frames.load(Ordering::Relaxed),
             incremental_fallback: self.period_incremental_fallback.load(Ordering::Relaxed),
+            incremental_compression_saved: self
+                .period_incremental_compression_saved
+                .load(Ordering::Relaxed),
+            incremental_compression_frames: self
+                .period_incremental_compression_frames
+                .load(Ordering::Relaxed),
         }
     }
 
@@ -167,8 +205,10 @@ impl ConnectionStats {
         let has_incremental = stats.incremental_saved > 0
             || stats.incremental_frames > 0
             || stats.incremental_fallback > 0;
+        let has_incremental_compression =
+            stats.incremental_compression_saved > 0 || stats.incremental_compression_frames > 0;
 
-        if has_transfer || has_compression || has_incremental {
+        if has_transfer || has_compression || has_incremental || has_incremental_compression {
             lines.push(format!("  {}:", prefix));
 
             if stats.bytes_sent > 0 || stats.bytes_received > 0 {
@@ -181,7 +221,7 @@ impl ConnectionStats {
                 if stats.compression_saved > 0 {
                     comp_parts.push(format!("saved {}", format_bytes(stats.compression_saved)));
                 }
-                lines.push(format!("    Compressed: {}", comp_parts.join(", ")));
+                lines.push(format!("    Compressed (full): {}", comp_parts.join(", ")));
             }
 
             if has_incremental {
@@ -193,6 +233,21 @@ impl ConnectionStats {
                     inc_parts.push(format!("{} fallbacks", stats.incremental_fallback));
                 }
                 lines.push(format!("    Incremental: {}", inc_parts.join(", ")));
+            }
+
+            if has_incremental_compression {
+                let mut inc_comp_parts =
+                    vec![format!("{} frames", stats.incremental_compression_frames)];
+                if stats.incremental_compression_saved > 0 {
+                    inc_comp_parts.push(format!(
+                        "saved {}",
+                        format_bytes(stats.incremental_compression_saved)
+                    ));
+                }
+                lines.push(format!(
+                    "    Compressed (incremental): {}",
+                    inc_comp_parts.join(", ")
+                ));
             }
         }
     }
@@ -206,6 +261,8 @@ struct StatsSnapshot {
     incremental_saved: u64,
     incremental_frames: u64,
     incremental_fallback: u64,
+    incremental_compression_saved: u64,
+    incremental_compression_frames: u64,
 }
 
 impl Default for ConnectionStats {
