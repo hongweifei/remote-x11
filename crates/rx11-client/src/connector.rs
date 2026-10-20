@@ -1,25 +1,36 @@
-use rand::RngExt;
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+//! Client connector: establishes the relay connection (handshake, session
+//! creation or resume), runs the proxy receive loop and reconnects with
+//! exponential backoff on transient failures.
+
+use std::sync::atomic::AtomicU32;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+use rand::RngExt;
 use tokio::net::TcpStream;
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
-use tracing::{debug, error, info, warn};
+use tokio::sync::mpsc;
+use tracing::{error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
 use rx11_core::compress::CompressionAlgo;
 use rx11_core::config::{BufferDefaults, ClientDefaults};
+use rx11_core::error::{is_retriable_io_error, Rx11Error};
 use rx11_core::incremental::ConnectionDataCache;
-use rx11_core::protocol::*;
+use rx11_core::protocol::{
+    client_handshake, Frame, SessionAckMessage, SessionAutoCreateMessage, SessionCreateMessage,
+    SessionResumeMessage,
+};
 use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::Rx11Transport;
-use rx11_core::types::{ConnectionId, DisplayNumber, SessionId, Token};
+use rx11_core::types::{DisplayNumber, SessionId, Token};
 
-type X11ConnMap = HashMap<u32, (tokio::sync::mpsc::Sender<bytes::Bytes>, JoinHandle<()>)>;
-type SharedX11Conns = Arc<Mutex<X11ConnMap>>;
+use crate::proxy::{cleanup_connections, new_shared_conns, ProxyDeps};
+use crate::serve::{serve, ServeCtx};
+
+/// X11 authorization protocol the client always requests.
+const X11_AUTH_NAME: &str = "MIT-MAGIC-COOKIE-1";
+/// Ceiling of the exponential backoff doubling (`base * 2^cap`).
+const MAX_BACKOFF_EXPONENT: u32 = 10;
 
 pub struct LocalConnector {
     relay_addr: String,
@@ -52,112 +63,56 @@ impl LocalConnector {
         }
     }
 
+    /// Run connect/serve cycles, retrying retriable failures while carrying
+    /// the session id over for resume attempts.
     pub async fn connect_and_serve(&self) -> anyhow::Result<()> {
         let mut attempt: u32 = 0;
         let mut last_session_id: Option<String> = None;
         loop {
             let sid = last_session_id.take();
-            if let Err(e) = self
-                .connect_and_serve_inner(sid, &mut last_session_id)
-                .await
-            {
-                let retriable = e
-                    .downcast_ref::<rx11_core::error::Rx11Error>()
-                    .map(|re| re.is_retriable())
-                    .or_else(|| {
-                        e.downcast_ref::<std::io::Error>().map(|io| {
-                            matches!(
-                                io.kind(),
-                                std::io::ErrorKind::ConnectionRefused
-                                    | std::io::ErrorKind::ConnectionReset
-                                    | std::io::ErrorKind::ConnectionAborted
-                                    | std::io::ErrorKind::BrokenPipe
-                                    | std::io::ErrorKind::TimedOut
-                                    | std::io::ErrorKind::UnexpectedEof
-                            )
-                        })
-                    })
-                    .unwrap_or(false);
+            let result = self
+                .connect_and_serve_once(sid.as_deref(), &mut last_session_id)
+                .await;
 
-                if !retriable {
-                    return Err(e);
-                }
-
-                attempt += 1;
-                if attempt > self.max_retries {
-                    error!("Max reconnection attempts ({}) reached", self.max_retries);
-                    return Err(e);
-                }
-
-                let delay = self.calculate_backoff(attempt);
-                warn!(
-                    "Connection lost ({}), reconnecting in {:?} (attempt {}/{})",
-                    e, delay, attempt, self.max_retries
-                );
-                tokio::time::sleep(delay).await;
-            } else {
+            let Err(e) = result else {
                 return Ok(());
+            };
+
+            if !is_retriable(&e) {
+                return Err(e);
             }
+
+            attempt += 1;
+            if attempt > self.max_retries {
+                error!("Max reconnection attempts ({}) reached", self.max_retries);
+                return Err(e);
+            }
+
+            let delay = self.calculate_backoff(attempt);
+            warn!(
+                "Connection lost ({}), reconnecting in {:?} (attempt {}/{})",
+                e, delay, attempt, self.max_retries
+            );
+            tokio::time::sleep(delay).await;
         }
     }
 
     fn calculate_backoff(&self, attempt: u32) -> Duration {
         let base_ms = self.retry_base_delay.as_millis() as u64;
         let max_ms = self.retry_max_delay.as_millis() as u64;
-        let backoff_ms = base_ms.saturating_mul(1u64 << attempt.min(10));
+        let backoff_ms = base_ms.saturating_mul(1u64 << attempt.min(MAX_BACKOFF_EXPONENT));
         let capped_ms = backoff_ms.min(max_ms);
         let jitter = rand::rng().random_range(0..=(capped_ms / 4));
         Duration::from_millis((capped_ms + jitter).min(max_ms))
     }
 
-    async fn create_session(
+    /// Connect the TCP stream, perform the handshake and obtain a session
+    /// (resuming `resume_session_id` when the server still has it).
+    async fn establish(
         &self,
-        transport: &mut Rx11Transport,
-        display: Option<u16>,
-    ) -> anyhow::Result<(DisplayNumber, SessionId)> {
-        let cookie = generate_display_cookie();
-        if self.auto_display {
-            transport
-                .send_frame(&Frame::SessionAutoCreate(SessionAutoCreateMessage {
-                    auth_name: "MIT-MAGIC-COOKIE-1".to_string(),
-                    auth_data: cookie,
-                }))
-                .await?;
-        } else {
-            let disp = display.unwrap_or(0);
-            transport
-                .send_frame(&Frame::SessionCreate(SessionCreateMessage {
-                    display: DisplayNumber::new(disp)?,
-                    auth_name: "MIT-MAGIC-COOKIE-1".to_string(),
-                    auth_data: cookie,
-                }))
-                .await?;
-        }
-
-        let session_ack = transport.recv_frame().await?;
-        match session_ack {
-            Frame::SessionAck(ack) => {
-                if !ack.success {
-                    return Err(anyhow::anyhow!(
-                        "Session create failed: {}",
-                        ack.error_msg.as_deref().unwrap_or("unknown error")
-                    ));
-                }
-                info!("Session created for display {}", ack.display);
-                let sid = ack
-                    .session_id
-                    .ok_or_else(|| anyhow::anyhow!("Missing session_id"))?;
-                Ok((ack.display, sid))
-            }
-            _ => Err(anyhow::anyhow!("Expected SessionAck")),
-        }
-    }
-
-    async fn connect_and_serve_inner(
-        &self,
-        resume_session_id: Option<String>,
+        resume_session_id: Option<&str>,
         saved_session_id: &mut Option<String>,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<(Rx11Transport, DisplayNumber, Option<CompressionAlgo>)> {
         info!("Connecting to relay at {}", self.relay_addr);
         let stream = tokio::time::timeout(
             ClientDefaults::TCP_CONNECT_TIMEOUT,
@@ -167,7 +122,9 @@ impl LocalConnector {
         .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
         let mut transport = Rx11Transport::new(stream)?;
 
-        let resume_sid = resume_session_id.map(SessionId::new).transpose()?;
+        let resume_sid = resume_session_id
+            .map(|s| SessionId::new(s.to_string()))
+            .transpose()?;
 
         let token = Token::new(self.auth_token.clone())?;
         let handshake = client_handshake(
@@ -185,63 +142,111 @@ impl LocalConnector {
             compression.map(|a| a.as_str()).unwrap_or("disabled")
         );
 
-        let actual_display: DisplayNumber;
-
-        if let Some(ref sid) = resume_sid {
-            transport
-                .send_frame(&Frame::SessionResume(SessionResumeMessage {
-                    session_id: sid.clone(),
-                }))
-                .await?;
-
-            let resume_ack = transport.recv_frame().await?;
-            match resume_ack {
-                Frame::SessionAck(ack) => {
-                    if !ack.success {
-                        warn!(
-                            "Session resume failed: {}, creating new session",
-                            ack.error_msg.as_deref().unwrap_or("unknown error")
-                        );
-                        let (disp, new_sid) =
-                            self.create_session(&mut transport, self.display).await?;
-                        actual_display = disp;
-                        *saved_session_id = Some(new_sid.into_inner());
-                    } else {
-                        actual_display = ack.display;
-                        info!("Session resumed for display {}", ack.display);
-                        *saved_session_id = ack.session_id.clone().map(|s| s.into_inner());
-                    }
-                }
-                _ => return Err(anyhow::anyhow!("Expected SessionAck for resume")),
-            }
+        let display = if let Some(ref sid) = resume_sid {
+            self.try_resume_session(&mut transport, sid, saved_session_id)
+                .await?
         } else {
-            let (disp, sid) = self.create_session(&mut transport, self.display).await?;
-            actual_display = disp;
+            let (disp, sid) = self.request_new_session(&mut transport).await?;
             *saved_session_id = Some(sid.into_inner());
+            disp
+        };
+
+        Ok((transport, display, compression))
+    }
+
+    async fn try_resume_session(
+        &self,
+        transport: &mut Rx11Transport,
+        sid: &SessionId,
+        saved_session_id: &mut Option<String>,
+    ) -> anyhow::Result<DisplayNumber> {
+        transport
+            .send_frame(&Frame::SessionResume(SessionResumeMessage {
+                session_id: sid.clone(),
+            }))
+            .await?;
+
+        let ack = recv_session_ack(transport).await?;
+        if !ack.success {
+            warn!(
+                "Session resume failed: {}, creating new session",
+                ack.error_msg.as_deref().unwrap_or("unknown error")
+            );
+            let (disp, new_sid) = self.request_new_session(transport).await?;
+            *saved_session_id = Some(new_sid.into_inner());
+            return Ok(disp);
         }
 
-        let (mut read_half, mut write_half) = transport.split();
+        info!("Session resumed for display {}", ack.display);
+        *saved_session_id = ack.session_id.clone().map(SessionId::into_inner);
+        Ok(ack.display)
+    }
 
-        let x11_connections: SharedX11Conns = Arc::new(Mutex::new(HashMap::new()));
+    async fn request_new_session(
+        &self,
+        transport: &mut Rx11Transport,
+    ) -> anyhow::Result<(DisplayNumber, SessionId)> {
+        let cookie = generate_display_cookie();
+        let frame = if self.auto_display {
+            Frame::SessionAutoCreate(SessionAutoCreateMessage {
+                auth_name: X11_AUTH_NAME.to_string(),
+                auth_data: cookie,
+            })
+        } else {
+            Frame::SessionCreate(SessionCreateMessage {
+                display: DisplayNumber::new(self.display.unwrap_or(0))?,
+                auth_name: X11_AUTH_NAME.to_string(),
+                auth_data: cookie,
+            })
+        };
+        transport.send_frame(&frame).await?;
+
+        let ack = recv_session_ack(transport).await?;
+        if !ack.success {
+            return Err(anyhow::anyhow!(
+                "Session create failed: {}",
+                ack.error_msg.as_deref().unwrap_or("unknown error")
+            ));
+        }
+        info!("Session created for display {}", ack.display);
+        let sid = ack
+            .session_id
+            .ok_or_else(|| anyhow::anyhow!("Missing session_id"))?;
+        Ok((ack.display, sid))
+    }
+
+    async fn connect_and_serve_once(
+        &self,
+        resume_session_id: Option<&str>,
+        saved_session_id: &mut Option<String>,
+    ) -> anyhow::Result<()> {
+        let (transport, actual_display, compression) =
+            self.establish(resume_session_id, saved_session_id).await?;
+        let (mut read_half, write_half) = transport.split();
+
+        let x11_connections = new_shared_conns();
         let stats = Arc::new(ConnectionStats::new());
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::new();
 
         let (outbound_tx, mut outbound_rx) =
-            tokio::sync::mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
+            mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
 
-        let stats_clone = stats.clone();
-        let stats_task = tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.tick().await;
-            loop {
-                interval.tick().await;
-                info!("[rx11] Status: connected | {}", stats_clone.summary());
-                stats_clone.reset_period();
-            }
-        });
+        let stats_logger = {
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(ClientDefaults::STATUS_INTERVAL);
+                interval.tick().await; // first tick completes immediately
+                loop {
+                    interval.tick().await;
+                    info!("[rx11] Status: connected | {}", stats.summary());
+                    stats.reset_period();
+                }
+            })
+        };
 
         let sender_task = tokio::spawn(async move {
+            let mut write_half = write_half;
             while let Some(frame) = outbound_rx.recv().await {
                 if write_half.send_frame(&frame).await.is_err() {
                     break;
@@ -255,189 +260,24 @@ impl LocalConnector {
             self.local_x11_addr
         );
 
-        let result: anyhow::Result<()> = async {
-            loop {
-                tokio::select! {
-                    frame_result = tokio::time::timeout(
-                        ClientDefaults::READ_TIMEOUT,
-                        read_half.recv_frame()
-                    ) => {
-                        match frame_result {
-                            Ok(Ok(Frame::X11Connect(msg))) => {
-                                let conn_id = msg.connection_id;
-                                let display = msg.display;
-                                info!("X11 client connected ({})", conn_id);
-                                stats.inc_x11_connections();
+        let result = {
+            let mut ctx = ServeCtx {
+                read_half: &mut read_half,
+                proxy: ProxyDeps {
+                    outbound: &outbound_tx,
+                    x11_connections: &x11_connections,
+                    stats: &stats,
+                    compression,
+                    seq: &seq_counter,
+                    local_x11_addr: &self.local_x11_addr,
+                },
+                incremental_cache: &mut incremental_cache,
+                display: actual_display,
+            };
+            serve(&mut ctx).await
+        };
 
-                                match TcpStream::connect(&self.local_x11_addr).await {
-                                    Ok(local_stream) => {
-                                        local_stream.set_nodelay(true)?;
-                                        let (mut local_read, mut local_write) = tokio::io::split(local_stream);
-
-                                        let (write_tx, mut write_rx) =
-                                            tokio::sync::mpsc::channel::<bytes::Bytes>(BufferDefaults::CHANNEL_BUFFER);
-
-                                        let outbound = outbound_tx.clone();
-                                        let stats_clone = stats.clone();
-                                        let x11_conns_clone = x11_connections.clone();
-                                        let compress = compression;
-                                        let seq = seq_counter.clone();
-
-                                        let handle = tokio::spawn(async move {
-                                            let ctx = ProxyContext {
-                                                conn_id,
-                                                local_read: &mut local_read,
-                                                local_write: &mut local_write,
-                                                relay_rx: &mut write_rx,
-                                                outbound: &outbound,
-                                                stats: &stats_clone,
-                                                compression: compress,
-                                                seq: &seq,
-                                            };
-                                            proxy_local_x11_connection(ctx).await;
-                                            let _ = outbound
-                                                .send(Frame::X11Disconnect(X11DisconnectMessage {
-                                                    display,
-                                                    connection_id: conn_id,
-                                                }))
-                                                .await;
-                                            x11_conns_clone.lock().await.remove(&conn_id.get());
-                                            stats_clone.dec_x11_connections();
-                                        });
-
-                                        x11_connections.lock().await.insert(conn_id.get(), (write_tx, handle));
-                                    }
-                                    Err(e) => {
-                                        error!("Failed to connect to local X Server for {}: {}", conn_id, e);
-                                        stats.dec_x11_connections();
-                                        let _ = outbound_tx
-                                            .send(Frame::X11Disconnect(X11DisconnectMessage {
-                                                display: msg.display,
-                                                connection_id: conn_id,
-                                            }))
-                                            .await;
-                                    }
-                                }
-                            }
-                            Ok(Ok(frame)) => {
-                                match frame {
-                                    Frame::DataX11(msg) => {
-                                        stats.add_bytes_received(msg.data.len() as u64);
-                                        incremental_cache.update_cache(msg.connection_id, msg.sequence_id, &msg.data);
-                                        send_data_to_local(&x11_connections, msg.connection_id, msg.data).await;
-                                    }
-                                    Frame::CompressedDataX11(msg) => {
-                                        let algo = match compression {
-                                            Some(a) => a,
-                                            None => continue,
-                                        };
-                                        let original_len = msg.original_len;
-                                        let compressed_len = msg.data.len();
-                                        let decompressed = match rx11_core::compress::decompress_frame_data(&msg, algo) {
-                                            Some(d) => d,
-                                            None => {
-                                                warn!("Decompression failed for {}, dropping frame", msg.connection_id);
-                                                continue;
-                                            }
-                                        };
-                                        stats.add_compression_saved(original_len.saturating_sub(compressed_len) as u64);
-                                        stats.add_bytes_received(decompressed.len() as u64);
-                                        incremental_cache.update_cache(msg.connection_id, msg.sequence_id, &decompressed);
-                                        send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
-                                    }
-                                    Frame::IncrementalDataX11(msg) => {
-                                        let total_len = msg.total_len;
-                                        let decompressed = match incremental_cache.apply_incremental(&msg) {
-                                            Some(d) => d,
-                                            None => {
-                                                warn!("Incremental data apply failed for {}, will request full data", msg.connection_id);
-                                                continue;
-                                            }
-                                        };
-                                        let saved_bytes = total_len.saturating_sub(
-                                            msg.chunks.iter().map(|c| c.data.len()).sum::<usize>()
-                                        );
-                                        stats.add_incremental_saved(saved_bytes as u64);
-                                        stats.add_bytes_received(decompressed.len() as u64);
-                                        send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
-                                    }
-                                    Frame::CompressedIncrementalDataX11(msg) => {
-                                        let algo = match compression {
-                                            Some(a) => a,
-                                            None => continue,
-                                        };
-                                        let original_len = msg.original_len;
-                                        let compressed_len = msg.data.len();
-                                        
-                                        // 先解压增量数据的二进制内容
-                                        let decompressed_incremental = match rx11_core::compress::decompress_incremental_frame_data(&msg, algo) {
-                                            Some(d) => d,
-                                            None => {
-                                                warn!("Incremental decompression failed for {}, dropping frame", msg.connection_id);
-                                                continue;
-                                            }
-                                        };
-                                        
-                                        stats.add_incremental_compression_saved(original_len.saturating_sub(compressed_len) as u64);
-                                        
-                                        // 再解码增量消息
-                                        let incremental_msg = match rx11_core::protocol::IncrementalX11DataMessage::decode_payload(&decompressed_incremental) {
-                                            Ok(m) => m,
-                                            Err(e) => {
-                                                warn!("Incremental decode failed for {}: {}", msg.connection_id, e);
-                                                continue;
-                                            }
-                                        };
-                                        
-                                        // 应用增量
-                                        let total_len = incremental_msg.total_len;
-                                        let decompressed = match incremental_cache.apply_incremental(&incremental_msg) {
-                                            Some(d) => d,
-                                            None => {
-                                                warn!("Incremental data apply failed for {}, will request full data", msg.connection_id);
-                                                continue;
-                                            }
-                                        };
-                                        
-                                        let saved_bytes = total_len.saturating_sub(
-                                            incremental_msg.chunks.iter().map(|c| c.data.len()).sum::<usize>()
-                                        );
-                                        stats.add_incremental_saved(saved_bytes as u64);
-                                        stats.add_bytes_received(decompressed.len() as u64);
-                                        send_data_to_local(&x11_connections, msg.connection_id, bytes::Bytes::from(decompressed)).await;
-                                    }
-                                    _ => handle_other_frame(frame, &outbound_tx, &x11_connections, &stats, Some(&mut incremental_cache)).await,
-                                }
-                            }
-                            Ok(Err(e)) => {
-                                error!("Connection error: {}", e);
-                                return Err(e.into());
-                            }
-                            Err(_) => {
-                                error!(
-                                    "Read timeout ({:?}), no data from relay",
-                                    ClientDefaults::READ_TIMEOUT
-                                );
-                                return Err(rx11_core::error::Rx11Error::Timeout.into());
-                            }
-                        }
-                    }
-                    _ = tokio::signal::ctrl_c() => {
-                        info!("Received shutdown signal, sending SessionDestroy...");
-                        let _ = outbound_tx
-                            .send(Frame::SessionDestroy(SessionDestroyMessage {
-                                display: actual_display,
-                            }))
-                            .await;
-                        break;
-                    }
-                }
-            }
-            Ok(())
-        }
-        .await;
-
-        stats_task.abort();
+        stats_logger.abort();
         cleanup_connections(&x11_connections, &stats).await;
         drop(outbound_tx);
         if let Err(e) = sender_task.await {
@@ -456,135 +296,22 @@ impl LocalConnector {
     }
 }
 
-struct ProxyContext<'a> {
-    conn_id: ConnectionId,
-    local_read: &'a mut tokio::io::ReadHalf<TcpStream>,
-    local_write: &'a mut tokio::io::WriteHalf<TcpStream>,
-    relay_rx: &'a mut tokio::sync::mpsc::Receiver<bytes::Bytes>,
-    outbound: &'a tokio::sync::mpsc::Sender<Frame>,
-    stats: &'a ConnectionStats,
-    compression: Option<CompressionAlgo>,
-    seq: &'a Arc<AtomicU32>,
-}
-
-async fn proxy_local_x11_connection(ctx: ProxyContext<'_>) {
-    let mut buf = vec![0u8; BufferDefaults::INITIAL_READ_BUF];
-    loop {
-        tokio::select! {
-            result = ctx.local_read.read(&mut buf) => {
-                match result {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
-                        let seq_id = ctx.seq.fetch_add(1, Ordering::Relaxed);
-
-                        let frame = rx11_core::compress::maybe_compress_frame(
-                            ctx.conn_id,
-                            seq_id,
-                            data.clone(),
-                            ctx.compression,
-                        );
-                        if ctx.outbound.send(frame).await.is_err() {
-                            break;
-                        }
-                        if ctx.compression.is_some() {
-                            if data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD {
-                                ctx.stats.add_compression_saved(data.len().saturating_sub(n) as u64);
-                            }
-                        }
-                        ctx.stats.add_bytes_sent(n as u64);
-                        if buf.len() < BufferDefaults::MAX_READ_BUF {
-                            let new_size = (buf.len() * 2).min(BufferDefaults::MAX_READ_BUF);
-                            buf.resize(new_size, 0);
-                        }
-                    }
-                    Err(e) => {
-                        debug!("Read error from local X Server ({}): {}", ctx.conn_id, e);
-                        break;
-                    }
-                }
-            }
-            data = ctx.relay_rx.recv() => {
-                match data {
-                    Some(data) => {
-                        if ctx.local_write.write_all(&data).await.is_err()
-                            || ctx.local_write.flush().await.is_err()
-                        {
-                            break;
-                        }
-                    }
-                    None => break,
-                }
-            }
-        }
+/// Receive the next frame and require it to be a SessionAck.
+async fn recv_session_ack(transport: &mut Rx11Transport) -> anyhow::Result<SessionAckMessage> {
+    match transport.recv_frame().await? {
+        Frame::SessionAck(ack) => Ok(ack),
+        _ => Err(anyhow::anyhow!("Expected SessionAck")),
     }
 }
 
-async fn send_data_to_local(
-    x11_connections: &SharedX11Conns,
-    conn_id: ConnectionId,
-    data: bytes::Bytes,
-) {
-    let tx = {
-        let conns = x11_connections.lock().await;
-        conns.get(&conn_id.get()).map(|(tx, _)| tx.clone())
-    };
-
-    if let Some(tx) = tx {
-        if tx.send(data).await.is_err() {
-            debug!("Local X11 connection gone for {}", conn_id);
-            x11_connections.lock().await.remove(&conn_id.get());
-        }
-    } else {
-        debug!("No local connection for {}", conn_id);
-    }
-}
-
-async fn handle_other_frame(
-    frame: Frame,
-    outbound: &tokio::sync::mpsc::Sender<Frame>,
-    x11_connections: &SharedX11Conns,
-    _stats: &ConnectionStats,
-    incremental_cache: Option<&mut ConnectionDataCache>,
-) {
-    match frame {
-        Frame::Heartbeat => {
-            let _ = outbound.send(Frame::HeartbeatAck).await;
-        }
-        Frame::SessionDestroy(msg) => {
-            info!("Session destroyed for display {}", msg.display);
-        }
-        Frame::X11Disconnect(msg) => {
-            let conn_id = msg.connection_id;
-            debug!("Remote X11 client disconnected ({})", conn_id);
-            let mut conns = x11_connections.lock().await;
-            conns.remove(&conn_id.get());
-            if let Some(cache) = incremental_cache {
-                cache.clear_connection(conn_id);
-            }
-        }
-        Frame::Error(msg) => {
-            error!("Error from relay (code={}): {}", msg.code, msg.message);
-        }
-        Frame::FlowControl(msg) => {
-            debug!(
-                "FlowControl from relay: action={:?} conn={:?}",
-                msg.action, msg.connection_id
-            );
-        }
-        _ => {
-            warn!("Unexpected frame from relay: {:?}", frame.msg_type());
-        }
-    }
-}
-
-async fn cleanup_connections(x11_connections: &SharedX11Conns, stats: &Arc<ConnectionStats>) {
-    let mut conns = x11_connections.lock().await;
-    let count = conns.len() as u32;
-    for _ in 0..count {
-        stats.dec_x11_connections();
-    }
-    for (_, (_, handle)) in conns.drain() {
-        handle.abort();
-    }
+/// Classify an anyhow error as retriable, checking both our own error type
+/// and raw IO errors.
+fn is_retriable(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<Rx11Error>()
+        .map(Rx11Error::is_retriable)
+        .or_else(|| {
+            err.downcast_ref::<std::io::Error>()
+                .map(is_retriable_io_error)
+        })
+        .unwrap_or(false)
 }

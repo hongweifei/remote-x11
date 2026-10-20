@@ -150,6 +150,16 @@ async fn check_tunnel_port(addr: &str) -> bool {
     }
 }
 
+/// ssh(1) options for every tunnel: no remote command, no tty, fail fast on
+/// forward errors, never prompt, accept-new host keys, TCP keepalive.
+const SSH_TUNNEL_OPTS: [&str; 5] = [
+    "ExitOnForwardFailure=yes",
+    "BatchMode=yes",
+    "StrictHostKeyChecking=accept-new",
+    "ServerAliveInterval=15",
+    "ServerAliveCountMax=3",
+];
+
 pub async fn create_forward_tunnel(
     ssh_host: &str,
     ssh_port: u16,
@@ -158,20 +168,12 @@ pub async fn create_forward_tunnel(
     local_bind_port: u16,
     identity_file: Option<&str>,
 ) -> anyhow::Result<tokio::process::Child> {
-    let mut args = Vec::new();
-
-    args.push("-N".to_string());
-    args.push("-T".to_string());
-    args.push("-o".to_string());
-    args.push("ExitOnForwardFailure=yes".to_string());
-    args.push("-o".to_string());
-    args.push("BatchMode=yes".to_string());
-    args.push("-o".to_string());
-    args.push("StrictHostKeyChecking=accept-new".to_string());
-    args.push("-o".to_string());
-    args.push("ServerAliveInterval=15".to_string());
-    args.push("-o".to_string());
-    args.push("ServerAliveCountMax=3".to_string());
+    let mut args: Vec<String> = vec!["-N".to_string(), "-T".to_string()];
+    args.extend(
+        SSH_TUNNEL_OPTS
+            .iter()
+            .flat_map(|opt| ["-o".to_string(), (*opt).to_string()]),
+    );
 
     args.push("-L".to_string());
     args.push(format!(
