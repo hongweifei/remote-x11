@@ -16,7 +16,6 @@ macro_rules! impl_newtype {
         pub struct $name(pub $inner);
 
         impl $name {
-            #[must_use]
             pub fn new(value: $inner) -> crate::error::Result<Self> {
                 let s: &str = &value;
                 if s.is_empty() || s.len() > $max_len {
@@ -71,7 +70,6 @@ pub struct DisplayNumber(pub u16);
 impl DisplayNumber {
     pub const UNSPECIFIED: Self = Self(0);
 
-    #[must_use]
     pub fn new(disp: u16) -> crate::error::Result<Self> {
         if disp > MAX_DISPLAY_NUMBER {
             return Err(crate::error::Rx11Error::Protocol(format!(
@@ -109,7 +107,6 @@ impl FromStr for DisplayNumber {
 pub struct ConnectionId(pub u32);
 
 impl ConnectionId {
-    #[must_use]
     pub fn new(id: u32) -> Self {
         Self(id)
     }
@@ -125,7 +122,6 @@ impl fmt::Display for ConnectionId {
     }
 }
 
-#[must_use]
 pub fn validate_auth_fields(auth_name: &str, auth_data: &[u8]) -> crate::error::Result<()> {
     if auth_name.len() > MAX_AUTH_NAME_LEN {
         return Err(crate::error::Rx11Error::Protocol(format!(

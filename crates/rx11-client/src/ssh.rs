@@ -136,14 +136,11 @@ async fn health_check_loop(
 }
 
 async fn check_tunnel_port(addr: &str) -> bool {
-    let result = tokio::time::timeout(
-        SshDefaults::HEALTH_CHECK_TIMEOUT,
-        async {
-            let mut stream = TcpStream::connect(addr).await?;
-            stream.shutdown().await?;
-            Ok::<(), std::io::Error>(())
-        },
-    )
+    let result = tokio::time::timeout(SshDefaults::HEALTH_CHECK_TIMEOUT, async {
+        let mut stream = TcpStream::connect(addr).await?;
+        stream.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    })
     .await;
 
     match result {

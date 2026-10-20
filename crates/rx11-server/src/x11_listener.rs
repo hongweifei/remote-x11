@@ -39,14 +39,13 @@ impl X11Listener {
     }
 
     pub async fn bind_display(&self, disp: u16) -> anyhow::Result<()> {
-        let port = self
-            .base_port
-            .checked_add(disp)
-            .ok_or_else(|| anyhow::anyhow!(
+        let port = self.base_port.checked_add(disp).ok_or_else(|| {
+            anyhow::anyhow!(
                 "X11 port overflow: base {} + display {}",
                 self.base_port,
                 disp
-            ))?;
+            )
+        })?;
         let listener = TcpListener::bind(("127.0.0.1", port)).await?;
         info!("X11 listening on port {} (display :{})", port, disp);
 
@@ -112,22 +111,20 @@ async fn handle_x11_connection(
 
     let connection_id = next_connection_id();
 
-    let event_tx = tokio::time::timeout(
-        ServerDefaults::HANDSHAKE_TIMEOUT,
-        async {
-            loop {
-                if let Some(tx) = session_mgr.get_x11_event_sender(disp).await {
-                    return Ok::<_, std::convert::Infallible>(tx);
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let event_tx = tokio::time::timeout(ServerDefaults::HANDSHAKE_TIMEOUT, async {
+        loop {
+            if let Some(tx) = session_mgr.get_x11_event_sender(disp).await {
+                return Ok::<_, std::convert::Infallible>(tx);
             }
-        },
-    )
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    })
     .await
     .map_err(|_| anyhow::anyhow!("Timed out waiting for relay for display {}", disp))?
     .unwrap();
 
-    let (relay_tx, mut relay_rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(BufferDefaults::CHANNEL_BUFFER);
+    let (relay_tx, mut relay_rx) =
+        tokio::sync::mpsc::channel::<X11RelayToConn>(BufferDefaults::CHANNEL_BUFFER);
     session_mgr
         .register_x11_connection(connection_id, disp, relay_tx)
         .await?;

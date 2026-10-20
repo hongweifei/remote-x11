@@ -1,8 +1,19 @@
+//! Compression algorithm negotiation and frame-level compress/decompress
+//! helpers shared by server and client.
+
 use std::io::{Read, Write};
 
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
+use crate::incremental::ConnectionDataCache;
+use crate::protocol::{
+    BinaryMessageCodec, CompressedIncrementalX11DataMessage, CompressedPayload,
+    CompressedX11DataMessage, Frame, X11DataMessage,
+};
+use crate::types::ConnectionId;
+
+/// Payloads smaller than this skip compression entirely.
 pub const COMPRESSION_THRESHOLD: usize = 256;
 
 const ZSTD_COMPRESSION_LEVEL: i32 = 3;
@@ -17,6 +28,7 @@ pub enum CompressionAlgo {
 }
 
 impl CompressionAlgo {
+    /// Preferred order used for negotiation and advertised by both peers.
     pub const ALL: [CompressionAlgo; 3] = [
         CompressionAlgo::Zstd,
         CompressionAlgo::Lz4,
@@ -35,6 +47,8 @@ impl CompressionAlgo {
         self.compress_to_bytes(data).map(|b| b.to_vec())
     }
 
+    /// Compress when the payload is worth it (above the threshold and
+    /// actually smaller afterwards); `None` means "send uncompressed".
     pub fn compress_to_bytes(&self, data: &[u8]) -> Option<Bytes> {
         if data.len() < COMPRESSION_THRESHOLD {
             return None;
@@ -62,6 +76,8 @@ impl CompressionAlgo {
         Some(result)
     }
 
+    /// Pick the first algorithm from our preference list that the peer also
+    /// supports.
     pub fn negotiate(
         client_algos: &[CompressionAlgo],
         server_algos: &[CompressionAlgo],
@@ -75,34 +91,22 @@ impl CompressionAlgo {
     }
 }
 
-fn compress_zstd(data: &[u8]) -> Option<Bytes> {
-    zstd::encode_all(data, ZSTD_COMPRESSION_LEVEL)
-        .ok()
-        .map(Bytes::from)
-}
-
-fn decompress_zstd(compressed: &[u8]) -> Option<Vec<u8>> {
-    zstd::decode_all(compressed).ok()
-}
-
-pub fn maybe_compress_frame(
-    connection_id: crate::types::ConnectionId,
+/// Compress the payload when possible, otherwise fall back to a plain
+/// `DataX11` frame. Shared tail of both frame builders below.
+fn plain_or_compressed_frame(
+    connection_id: ConnectionId,
     sequence_id: u32,
     data: Bytes,
     compression_algo: Option<CompressionAlgo>,
-) -> crate::protocol::Frame {
-    use crate::protocol::{CompressedX11DataMessage, Frame, X11DataMessage};
-
+) -> Frame {
     if let Some(algo) = compression_algo {
-        if data.len() >= COMPRESSION_THRESHOLD {
-            if let Some(compressed) = algo.compress_to_bytes(&data) {
-                return Frame::CompressedDataX11(CompressedX11DataMessage {
-                    connection_id,
-                    sequence_id,
-                    original_len: data.len(),
-                    data: compressed,
-                });
-            }
+        if let Some(compressed) = algo.compress_to_bytes(&data) {
+            return Frame::CompressedDataX11(CompressedX11DataMessage {
+                connection_id,
+                sequence_id,
+                original_len: data.len(),
+                data: compressed,
+            });
         }
     }
     Frame::DataX11(X11DataMessage {
@@ -112,54 +116,41 @@ pub fn maybe_compress_frame(
     })
 }
 
-pub fn decompress_frame_data(
-    msg: &crate::protocol::CompressedX11DataMessage,
-    algo: CompressionAlgo,
-) -> Option<Vec<u8>> {
-    algo.decompress(&msg.data, msg.original_len)
-}
-
-pub fn decompress_incremental_frame_data(
-    msg: &crate::protocol::CompressedIncrementalX11DataMessage,
-    algo: CompressionAlgo,
-) -> Option<Vec<u8>> {
-    algo.decompress(&msg.data, msg.original_len)
-}
-
-pub fn maybe_incremental_or_compress_frame(
-    connection_id: crate::types::ConnectionId,
+/// Build the outbound frame for a raw X11 payload.
+pub fn maybe_compress_frame(
+    connection_id: ConnectionId,
     sequence_id: u32,
     data: Bytes,
     compression_algo: Option<CompressionAlgo>,
-    incremental_cache: Option<&mut crate::incremental::ConnectionDataCache>,
-) -> crate::protocol::Frame {
-    use crate::protocol::{
-        BinaryMessageCodec,
-        CompressedIncrementalX11DataMessage,
-        CompressedX11DataMessage,
-        Frame,
-        X11DataMessage,
-    };
+) -> Frame {
+    plain_or_compressed_frame(connection_id, sequence_id, data, compression_algo)
+}
 
+/// Try sending an incremental diff frame, optionally compressed; falls back
+/// to [`maybe_compress_frame`] when no useful diff exists.
+pub fn maybe_incremental_or_compress_frame(
+    connection_id: ConnectionId,
+    sequence_id: u32,
+    data: Bytes,
+    compression_algo: Option<CompressionAlgo>,
+    incremental_cache: Option<&mut ConnectionDataCache>,
+) -> Frame {
     if let Some(cache) = incremental_cache {
         if let Some(incremental_msg) = cache.compute_incremental(connection_id, sequence_id, &data)
         {
             cache.update_cache(connection_id, sequence_id, &data);
 
-            // 尝试压缩增量数据
             if let Some(algo) = compression_algo {
                 if let Ok(encoded) = incremental_msg.encode_payload() {
-                    if encoded.len() >= COMPRESSION_THRESHOLD {
-                        if let Some(compressed) = algo.compress_to_bytes(&encoded) {
-                            return Frame::CompressedIncrementalDataX11(
-                                CompressedIncrementalX11DataMessage {
-                                    connection_id,
-                                    sequence_id,
-                                    original_len: encoded.len(),
-                                    data: compressed,
-                                },
-                            );
-                        }
+                    if let Some(compressed) = algo.compress_to_bytes(&encoded) {
+                        return Frame::CompressedIncrementalDataX11(
+                            CompressedIncrementalX11DataMessage {
+                                connection_id,
+                                sequence_id,
+                                original_len: encoded.len(),
+                                data: compressed,
+                            },
+                        );
                     }
                 }
             }
@@ -169,23 +160,25 @@ pub fn maybe_incremental_or_compress_frame(
         cache.update_cache(connection_id, sequence_id, &data);
     }
 
-    if let Some(algo) = compression_algo {
-        if data.len() >= COMPRESSION_THRESHOLD {
-            if let Some(compressed) = algo.compress_to_bytes(&data) {
-                return Frame::CompressedDataX11(CompressedX11DataMessage {
-                    connection_id,
-                    sequence_id,
-                    original_len: data.len(),
-                    data: compressed,
-                });
-            }
-        }
-    }
-    Frame::DataX11(X11DataMessage {
-        connection_id,
-        sequence_id,
-        data,
-    })
+    plain_or_compressed_frame(connection_id, sequence_id, data, compression_algo)
+}
+
+/// Decompress a compressed-payload frame using the negotiated algorithm.
+pub fn decompress_frame_data(
+    msg: &impl CompressedPayload,
+    algo: CompressionAlgo,
+) -> Option<Vec<u8>> {
+    algo.decompress(msg.compressed_data(), msg.original_len())
+}
+
+fn compress_zstd(data: &[u8]) -> Option<Bytes> {
+    zstd::encode_all(data, ZSTD_COMPRESSION_LEVEL)
+        .ok()
+        .map(Bytes::from)
+}
+
+fn decompress_zstd(compressed: &[u8]) -> Option<Vec<u8>> {
+    zstd::decode_all(compressed).ok()
 }
 
 fn compress_lz4(data: &[u8]) -> Option<Bytes> {
@@ -246,10 +239,10 @@ mod tests {
         for algo in &CompressionAlgo::ALL {
             let compressed = algo
                 .compress(&data)
-                .expect(&format!("compress failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("compress failed: {:?}", algo));
             let decompressed = algo
                 .decompress(&compressed, data.len())
-                .expect(&format!("decompress failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("decompress failed: {:?}", algo));
             assert_eq!(data, decompressed, "roundtrip failed: {:?}", algo);
         }
     }
@@ -260,10 +253,10 @@ mod tests {
         for algo in &CompressionAlgo::ALL {
             let compressed = algo
                 .compress(&data)
-                .expect(&format!("compress failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("compress failed: {:?}", algo));
             let decompressed = algo
                 .decompress(&compressed, data.len())
-                .expect(&format!("decompress failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("decompress failed: {:?}", algo));
             assert_eq!(data, decompressed, "roundtrip failed: {:?}", algo);
         }
     }
@@ -326,7 +319,7 @@ mod tests {
         for algo in &CompressionAlgo::ALL {
             let compressed = algo
                 .compress(&data)
-                .expect(&format!("compress failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("compress failed: {:?}", algo));
             assert!(
                 algo.decompress(&compressed, data.len() + 1).is_none(),
                 "should reject wrong original_len: {:?}",
@@ -341,11 +334,33 @@ mod tests {
         for algo in &CompressionAlgo::ALL {
             let compressed = algo
                 .compress_to_bytes(&data)
-                .expect(&format!("compress_to_bytes failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("compress_to_bytes failed: {:?}", algo));
             let decompressed = algo
                 .decompress(&compressed, data.len())
-                .expect(&format!("decompress failed: {:?}", algo));
+                .unwrap_or_else(|| panic!("decompress failed: {:?}", algo));
             assert_eq!(data, decompressed, "roundtrip failed: {:?}", algo);
         }
+    }
+
+    #[test]
+    fn test_decompress_frame_data_generic_over_compressed_payload() {
+        let data = vec![0xEF; 2048];
+        let algo = CompressionAlgo::Zstd;
+        let compressed = algo.compress_to_bytes(&data).expect("compressible");
+        let msg = CompressedX11DataMessage {
+            connection_id: ConnectionId::new(1),
+            sequence_id: 0,
+            original_len: data.len(),
+            data: compressed,
+        };
+        assert_eq!(decompress_frame_data(&msg, algo).unwrap(), data);
+
+        let inc_msg = CompressedIncrementalX11DataMessage {
+            connection_id: ConnectionId::new(1),
+            sequence_id: 0,
+            original_len: data.len(),
+            data: algo.compress_to_bytes(&data).unwrap(),
+        };
+        assert_eq!(decompress_frame_data(&inc_msg, algo).unwrap(), data);
     }
 }

@@ -1,13 +1,23 @@
+//! Async TCP transport: buffers bytes until complete frames can be decoded,
+//! resynchronizing on the magic bytes after protocol errors.
+
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
 
 use crate::config::BufferDefaults;
-use crate::error::Rx11Error;
+use crate::error::{Result, Rx11Error};
 use crate::protocol::{decode_frame, encode_frame, Frame, MAGIC_BYTES, MAX_FRAME_SIZE};
 
-const MAX_READ_BUF: usize = MAX_FRAME_SIZE + 256;
+/// Absolute ceiling for the frame accumulation buffer; protects against a
+/// peer that never sends a complete frame. Distinct from
+/// [`BufferDefaults::PROXY_READ_BUF_MAX`], which bounds the raw X11 socket
+/// read buffers in the proxy loops.
+const READ_BUF_HARD_LIMIT: usize = MAX_FRAME_SIZE + 256;
+
+/// Reserve hint for each incremental read into the accumulation buffer.
+const READ_RESERVE: usize = 8192;
 
 fn scan_for_magic(data: &[u8]) -> usize {
     if data.len() <= 4 {
@@ -24,7 +34,7 @@ fn scan_for_magic(data: &[u8]) -> usize {
 async fn recv_frame_inner<R: AsyncReadExt + Unpin>(
     read_buf: &mut BytesMut,
     reader: &mut R,
-) -> crate::error::Result<Frame> {
+) -> Result<Frame> {
     loop {
         if read_buf.len() >= crate::protocol::FRAME_HEADER_SIZE {
             match decode_frame(read_buf) {
@@ -47,13 +57,13 @@ async fn recv_frame_inner<R: AsyncReadExt + Unpin>(
             }
         }
 
-        if read_buf.len() > MAX_READ_BUF {
+        if read_buf.len() > READ_BUF_HARD_LIMIT {
             return Err(Rx11Error::Protocol(
                 "read buffer exceeded maximum size".into(),
             ));
         }
 
-        read_buf.reserve(8192);
+        read_buf.reserve(READ_RESERVE);
         let n = reader.read_buf(read_buf).await.map_err(Rx11Error::Io)?;
         if n == 0 {
             return Err(Rx11Error::ConnectionClosed);
@@ -67,7 +77,7 @@ pub struct Rx11Transport {
 }
 
 impl Rx11Transport {
-    pub fn new(stream: TcpStream) -> crate::error::Result<Self> {
+    pub fn new(stream: TcpStream) -> Result<Self> {
         stream.set_nodelay(true)?;
         Ok(Self {
             read_buf: BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF),
@@ -75,17 +85,14 @@ impl Rx11Transport {
         })
     }
 
-    pub async fn send_frame(&mut self, frame: &Frame) -> crate::error::Result<()> {
+    pub async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let data = encode_frame(frame)?;
-        self.stream
-            .write_all(&data)
-            .await
-            .map_err(Rx11Error::Io)?;
+        self.stream.write_all(&data).await.map_err(Rx11Error::Io)?;
         self.stream.flush().await.map_err(Rx11Error::Io)?;
         Ok(())
     }
 
-    pub async fn recv_frame(&mut self) -> crate::error::Result<Frame> {
+    pub async fn recv_frame(&mut self) -> Result<Frame> {
         recv_frame_inner(&mut self.read_buf, &mut self.stream).await
     }
 
@@ -107,7 +114,7 @@ pub struct Rx11TransportReadHalf {
 }
 
 impl Rx11TransportReadHalf {
-    pub async fn recv_frame(&mut self) -> crate::error::Result<Frame> {
+    pub async fn recv_frame(&mut self) -> Result<Frame> {
         recv_frame_inner(&mut self.read_buf, &mut self.read_half).await
     }
 }
@@ -117,7 +124,7 @@ pub struct Rx11TransportWriteHalf {
 }
 
 impl Rx11TransportWriteHalf {
-    pub async fn send_frame(&mut self, frame: &Frame) -> crate::error::Result<()> {
+    pub async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let data = encode_frame(frame)?;
         self.write_half
             .write_all(&data)
@@ -127,7 +134,7 @@ impl Rx11TransportWriteHalf {
         Ok(())
     }
 
-    pub async fn flush(&mut self) -> crate::error::Result<()> {
+    pub async fn flush(&mut self) -> Result<()> {
         self.write_half.flush().await.map_err(Rx11Error::Io)
     }
 }

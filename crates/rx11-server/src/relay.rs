@@ -94,7 +94,12 @@ async fn handle_client(
     info!("Client connected from {}", addr);
     let mut transport = Rx11Transport::new(stream)?;
 
-    let handshake = server_handshake(&mut transport, auth_token, ServerDefaults::HANDSHAKE_TIMEOUT).await?;
+    let handshake = server_handshake(
+        &mut transport,
+        auth_token,
+        ServerDefaults::HANDSHAKE_TIMEOUT,
+    )
+    .await?;
     let transport_id = handshake.session_id.clone();
     let compression = handshake.compression;
 
@@ -115,8 +120,7 @@ async fn handle_client(
     let heartbeat_task = spawn_heartbeat(outbound_tx.clone(), ServerDefaults::HEARTBEAT_INTERVAL);
     let sender_task = spawn_sender(outbound_rx, write_half);
 
-    let mut heartbeat_deadline =
-        tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
+    let mut heartbeat_deadline = tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
 
     let tid = transport_id.as_str().to_string();
     let mut incremental_cache = ConnectionDataCache::new();
@@ -236,7 +240,12 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
         Frame::SessionCreate(msg) => {
             let result = ctx
                 .session_mgr
-                .create_session(msg.display, msg.auth_name, msg.auth_data, ctx.transport_id.to_string())
+                .create_session(
+                    msg.display,
+                    msg.auth_name,
+                    msg.auth_data,
+                    ctx.transport_id.to_string(),
+                )
                 .await;
             send_session_ack(result, ctx).await
         }
@@ -257,7 +266,10 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
         Frame::SessionDestroy(msg) => {
             let disp = msg.display;
             if !ctx.session_mgr.owns_session(disp, ctx.transport_id).await {
-                warn!("Client {} tried to destroy unowned session for display {}", ctx.transport_id, disp);
+                warn!(
+                    "Client {} tried to destroy unowned session for display {}",
+                    ctx.transport_id, disp
+                );
                 return RelayAction::Continue;
             }
             ctx.session_mgr.unregister_x11_relay(disp).await;
@@ -266,16 +278,32 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             RelayAction::Continue
         }
         Frame::DataX11(msg) => {
-            if !ctx.session_mgr.owns_connection(msg.connection_id, ctx.transport_id).await {
-                warn!("Client {} sent data for unowned {}", ctx.transport_id, msg.connection_id);
+            if !ctx
+                .session_mgr
+                .owns_connection(msg.connection_id, ctx.transport_id)
+                .await
+            {
+                warn!(
+                    "Client {} sent data for unowned {}",
+                    ctx.transport_id, msg.connection_id
+                );
                 return RelayAction::Continue;
             }
-            ctx.session_mgr.send_to_x11_connection(msg.connection_id, msg.data.to_vec()).await;
+            ctx.session_mgr
+                .send_to_x11_connection(msg.connection_id, msg.data.to_vec())
+                .await;
             RelayAction::Continue
         }
         Frame::CompressedDataX11(msg) => {
-            if !ctx.session_mgr.owns_connection(msg.connection_id, ctx.transport_id).await {
-                warn!("Client {} sent compressed data for unowned {}", ctx.transport_id, msg.connection_id);
+            if !ctx
+                .session_mgr
+                .owns_connection(msg.connection_id, ctx.transport_id)
+                .await
+            {
+                warn!(
+                    "Client {} sent compressed data for unowned {}",
+                    ctx.transport_id, msg.connection_id
+                );
                 return RelayAction::Continue;
             }
             let algo = match ctx.compression {
@@ -287,16 +315,22 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             };
             match rx11_core::compress::decompress_frame_data(&msg, algo) {
                 Some(decompressed) => {
-                    ctx.session_mgr.send_to_x11_connection(msg.connection_id, decompressed).await;
+                    ctx.session_mgr
+                        .send_to_x11_connection(msg.connection_id, decompressed)
+                        .await;
                 }
                 None => {
-                    warn!("Decompression failed for {}, dropping frame", msg.connection_id);
+                    warn!(
+                        "Decompression failed for {}, dropping frame",
+                        msg.connection_id
+                    );
                 }
             }
             RelayAction::Continue
         }
         Frame::HeartbeatAck => {
-            *ctx.heartbeat_deadline = tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
+            *ctx.heartbeat_deadline =
+                tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
             RelayAction::Continue
         }
         Frame::FlowControl(msg) => {
@@ -307,7 +341,11 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             RelayAction::Continue
         }
         frame => {
-            warn!("Unexpected frame from client {}: {:?}", ctx.transport_id, frame.msg_type());
+            warn!(
+                "Unexpected frame from client {}: {:?}",
+                ctx.transport_id,
+                frame.msg_type()
+            );
             RelayAction::Continue
         }
     }
@@ -321,8 +359,13 @@ async fn send_session_ack(
         Ok(session) => {
             let disp = session.display;
             let sid = session.id.clone();
-            info!("Session created: DISPLAY={} (client: {})", disp, ctx.transport_id);
-            ctx.session_mgr.register_x11_relay(disp, ctx.x11_event_tx.clone()).await;
+            info!(
+                "Session created: DISPLAY={} (client: {})",
+                disp, ctx.transport_id
+            );
+            ctx.session_mgr
+                .register_x11_relay(disp, ctx.x11_event_tx.clone())
+                .await;
             if ctx
                 .outbound
                 .send(Frame::SessionAck(SessionAckMessage {
@@ -367,7 +410,10 @@ async fn handle_x11_event(
     incremental_cache: &mut ConnectionDataCache,
 ) -> RelayAction {
     match event {
-        Some(X11ConnToRelay::Connected { display, connection_id }) => {
+        Some(X11ConnToRelay::Connected {
+            display,
+            connection_id,
+        }) => {
             if outbound
                 .send(Frame::X11Connect(X11ConnectMessage {
                     display,
@@ -381,13 +427,17 @@ async fn handle_x11_event(
                 RelayAction::Continue
             }
         }
-        Some(X11ConnToRelay::Data { connection_id, data, .. }) => {
+        Some(X11ConnToRelay::Data {
+            connection_id,
+            data,
+            ..
+        }) => {
             let frame = maybe_incremental_or_compress_frame(
-                connection_id, 
-                0, 
-                data, 
-                compression, 
-                Some(incremental_cache)
+                connection_id,
+                0,
+                data,
+                compression,
+                Some(incremental_cache),
             );
             if outbound.send(frame).await.is_err() {
                 RelayAction::Disconnect
@@ -395,7 +445,10 @@ async fn handle_x11_event(
                 RelayAction::Continue
             }
         }
-        Some(X11ConnToRelay::Disconnected { display, connection_id }) => {
+        Some(X11ConnToRelay::Disconnected {
+            display,
+            connection_id,
+        }) => {
             session_mgr.unregister_x11_connection(connection_id).await;
             incremental_cache.clear_connection(connection_id);
             if outbound

@@ -40,7 +40,11 @@ fn config_home() -> Option<std::path::PathBuf> {
     std::env::var("HOME")
         .ok()
         .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var("USERPROFILE").ok().map(std::path::PathBuf::from))
+        .or_else(|| {
+            std::env::var("USERPROFILE")
+                .ok()
+                .map(std::path::PathBuf::from)
+        })
 }
 
 fn config_path() -> Option<std::path::PathBuf> {
@@ -51,16 +55,18 @@ fn load_config() -> Config {
     if let Some(path) = config_path() {
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(content) => match toml::from_str::<Config>(&content) {
-                    Ok(config) => {
-                        info!("Loaded config from {}", path.display());
-                        return config;
+                Ok(content) => {
+                    match toml::from_str::<Config>(&content) {
+                        Ok(config) => {
+                            info!("Loaded config from {}", path.display());
+                            return config;
+                        }
+                        Err(e) => {
+                            warn!("Failed to parse config file {}: {}", path.display(), e);
+                            eprintln!("WARNING: Failed to parse config file {}: {}. Using default config.", path.display(), e);
+                        }
                     }
-                    Err(e) => {
-                        warn!("Failed to parse config file {}: {}", path.display(), e);
-                        eprintln!("WARNING: Failed to parse config file {}: {}. Using default config.", path.display(), e);
-                    }
-                },
+                }
                 Err(e) => {
                     warn!("Failed to read config file {}: {}", path.display(), e);
                 }
@@ -136,25 +142,29 @@ Examples:
 
 Token can also be provided via RX11_TOKEN environment variable",
         next_line_help = true,
-        display_order = 0,
+        display_order = 0
     )]
     Server {
         #[arg(
-            short, long,
+            short,
+            long,
             help = "Listen address",
             long_help = "Relay server listen address, format: IP:PORT"
         )]
         listen: Option<String>,
 
         #[arg(
-            short = 'x', long = "x11-port",
+            short = 'x',
+            long = "x11-port",
             help = "X11 proxy start port",
             long_help = "X11 proxy start port number. Display :N maps to port 6000+N"
         )]
         x11_port: Option<u16>,
 
         #[arg(
-            short = 't', long, env = "RX11_TOKEN",
+            short = 't',
+            long,
+            env = "RX11_TOKEN",
             help = "Auth token (auto-generated if omitted)",
             long_help = "Authentication token between client and server. Auto-generated and printed if omitted. Can also be provided via RX11_TOKEN environment variable"
         )]
@@ -178,32 +188,37 @@ Examples:
 
 Token can also be provided via RX11_TOKEN environment variable",
         next_line_help = true,
-        display_order = 1,
+        display_order = 1
     )]
-        Client {
+    Client {
         #[arg(
-            short, long,
+            short,
+            long,
             help = "Relay server address",
             long_help = "Remote relay server address, format: IP:PORT"
         )]
         relay: Option<String>,
 
         #[arg(
-            short = 't', long, env = "RX11_TOKEN",
+            short = 't',
+            long,
+            env = "RX11_TOKEN",
             help = "Auth token",
             long_help = "Authentication token matching the remote server. Can also be provided via RX11_TOKEN environment variable"
         )]
         token: Option<String>,
 
         #[arg(
-            short, long,
+            short,
+            long,
             help = "Local X Server address",
             long_help = "Local X Server listen address, default 127.0.0.1:6000 (i.e. Display :0)"
         )]
         x11: Option<String>,
 
         #[arg(
-            short = 'd', long,
+            short = 'd',
+            long,
             help = "Specify display number (disables auto-assign)",
             long_help = "Manually specify the X11 display number to forward, maps to remote port 6000+N. Disables --auto"
         )]
@@ -212,7 +227,7 @@ Token can also be provided via RX11_TOKEN environment variable",
         #[arg(
             long,
             hide = true,
-            help = "Auto-assign display number (enabled by default)",
+            help = "Auto-assign display number (enabled by default)"
         )]
         auto: Option<bool>,
     },
@@ -236,60 +251,69 @@ Examples:
 
 Token can also be provided via RX11_TOKEN environment variable",
         next_line_help = true,
-        display_order = 2,
+        display_order = 2
     )]
     Ssh {
         #[arg(
-            short = 'H', long,
+            short = 'H',
+            long,
             help = "Remote server address",
             long_help = "Remote server hostname or IP address (required)"
         )]
         host: Option<String>,
 
         #[arg(
-            short = 'P', long,
+            short = 'P',
+            long,
             help = "SSH port",
             long_help = "Remote server SSH port"
         )]
         port: Option<u16>,
 
         #[arg(
-            short = 'u', long,
+            short = 'u',
+            long,
             help = "SSH username",
             long_help = "SSH login username. Uses SSH default config if omitted"
         )]
         user: Option<String>,
 
         #[arg(
-            short = 'i', long,
+            short = 'i',
+            long,
             help = "SSH private key path",
             long_help = "Private key file for SSH authentication, e.g. ~/.ssh/id_rsa"
         )]
         identity: Option<String>,
 
         #[arg(
-            short = 't', long, env = "RX11_TOKEN",
+            short = 't',
+            long,
+            env = "RX11_TOKEN",
             help = "Auth token",
             long_help = "Authentication token matching the remote server. Can also be provided via RX11_TOKEN environment variable"
         )]
         token: Option<String>,
 
         #[arg(
-            short, long = "relay-port",
+            short,
+            long = "relay-port",
             help = "Remote relay port",
             long_help = "Relay listen port of rx11 server on the remote host"
         )]
         relay_port: Option<u16>,
 
         #[arg(
-            short, long,
+            short,
+            long,
             help = "Local X Server address",
             long_help = "Local X Server listen address, default 127.0.0.1:6000 (i.e. Display :0)"
         )]
         x11: Option<String>,
 
         #[arg(
-            short = 'd', long,
+            short = 'd',
+            long,
             help = "Specify display number (disables auto-assign)",
             long_help = "Manually specify the X11 display number to forward, maps to remote port 6000+N. Disables --auto"
         )]
@@ -298,7 +322,7 @@ Token can also be provided via RX11_TOKEN environment variable",
         #[arg(
             long,
             hide = true,
-            help = "Auto-assign display number (enabled by default)",
+            help = "Auto-assign display number (enabled by default)"
         )]
         auto: Option<bool>,
     },
@@ -311,7 +335,7 @@ Examples:
   TOKEN=$(rx11 gen-token)
   rx11 server -t $TOKEN &  # remote
   rx11 client -r server:7000 -t $TOKEN  # local",
-        display_order = 3,
+        display_order = 3
     )]
     GenToken,
 
@@ -323,11 +347,12 @@ Examples:
   rx11 run xclock
   rx11 run -d 1 firefox
   rx11 run -- gedit /etc/hosts",
-        display_order = 4,
+        display_order = 4
     )]
     Run {
         #[arg(
-            short, long,
+            short,
+            long,
             help = "X11 display number",
             long_help = "DISPLAY environment variable value to set, default 0 (i.e. DISPLAY=:0)"
         )]
@@ -356,7 +381,7 @@ Examples:
   rx11 config init    # generate default config file
   rx11 config path    # show config file path",
         subcommand_required = true,
-        display_order = 5,
+        display_order = 5
     )]
     Config {
         #[command(subcommand)]
@@ -392,8 +417,12 @@ async fn main() -> anyhow::Result<()> {
             let config = load_config();
             let sc = config.server.unwrap_or_default();
 
-            let listen = listen.or(sc.listen).unwrap_or_else(|| "0.0.0.0:7000".to_string());
-            let x11_port = x11_port.or(sc.x11_port).unwrap_or(rx11_core::protocol::DEFAULT_X11_PORT);
+            let listen = listen
+                .or(sc.listen)
+                .unwrap_or_else(|| "0.0.0.0:7000".to_string());
+            let x11_port = x11_port
+                .or(sc.x11_port)
+                .unwrap_or(rx11_core::protocol::DEFAULT_X11_PORT);
             let token = token.or(sc.token).unwrap_or_else(|| {
                 let t = rx11_core::auth::generate_token();
                 eprintln!("Generated token: {}", t);
@@ -415,20 +444,30 @@ async fn main() -> anyhow::Result<()> {
             let cc = config.client.unwrap_or_default();
 
             let relay = relay.or(cc.relay).ok_or_else(|| {
-                anyhow::anyhow!("Missing relay server address. Use --relay or set it in config file")
+                anyhow::anyhow!(
+                    "Missing relay server address. Use --relay or set it in config file"
+                )
             })?;
-            let x11 = x11.or(cc.x11).unwrap_or_else(|| "127.0.0.1:6000".to_string());
+            let x11 = x11
+                .or(cc.x11)
+                .unwrap_or_else(|| "127.0.0.1:6000".to_string());
 
             let token = token.or(cc.token);
             let token = token.ok_or_else(|| {
-                anyhow::anyhow!("Missing auth token. Use --token, RX11_TOKEN env var, or set it in config file")
+                anyhow::anyhow!(
+                    "Missing auth token. Use --token, RX11_TOKEN env var, or set it in config file"
+                )
             })?;
 
             let auto_display = auto.unwrap_or(true) && display.is_none() && cc.display.is_none();
 
             detect_x11_server(&x11).await;
             let connector = rx11_client::connector::LocalConnector::new(
-                relay, token, x11, display, auto_display,
+                relay,
+                token,
+                x11,
+                display,
+                auto_display,
             );
             connector.connect_and_serve().await?;
         }
@@ -448,18 +487,26 @@ async fn main() -> anyhow::Result<()> {
 
             let host = host.or(sc.host);
             let host = host.ok_or_else(|| {
-                anyhow::anyhow!("Missing remote server address. Use --host or set it in config file")
+                anyhow::anyhow!(
+                    "Missing remote server address. Use --host or set it in config file"
+                )
             })?;
 
             let port = port.or(sc.port).unwrap_or(22);
-            let relay_port = relay_port.or(sc.relay_port).unwrap_or(rx11_core::protocol::DEFAULT_RELAY_PORT);
-            let x11 = x11.or(sc.x11).unwrap_or_else(|| "127.0.0.1:6000".to_string());
+            let relay_port = relay_port
+                .or(sc.relay_port)
+                .unwrap_or(rx11_core::protocol::DEFAULT_RELAY_PORT);
+            let x11 = x11
+                .or(sc.x11)
+                .unwrap_or_else(|| "127.0.0.1:6000".to_string());
 
             let auto_display = auto.unwrap_or(true) && display.is_none() && sc.display.is_none();
 
             let token = token.or(sc.token);
             let token = token.ok_or_else(|| {
-                anyhow::anyhow!("Missing auth token. Use --token, RX11_TOKEN env var, or set it in config file")
+                anyhow::anyhow!(
+                    "Missing auth token. Use --token, RX11_TOKEN env var, or set it in config file"
+                )
             })?;
 
             let user = user.or(sc.user);
@@ -503,10 +550,13 @@ async fn main() -> anyhow::Result<()> {
 
             detect_x11_server(&x11).await;
 
-            let connector =
-                rx11_client::connector::LocalConnector::new(
-                    local_addr, token, x11, display, auto_display,
-                );
+            let connector = rx11_client::connector::LocalConnector::new(
+                local_addr,
+                token,
+                x11,
+                display,
+                auto_display,
+            );
 
             tokio::select! {
                 r = connector.connect_and_serve() => r?,
@@ -576,7 +626,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Config { action } => match action {
             ConfigAction::Init => {
-                let cfg_path = config_path().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory (HOME/USERPROFILE not set)"))?;
+                let cfg_path = config_path().ok_or_else(|| {
+                    anyhow::anyhow!("Cannot determine config directory (HOME/USERPROFILE not set)")
+                })?;
 
                 if cfg_path.exists() {
                     anyhow::bail!("Config file already exists at {}", cfg_path.display());
@@ -611,7 +663,9 @@ async fn main() -> anyhow::Result<()> {
                 println!("Config file created at {}", cfg_path.display());
             }
             ConfigAction::Path => {
-                let cfg_path = config_path().ok_or_else(|| anyhow::anyhow!("Cannot determine config directory (HOME/USERPROFILE not set)"))?;
+                let cfg_path = config_path().ok_or_else(|| {
+                    anyhow::anyhow!("Cannot determine config directory (HOME/USERPROFILE not set)")
+                })?;
                 println!("{}", cfg_path.display());
             }
         },

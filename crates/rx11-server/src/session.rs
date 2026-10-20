@@ -157,7 +157,8 @@ impl SessionManager {
         auth_data: Vec<u8>,
         client_id: String,
     ) -> rx11_core::error::Result<Session> {
-        self.create_session_inner(disp, auth_name, auth_data, client_id).await
+        self.create_session_inner(disp, auth_name, auth_data, client_id)
+            .await
     }
 
     pub async fn create_session_auto(
@@ -171,9 +172,7 @@ impl SessionManager {
             (0..=rx11_core::types::MAX_DISPLAY_NUMBER)
                 .find(|d| !sessions.contains_key(d))
                 .ok_or_else(|| {
-                    rx11_core::error::Rx11Error::Protocol(
-                        "No available display number".into(),
-                    )
+                    rx11_core::error::Rx11Error::Protocol("No available display number".into())
                 })?
         };
         self.create_session_inner(DisplayNumber::new(disp)?, auth_name, auth_data, client_id)
@@ -186,10 +185,7 @@ impl SessionManager {
         new_client_id: String,
     ) -> rx11_core::error::Result<Session> {
         let mut sessions = self.sessions.write().await;
-        let session = sessions
-            .values()
-            .find(|s| s.id == *session_id)
-            .cloned();
+        let session = sessions.values().find(|s| s.id == *session_id).cloned();
         match session {
             Some(session) => {
                 let old_client_id = session.client_id.clone();
@@ -266,7 +262,10 @@ impl SessionManager {
         for (disp, session_id) in &to_release {
             info!(
                 "Client {} disconnected, session {} for display :{} enters grace period ({}s)",
-                client_id, session_id, disp, ServerDefaults::SESSION_GRACE_PERIOD.as_secs()
+                client_id,
+                session_id,
+                disp,
+                ServerDefaults::SESSION_GRACE_PERIOD.as_secs()
             );
         }
 
@@ -295,7 +294,10 @@ impl SessionManager {
             };
 
             for disp in &to_destroy {
-                warn!("Grace period expired for display :{}, destroying session", disp);
+                warn!(
+                    "Grace period expired for display :{}, destroying session",
+                    disp
+                );
                 if let Ok(disp_num) = DisplayNumber::new(*disp) {
                     mgr.destroy_session(disp_num).await;
                 }
@@ -335,7 +337,11 @@ impl SessionManager {
         self.sessions.write().await.remove(&disp_val);
     }
 
-    pub async fn register_x11_relay(&self, disp: DisplayNumber, sender: mpsc::Sender<X11ConnToRelay>) {
+    pub async fn register_x11_relay(
+        &self,
+        disp: DisplayNumber,
+        sender: mpsc::Sender<X11ConnToRelay>,
+    ) {
         self.conn_to_relay.write().await.insert(disp.get(), sender);
     }
 
@@ -343,7 +349,10 @@ impl SessionManager {
         self.conn_to_relay.write().await.remove(&disp.get());
     }
 
-    pub async fn get_x11_event_sender(&self, disp: DisplayNumber) -> Option<mpsc::Sender<X11ConnToRelay>> {
+    pub async fn get_x11_event_sender(
+        &self,
+        disp: DisplayNumber,
+    ) -> Option<mpsc::Sender<X11ConnToRelay>> {
         self.conn_to_relay.read().await.get(&disp.get()).cloned()
     }
 
@@ -361,7 +370,8 @@ impl SessionManager {
             if count >= ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY {
                 return Err(rx11_core::error::Rx11Error::Protocol(format!(
                     "Too many X11 connections for display :{} (max {})",
-                    disp_val, ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY
+                    disp_val,
+                    ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY
                 )));
             }
         }
@@ -392,8 +402,16 @@ impl SessionManager {
 
     pub async fn send_to_x11_connection(&self, conn_id: ConnectionId, data: Vec<u8>) {
         if let Some(state) = self.connections.lock().await.get(&conn_id.get()) {
-            if state.sender.send(X11RelayToConn::Data(bytes::Bytes::from(data))).await.is_err() {
-                warn!("Failed to send data to x11 connection {}, channel full or closed", conn_id);
+            if state
+                .sender
+                .send(X11RelayToConn::Data(bytes::Bytes::from(data)))
+                .await
+                .is_err()
+            {
+                warn!(
+                    "Failed to send data to x11 connection {}, channel full or closed",
+                    conn_id
+                );
             }
         }
     }
@@ -501,11 +519,20 @@ mod tests {
             .unwrap();
 
         assert_eq!(session.display.get(), 10);
-        assert!(mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1").await);
-        assert!(!mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-2").await);
+        assert!(
+            mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1")
+                .await
+        );
+        assert!(
+            !mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-2")
+                .await
+        );
 
         mgr.destroy_session(session.display).await;
-        assert!(!mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1").await);
+        assert!(
+            !mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -514,7 +541,11 @@ mod tests {
         mgr.set_x11_listener(Arc::new(MockBinder)).await;
 
         let session = mgr
-            .create_session_auto("MIT-MAGIC-COOKIE-1".into(), vec![1, 2, 3], "client-1".into())
+            .create_session_auto(
+                "MIT-MAGIC-COOKIE-1".into(),
+                vec![1, 2, 3],
+                "client-1".into(),
+            )
             .await
             .unwrap();
 
@@ -588,7 +619,9 @@ mod tests {
         let conn_id = ConnectionId::new(42);
         let disp = DisplayNumber::new(1).unwrap();
 
-        mgr.register_x11_connection(conn_id, disp, tx).await.unwrap();
+        mgr.register_x11_connection(conn_id, disp, tx)
+            .await
+            .unwrap();
 
         let conn_state = {
             let conns = mgr.connections.lock().await;
@@ -663,7 +696,10 @@ mod tests {
         mgr.destroy_all_sessions().await;
 
         for i in 0..3 {
-            assert!(!mgr.owns_session(DisplayNumber::new(i).unwrap(), &format!("client-{}", i)).await);
+            assert!(
+                !mgr.owns_session(DisplayNumber::new(i).unwrap(), &format!("client-{}", i))
+                    .await
+            );
         }
     }
 }

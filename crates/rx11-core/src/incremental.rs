@@ -1,10 +1,8 @@
+use crate::config::IncrementalDefaults;
 use crate::protocol::{IncrementalChunk, IncrementalX11DataMessage};
 use crate::types::ConnectionId;
 use bytes::Bytes;
 use std::collections::HashMap;
-
-pub const DEFAULT_CHUNK_SIZE: usize = 4096;
-pub const MIN_BLOCK_SIZE_FOR_DIFF: usize = 1024;
 
 pub struct ConnectionDataCache {
     last_data: HashMap<ConnectionId, CachedData>,
@@ -18,7 +16,7 @@ struct CachedData {
 
 impl ConnectionDataCache {
     pub fn new() -> Self {
-        Self::with_chunk_size(DEFAULT_CHUNK_SIZE)
+        Self::with_chunk_size(IncrementalDefaults::DEFAULT_CHUNK_SIZE)
     }
 
     pub fn with_chunk_size(chunk_size: usize) -> Self {
@@ -52,17 +50,26 @@ impl ConnectionDataCache {
     ) -> Option<IncrementalX11DataMessage> {
         let (base_sequence_id, old_data) = self.get_cached(connection_id)?;
 
-        if new_data.len() < MIN_BLOCK_SIZE_FOR_DIFF {
+        if new_data.len() < IncrementalDefaults::MIN_BLOCK_SIZE_FOR_DIFF {
             return None;
         }
 
         let chunks = self.compute_diff_chunks(old_data, new_data);
 
+        // Identical payload: an empty diff relies on the receiver's cache
+        // staying in sync; fall back to a full (compressible) frame instead.
+        if chunks.is_empty() {
+            return None;
+        }
+
         let saved_bytes = old_data
             .len()
             .saturating_sub(chunks.iter().map(|c| c.data.len()).sum::<usize>());
 
-        if saved_bytes < old_data.len() / 10 {
+        // Only send a diff when it saves a meaningful fraction of the base
+        // frame; the floor matches the previous `len() / 10` integer rule.
+        let min_saved = (old_data.len() as f64 * IncrementalDefaults::MIN_SAVINGS_RATIO) as usize;
+        if saved_bytes < min_saved {
             return None;
         }
 

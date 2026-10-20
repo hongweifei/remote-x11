@@ -21,19 +21,24 @@ pub enum Rx11Error {
 
 pub type Result<T> = std::result::Result<T, Rx11Error>;
 
+/// True for transient network errors that justify a reconnect attempt.
+pub fn is_retriable_io_error(err: &std::io::Error) -> bool {
+    matches!(
+        err.kind(),
+        ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::TimedOut
+            | ErrorKind::Interrupted
+            | ErrorKind::UnexpectedEof
+    )
+}
+
 impl Rx11Error {
     pub fn is_retriable(&self) -> bool {
         match self {
-            Rx11Error::Io(e) => matches!(
-                e.kind(),
-                ErrorKind::ConnectionRefused
-                    | ErrorKind::ConnectionReset
-                    | ErrorKind::ConnectionAborted
-                    | ErrorKind::BrokenPipe
-                    | ErrorKind::TimedOut
-                    | ErrorKind::Interrupted
-                    | ErrorKind::UnexpectedEof
-            ),
+            Rx11Error::Io(e) => is_retriable_io_error(e),
             Rx11Error::Timeout | Rx11Error::ConnectionClosed => true,
             _ => false,
         }

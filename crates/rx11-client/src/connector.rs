@@ -167,13 +167,16 @@ impl LocalConnector {
         .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
         let mut transport = Rx11Transport::new(stream)?;
 
-        let resume_sid = resume_session_id
-            .map(SessionId::new)
-            .transpose()?;
+        let resume_sid = resume_session_id.map(SessionId::new).transpose()?;
 
         let token = Token::new(self.auth_token.clone())?;
-        let handshake =
-            client_handshake(&mut transport, &token, resume_sid.as_ref(), ClientDefaults::TCP_CONNECT_TIMEOUT).await?;
+        let handshake = client_handshake(
+            &mut transport,
+            &token,
+            resume_sid.as_ref(),
+            ClientDefaults::TCP_CONNECT_TIMEOUT,
+        )
+        .await?;
         let compression = handshake.compression;
 
         info!(
@@ -564,7 +567,10 @@ async fn handle_other_frame(
             error!("Error from relay (code={}): {}", msg.code, msg.message);
         }
         Frame::FlowControl(msg) => {
-            debug!("FlowControl from relay: action={:?} conn={:?}", msg.action, msg.connection_id);
+            debug!(
+                "FlowControl from relay: action={:?} conn={:?}",
+                msg.action, msg.connection_id
+            );
         }
         _ => {
             warn!("Unexpected frame from relay: {:?}", frame.msg_type());
