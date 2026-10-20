@@ -384,28 +384,50 @@ Client                          Server
 
 ```
 remote-x11/
-├── Cargo.toml                  # Workspace root config
+├── Cargo.toml                    # Workspace root config (deps, release profile)
+├── LICENSE                       # MIT license
+├── .github/workflows/ci.yml      # CI: fmt / clippy / test / release build
 └── crates/
-    ├── rx11-core/              # Core lib: protocol, transport, auth, stats
+    ├── rx11-core/                # Core lib: protocol, transport, auth, stats
     │   └── src/
-     │       ├── protocol.rs     # Frame encode/decode, message type definitions
-     │       ├── transport.rs    # Async transport (frame sync recovery, buffer limits)
-     │       ├── compress.rs     # Data compression (zstd/lz4/zlib negotiation)
-     │       ├── auth.rs         # Token generation & verification (constant-time compare)
-    │       ├── stats.rs        # Connection stats (bytes, frames, active connections)
-    │       └── error.rs        # Error types (with retryable error support)
-    ├── rx11-server/            # Remote side: relay server + X11 listener
+    │       ├── protocol/         # Protocol layer
+    │       │   ├── mod.rs        #   Frame constants and module facade
+    │       │   ├── messages.rs   #   Payload structs for every frame kind
+    │       │   ├── message_type.rs #  On-wire message type tags
+    │       │   ├── binary.rs     #   Binary codecs for X11 data frames
+    │       │   ├── frame.rs      #   Frame enum, derive macro, frame (de)serialization
+    │       │   └── handshake.rs  #   Hello/Auth negotiation (shared by both sides)
+    │       ├── transport.rs      # Async transport (frame sync recovery, buffer limits)
+    │       ├── compress.rs       # Data compression (zstd/lz4/zlib negotiation)
+    │       ├── incremental.rs    # Incremental diff encoding
+    │       ├── auth.rs           # Token generation & verification (constant-time compare)
+    │       ├── types.rs          # Validated newtypes (SessionId/Token/DisplayNumber, …)
+    │       ├── stats.rs          # Connection stats (bytes, frames, active connections)
+    │       ├── config.rs         # Centralized default constants (timeouts/ports/buffers)
+    │       └── error.rs          # Error types (with retryable error support)
+    ├── rx11-server/              # Remote side: relay server + X11 listener
     │   └── src/
-    │       ├── relay.rs        # Relay service (handshake, auth, session mgmt, heartbeat)
-    │       ├── session.rs      # Session manager (persistence, grace period, auto display)
-    │       └── x11_listener.rs # X11 port listener & proxy (multi-connection multiplexing)
-    ├── rx11-client/            # Local side: relay connection + local X Server proxy
+    │       ├── relay/
+    │       │   ├── mod.rs        #   RelayServer: accept loop & connection cap
+    │       │   └── connection.rs #   Per-client connection task (sessions, heartbeat, forwarding)
+    │       ├── session/
+    │       │   ├── mod.rs        #   Session manager (grace period, auto display)
+    │       │   ├── events.rs     #   Channel messages between listener and relay
+    │       │   └── xauth.rs      #   xauth entry management
+    │       └── x11_listener.rs   # X11 port listener & proxy (multi-connection multiplexing)
+    ├── rx11-client/              # Local side: relay connection + local X Server proxy
     │   └── src/
-    │       ├── connector.rs    # Client connection, auto-reconnect, session resume, X11 relay
-    │       └── ssh.rs          # SSH tunnel client
-    └── rx11-cli/               # Unified CLI entry point
+    │       ├── connector.rs      # Connection, session create/resume, reconnect backoff
+    │       ├── serve.rs          # Relay receive loop and frame dispatch
+    │       ├── proxy.rs          # Local X11 app connections and socket pumps
+    │       └── ssh.rs            # SSH tunnel client (health check)
+    └── rx11-cli/                 # Unified CLI entry point
         └── src/
-            └── main.rs         # CLI arg parsing, config loading, subcommand dispatch
+            ├── main.rs           # Logging init + subcommand dispatch
+            ├── cli.rs            # clap argument definitions
+            ├── settings.rs       # TOML config loading and template
+            ├── util.rs           # X Server probing, port waiting
+            └── commands/         # server / client / ssh / run / gen-token / config
 ```
 
 ---

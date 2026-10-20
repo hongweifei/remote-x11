@@ -384,28 +384,50 @@ Client                          Server
 
 ```
 remote-x11/
-├── Cargo.toml                  # Workspace 根配置
+├── Cargo.toml                    # Workspace 根配置（依赖、release profile）
+├── LICENSE                       # MIT 许可证
+├── .github/workflows/ci.yml      # CI：fmt / clippy / test / release build
 └── crates/
-    ├── rx11-core/              # 核心库：协议定义、传输层、认证、统计
+    ├── rx11-core/                # 核心库：协议定义、传输层、认证、统计
     │   └── src/
-     │       ├── protocol.rs     # 帧编解码、消息类型定义
-     │       ├── transport.rs    # 异步传输层（帧同步恢复、缓冲区限制）
-     │       ├── compress.rs     # 数据压缩（zstd/lz4/zlib 协商与编解码）
-     │       ├── auth.rs         # Token 生成与验证（常量时间比较、空 token 拒绝）
-    │       ├── stats.rs        # 连接统计（字节数、帧数、活跃连接等）
-    │       └── error.rs        # 错误类型（支持可重试判断）
-    ├── rx11-server/            # 远程端：中继服务器 + X11 监听
+    │       ├── protocol/         # 协议层
+    │       │   ├── mod.rs        #   帧常量与统一出口
+    │       │   ├── messages.rs   #   各类帧载荷结构
+    │       │   ├── message_type.rs #  线上类型标签
+    │       │   ├── binary.rs     #   X11 数据帧二进制编解码
+    │       │   ├── frame.rs      #   Frame 枚举、派生宏、帧级编解码
+    │       │   └── handshake.rs  #   Hello/Auth 协商（双端共用）
+    │       ├── transport.rs      # 异步传输层（帧同步恢复、缓冲区限制）
+    │       ├── compress.rs       # 数据压缩（zstd/lz4/zlib 协商与编解码）
+    │       ├── incremental.rs    # 增量差分编码
+    │       ├── auth.rs           # Token 生成与验证（常量时间比较、空 token 拒绝）
+    │       ├── types.rs          # 校验型 newtype（SessionId/Token/DisplayNumber 等）
+    │       ├── stats.rs          # 连接统计（字节数、帧数、活跃连接等）
+    │       ├── config.rs         # 集中默认常量（超时/端口/缓冲）
+    │       └── error.rs          # 错误类型（支持可重试判断）
+    ├── rx11-server/              # 远程端：中继服务器 + X11 监听
     │   └── src/
-    │       ├── relay.rs        # 中继服务主逻辑（握手、认证、会话管理、心跳检测）
-    │       ├── session.rs      # 会话管理器（支持持久化、宽限期、自动分配 Display）
-    │       └── x11_listener.rs # X11 端口监听与代理（多连接多路复用）
-    ├── rx11-client/            # 本地端：连接中继 + 本地 X Server 代理
+    │       ├── relay/
+    │       │   ├── mod.rs        #   RelayServer：accept 循环与连接数限制
+    │       │   └── connection.rs #   每客户端连接任务（会话、心跳、转发）
+    │       ├── session/
+    │       │   ├── mod.rs        #   会话管理器（宽限期、自动分配 Display）
+    │       │   ├── events.rs     #   X11 监听与中继间的通道消息
+    │       │   └── xauth.rs      #   xauth 条目管理
+    │       └── x11_listener.rs   # X11 端口监听与代理（多连接多路复用）
+    ├── rx11-client/              # 本地端：连接中继 + 本地 X Server 代理
     │   └── src/
-    │       ├── connector.rs    # 客户端连接、自动重连、会话恢复、X11 数据转发
-    │       └── ssh.rs          # SSH 隧道客户端
-    └── rx11-cli/               # 统一 CLI 入口
+    │       ├── connector.rs      # 连接建立、会话创建/恢复、自动重连退避
+    │       ├── serve.rs          # 中继回帧分发循环（含增量/压缩解码）
+    │       ├── proxy.rs          # 本地 X11 应用连接与双向代理
+    │       └── ssh.rs            # SSH 隧道客户端（健康检查）
+    └── rx11-cli/                 # 统一 CLI 入口
         └── src/
-            └── main.rs         # 命令行参数解析、配置文件加载、子命令分发
+            ├── main.rs           # 日志初始化 + 子命令分发
+            ├── cli.rs            # clap 参数定义
+            ├── settings.rs       # TOML 配置文件加载与模板
+            ├── util.rs           # X Server 探测、端口等待
+            └── commands/         # server / client / ssh / run / gen-token / config
 ```
 
 ---
