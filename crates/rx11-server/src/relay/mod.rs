@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::{info, warn};
 
 use rx11_core::config::ServerDefaults;
+use rx11_core::stats::ConnectionStats;
 
 use crate::session::SessionManager;
 use crate::x11_listener::X11Listener;
@@ -21,6 +22,7 @@ pub struct RelayServer {
     session_mgr: Arc<SessionManager>,
     x11_base_port: u16,
     active_connections: Arc<AtomicUsize>,
+    stats: Arc<ConnectionStats>,
 }
 
 impl RelayServer {
@@ -31,6 +33,7 @@ impl RelayServer {
             session_mgr: Arc::new(SessionManager::new()),
             x11_base_port,
             active_connections: Arc::new(AtomicUsize::new(0)),
+            stats: Arc::new(ConnectionStats::new()),
         }
     }
 
@@ -43,6 +46,8 @@ impl RelayServer {
             self.session_mgr.clone(),
         ));
         self.session_mgr.set_x11_listener(x11_listener).await;
+
+        let stats_task = spawn_stats_reporter(self.stats.clone(), ServerDefaults::STATUS_INTERVAL);
 
         loop {
             tokio::select! {
@@ -59,6 +64,7 @@ impl RelayServer {
             }
         }
 
+        stats_task.abort();
         Ok(())
     }
 
@@ -81,11 +87,12 @@ impl RelayServer {
         );
 
         let session_mgr = self.session_mgr.clone();
+        let stats = self.stats.clone();
         let auth_token = self.auth_token.clone();
         let conn_counter = self.active_connections.clone();
 
         tokio::spawn(async move {
-            let result = handle_client(stream, addr, session_mgr, &auth_token).await;
+            let result = handle_client(stream, addr, session_mgr, stats, &auth_token).await;
             conn_counter.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 warn!("Client handler error: {}", e);
@@ -96,4 +103,23 @@ impl RelayServer {
     pub fn session_manager(&self) -> Arc<SessionManager> {
         self.session_mgr.clone()
     }
+}
+
+/// Periodically logs a server-wide activity summary; skips idle servers to
+/// keep the log quiet when nothing is flowing.
+fn spawn_stats_reporter(
+    stats: Arc<ConnectionStats>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await; // first tick completes immediately
+        loop {
+            timer.tick().await;
+            if !stats.is_idle() {
+                info!("[rx11] Relay status | {}", stats.summary());
+                stats.reset_period();
+            }
+        }
+    })
 }

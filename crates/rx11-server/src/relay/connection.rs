@@ -14,8 +14,9 @@ use rx11_core::compress::{
 use rx11_core::config::{BufferDefaults, ServerDefaults};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
+use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::{Rx11Transport, Rx11TransportReadHalf, Rx11TransportWriteHalf};
-use rx11_core::types::DisplayNumber;
+use rx11_core::types::{ConnectionId, DisplayNumber};
 
 use crate::session::{Session, SessionManager, X11ConnToRelay};
 
@@ -23,6 +24,7 @@ pub(super) async fn handle_client(
     stream: TcpStream,
     addr: SocketAddr,
     session_mgr: Arc<SessionManager>,
+    stats: Arc<ConnectionStats>,
     auth_token: &str,
 ) -> rx11_core::error::Result<()> {
     info!("Client connected from {}", addr);
@@ -66,6 +68,7 @@ pub(super) async fn handle_client(
         heartbeat_deadline: tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT,
         x11_event_tx: &x11_event_tx,
         incremental_cache: &mut incremental_cache,
+        stats: &stats,
     };
 
     let result = relay_loop(&mut ctx).await;
@@ -120,6 +123,7 @@ struct RelayContext<'a> {
     heartbeat_deadline: tokio::time::Instant,
     x11_event_tx: &'a mpsc::Sender<X11ConnToRelay>,
     incremental_cache: &'a mut ConnectionDataCache,
+    stats: &'a Arc<ConnectionStats>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -211,7 +215,29 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             info!("Session destroyed for display {}", disp);
             RelayAction::Continue
         }
-        Frame::DataX11(msg) => forward_to_x11(ctx, msg.connection_id, msg.data.to_vec()).await,
+        Frame::DataX11(msg) => {
+            ctx.stats.add_bytes_received(msg.data.len() as u64);
+            forward_to_x11(ctx, msg.connection_id, msg.data.to_vec()).await
+        }
+        Frame::IncrementalRequestFull(msg) => {
+            if !ctx
+                .session_mgr
+                .owns_connection(msg.connection_id, ctx.transport_id)
+                .await
+            {
+                warn!(
+                    "Client {} requested full resend for unowned {}",
+                    ctx.transport_id, msg.connection_id
+                );
+                return RelayAction::Continue;
+            }
+            info!(
+                "Client {} requested full resend for {} (diff cache dropped a frame); clearing send base",
+                ctx.transport_id, msg.connection_id
+            );
+            ctx.incremental_cache.clear_connection(msg.connection_id);
+            RelayAction::Continue
+        }
         Frame::CompressedDataX11(msg) => {
             if !ctx
                 .session_mgr
@@ -228,6 +254,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 warn!("CompressedDataX11 received but no compression negotiated, dropping");
                 return RelayAction::Continue;
             };
+            ctx.stats.add_bytes_received(msg.data.len() as u64);
             match decompress_frame_data(&msg, algo) {
                 Some(decompressed) => {
                     ctx.session_mgr
@@ -269,7 +296,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
 /// Ownership-checked plain-data forwarding for the DataX11 path.
 async fn forward_to_x11(
     ctx: &mut RelayContext<'_>,
-    connection_id: rx11_core::types::ConnectionId,
+    connection_id: ConnectionId,
     data: Vec<u8>,
 ) -> RelayAction {
     if !ctx
@@ -320,6 +347,30 @@ async fn send_session_ack(
     send_outbound(ctx.outbound, Frame::SessionAck(ack)).await
 }
 
+/// Attribute one outbound X11 data frame to the relay stats: wire bytes
+/// plus compression / incremental savings relative to the original payload.
+fn record_outbound_frame(stats: &ConnectionStats, frame: &Frame, original_len: usize) {
+    match frame {
+        Frame::DataX11(m) => stats.add_bytes_sent(m.data.len() as u64),
+        Frame::CompressedDataX11(m) => {
+            stats.add_bytes_sent(m.data.len() as u64);
+            stats.add_compression_saved(m.original_len.saturating_sub(m.data.len()) as u64);
+        }
+        Frame::IncrementalDataX11(m) => {
+            let chunks_len: usize = m.chunks.iter().map(|c| c.data.len()).sum();
+            stats.add_bytes_sent(chunks_len as u64);
+            stats.add_incremental_saved(original_len.saturating_sub(chunks_len) as u64);
+        }
+        Frame::CompressedIncrementalDataX11(m) => {
+            stats.add_bytes_sent(m.data.len() as u64);
+            stats.add_incremental_compression_saved(
+                m.original_len.saturating_sub(m.data.len()) as u64
+            );
+        }
+        _ => {}
+    }
+}
+
 async fn handle_x11_event(
     event: Option<X11ConnToRelay>,
     ctx: &mut RelayContext<'_>,
@@ -329,6 +380,7 @@ async fn handle_x11_event(
             display,
             connection_id,
         }) => {
+            ctx.stats.inc_x11_connections();
             send_outbound(
                 ctx.outbound,
                 Frame::X11Connect(X11ConnectMessage {
@@ -343,13 +395,16 @@ async fn handle_x11_event(
             data,
             ..
         }) => {
+            let original_len = data.len();
+            let sequence_id = ctx.incremental_cache.next_sequence_for(connection_id);
             let frame = maybe_incremental_or_compress_frame(
                 connection_id,
-                0,
+                sequence_id,
                 data,
                 ctx.compression,
                 Some(ctx.incremental_cache),
             );
+            record_outbound_frame(ctx.stats, &frame, original_len);
             send_outbound(ctx.outbound, frame).await
         }
         Some(X11ConnToRelay::Disconnected {
@@ -360,6 +415,7 @@ async fn handle_x11_event(
                 .unregister_x11_connection(connection_id)
                 .await;
             ctx.incremental_cache.clear_connection(connection_id);
+            ctx.stats.dec_x11_connections();
             send_outbound(
                 ctx.outbound,
                 Frame::X11Disconnect(X11DisconnectMessage {
