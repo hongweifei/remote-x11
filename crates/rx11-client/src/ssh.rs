@@ -13,6 +13,10 @@ pub struct SshTunnel {
     child: Arc<Mutex<Option<tokio::process::Child>>>,
     local_addr: String,
     cancel: Arc<Notify>,
+    /// Notified when the health check gives up, so the owning session can
+    /// fail fast instead of grinding through reconnect attempts against a
+    /// dead tunnel.
+    dead: Arc<Notify>,
     health_task: tokio::task::JoinHandle<()>,
 }
 
@@ -37,21 +41,29 @@ impl SshTunnel {
 
         let local_addr = format!("127.0.0.1:{}", local_bind_port);
         let cancel = Arc::new(Notify::new());
+        let dead = Arc::new(Notify::new());
         let cancel_clone = cancel.clone();
+        let dead_clone = dead.clone();
         let local_addr_clone = local_addr.clone();
         let child_ref = Arc::new(Mutex::new(Some(child)));
 
         let health_child = child_ref.clone();
         let health_task = tokio::spawn(async move {
-            health_check_loop(&local_addr_clone, cancel_clone, health_child).await;
+            health_check_loop(&local_addr_clone, cancel_clone, dead_clone, health_child).await;
         });
 
         Ok(Self {
             child: child_ref,
             local_addr,
             cancel,
+            dead,
             health_task,
         })
+    }
+
+    /// Handle on the "tunnel is dead" signal for `tokio::select!` usage.
+    pub fn dead_notify(&self) -> Arc<Notify> {
+        self.dead.clone()
     }
 
     pub async fn wait(&mut self) -> anyhow::Result<std::process::ExitStatus> {
@@ -81,6 +93,7 @@ impl SshTunnel {
 async fn health_check_loop(
     local_addr: &str,
     cancel: Arc<Notify>,
+    dead: Arc<Notify>,
     child: Arc<Mutex<Option<tokio::process::Child>>>,
 ) {
     let mut interval = tokio::time::interval(SshDefaults::HEALTH_CHECK_INTERVAL);
@@ -127,6 +140,7 @@ async fn health_check_loop(
                             "SSH tunnel health check failed {} consecutive times, tunnel appears dead",
                             SshDefaults::MAX_CONSECUTIVE_FAILURES
                         );
+                        dead.notify_waiters();
                         break;
                     }
                 }
@@ -206,6 +220,7 @@ pub async fn create_forward_tunnel(
     let child = Command::new("ssh")
         .args(&args)
         .stdin(Stdio::null())
+        .kill_on_drop(true)
         .spawn()?;
 
     Ok(child)

@@ -129,14 +129,15 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
                             data.clone(),
                             ctx.compression,
                         );
+                        // Record savings from the frame we actually built:
+                        // the old `data.len() - n` expression was always zero.
+                        if let Frame::CompressedDataX11(m) = &frame {
+                            ctx.stats.add_compression_saved(
+                                m.original_len.saturating_sub(m.data.len()) as u64,
+                            );
+                        }
                         if ctx.outbound.send(frame).await.is_err() {
                             break;
-                        }
-                        if ctx.compression.is_some()
-                            && data.len() >= rx11_core::compress::COMPRESSION_THRESHOLD
-                        {
-                            ctx.stats
-                                .add_compression_saved(data.len().saturating_sub(n) as u64);
                         }
                         ctx.stats.add_bytes_sent(n as u64);
 

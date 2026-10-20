@@ -8,9 +8,11 @@ use rx11_core::config::ClientDefaults;
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{
     BinaryMessageCodec, CompressedIncrementalX11DataMessage, CompressedX11DataMessage, Frame,
-    IncrementalX11DataMessage, SessionDestroyMessage, X11DataMessage,
+    IncrementalRequestFullMessage, IncrementalX11DataMessage, SessionDestroyMessage,
+    X11DataMessage,
 };
 use rx11_core::transport::Rx11TransportReadHalf;
+use rx11_core::types::ConnectionId;
 use rx11_core::types::DisplayNumber;
 
 use crate::proxy::{send_data_to_local, spawn_local_connection, ProxyDeps};
@@ -103,14 +105,30 @@ async fn on_compressed_data(ctx: &mut ServeCtx<'_>, msg: CompressedX11DataMessag
     deliver(ctx, msg.connection_id, msg.sequence_id, decompressed).await;
 }
 
+/// Ask the relay to stop diffing this connection and resend full frames:
+/// our receive cache is out of sync, so every further diff would fail.
+async fn request_full_resend(ctx: &mut ServeCtx<'_>, conn_id: ConnectionId) {
+    ctx.proxy.stats.add_incremental_full_fallback();
+    let _ = ctx
+        .proxy
+        .outbound
+        .send(Frame::IncrementalRequestFull(
+            IncrementalRequestFullMessage {
+                connection_id: conn_id,
+            },
+        ))
+        .await;
+}
+
 async fn on_incremental_data(ctx: &mut ServeCtx<'_>, msg: IncrementalX11DataMessage) {
     let conn_id = msg.connection_id;
     let total_len = msg.total_len;
     let Some(decompressed) = ctx.incremental_cache.apply_incremental(&msg) else {
         warn!(
-            "Incremental data apply failed for {}, will request full data",
+            "Incremental data apply failed for {}, requesting full data",
             conn_id
         );
+        request_full_resend(ctx, conn_id).await;
         return;
     };
     let saved = total_len.saturating_sub(msg.chunks.iter().map(|c| c.data.len()).sum::<usize>());
@@ -136,6 +154,7 @@ async fn on_compressed_incremental(
             "Incremental decompression failed for {}, dropping frame",
             conn_id
         );
+        request_full_resend(ctx, conn_id).await;
         return;
     };
     ctx.proxy
@@ -147,6 +166,7 @@ async fn on_compressed_incremental(
         Ok(m) => m,
         Err(e) => {
             warn!("Incremental decode failed for {}: {}", conn_id, e);
+            request_full_resend(ctx, conn_id).await;
             return;
         }
     };
