@@ -203,3 +203,71 @@ pub(crate) async fn cleanup_connections(
         handle.abort();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future;
+
+    async fn stub_handle() -> JoinHandle<()> {
+        tokio::spawn(future::pending::<()>())
+    }
+
+    #[tokio::test]
+    async fn send_data_to_local_delivers_to_live_channel() {
+        let conns = new_shared_conns();
+        let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(4);
+        conns.lock().await.insert(12, (tx, stub_handle().await));
+        send_data_to_local(
+            &conns,
+            ConnectionId::new(12),
+            bytes::Bytes::from_static(&[7, 7]),
+        )
+        .await;
+        assert_eq!(&rx.recv().await.unwrap()[..], &[7, 7]);
+    }
+
+    #[tokio::test]
+    async fn send_data_to_local_prunes_gone_receiver() {
+        let conns = new_shared_conns();
+        let (tx, rx) = mpsc::channel::<bytes::Bytes>(4);
+        drop(rx); // pump task vanished
+        conns.lock().await.insert(11, (tx, stub_handle().await));
+
+        send_data_to_local(
+            &conns,
+            ConnectionId::new(11),
+            bytes::Bytes::from_static(&[1]),
+        )
+        .await;
+        assert!(conns.lock().await.is_empty(), "stale entry must be pruned");
+    }
+
+    #[tokio::test]
+    async fn send_data_to_local_unknown_connection_is_noop() {
+        let conns = new_shared_conns();
+        send_data_to_local(
+            &conns,
+            ConnectionId::new(99),
+            bytes::Bytes::from_static(&[1]),
+        )
+        .await;
+        assert!(conns.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cleanup_connections_aborts_tasks_and_decrements_stats() {
+        let conns = new_shared_conns();
+        let stats = Arc::new(ConnectionStats::new());
+        for id in 1..=2u32 {
+            let (tx, _rx) = mpsc::channel::<bytes::Bytes>(1);
+            conns.lock().await.insert(id, (tx, stub_handle().await));
+            stats.inc_x11_connections();
+        }
+
+        cleanup_connections(&conns, &stats).await;
+
+        assert!(conns.lock().await.is_empty());
+        assert!(stats.summary().contains("0 active X11 connections"));
+    }
+}

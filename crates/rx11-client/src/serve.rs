@@ -240,3 +240,338 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::{new_shared_conns, SharedX11Conns};
+    use bytes::Bytes;
+    use rx11_core::compress::CompressionAlgo;
+    use rx11_core::protocol::{
+        HelloAckMessage, IncrementalChunk, X11DisconnectMessage, PROTOCOL_VERSION,
+    };
+    use rx11_core::stats::ConnectionStats;
+    use rx11_core::transport::{Rx11Transport, Rx11TransportWriteHalf};
+    use rx11_core::types::SessionId;
+    use std::future;
+    use std::sync::atomic::AtomicU32;
+    use std::sync::Arc;
+    use tokio::net::TcpListener;
+    use tokio::sync::mpsc;
+    use tokio::sync::mpsc::error::TryRecvError;
+
+    /// Drives `dispatch_frame` without a real relay: the read half is a
+    /// loopback socket nobody feeds, all assertions go through the outbound
+    /// channel, local conn channels and stats.
+    struct Harness {
+        read_half: Rx11TransportReadHalf,
+        _write_half: Rx11TransportWriteHalf,
+        _peer: tokio::net::TcpStream,
+        outbound_tx: mpsc::Sender<Frame>,
+        outbound_rx: mpsc::Receiver<Frame>,
+        conns: SharedX11Conns,
+        stats: Arc<ConnectionStats>,
+        seq: Arc<AtomicU32>,
+        cache: ConnectionDataCache,
+        local_addr: String,
+    }
+
+    impl Harness {
+        async fn new() -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (peer, _) = listener.accept().await.unwrap();
+            let (read_half, write_half) = Rx11Transport::new(client).unwrap().split();
+            let (tx, rx) = mpsc::channel(16);
+            Self {
+                read_half,
+                _write_half: write_half,
+                _peer: peer,
+                outbound_tx: tx,
+                outbound_rx: rx,
+                conns: new_shared_conns(),
+                stats: Arc::new(ConnectionStats::new()),
+                seq: Arc::new(AtomicU32::new(1)),
+                cache: ConnectionDataCache::new(),
+                local_addr: "unused".to_string(),
+            }
+        }
+
+        fn ctx(&mut self, compression: Option<CompressionAlgo>) -> ServeCtx<'_> {
+            ServeCtx {
+                read_half: &mut self.read_half,
+                proxy: ProxyDeps {
+                    outbound: &self.outbound_tx,
+                    x11_connections: &self.conns,
+                    stats: &self.stats,
+                    compression,
+                    seq: &self.seq,
+                    local_x11_addr: &self.local_addr,
+                },
+                incremental_cache: &mut self.cache,
+                display: DisplayNumber::new(0).unwrap(),
+            }
+        }
+
+        async fn register_local(&mut self, conn: ConnectionId) -> mpsc::Receiver<Bytes> {
+            let (tx, rx) = mpsc::channel(16);
+            let handle = tokio::spawn(future::pending::<()>());
+            self.conns.lock().await.insert(conn.get(), (tx, handle));
+            rx
+        }
+
+        async fn assert_nothing_emitted(&mut self) {
+            assert!(matches!(
+                self.outbound_rx.try_recv().unwrap_err(),
+                TryRecvError::Empty
+            ));
+        }
+    }
+
+    fn conn(id: u32) -> ConnectionId {
+        ConnectionId::new(id)
+    }
+
+    #[tokio::test]
+    async fn plain_data_delivers_and_updates_receive_cache() {
+        let mut h = Harness::new().await;
+        let mut rx = h.register_local(conn(3)).await;
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(
+                &mut ctx,
+                Frame::DataX11(X11DataMessage {
+                    connection_id: conn(3),
+                    sequence_id: 7,
+                    data: Bytes::from_static(&[1, 2, 3]),
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(&rx.recv().await.unwrap()[..], &[1, 2, 3]);
+        }
+        assert_eq!(h.cache.get_cached(conn(3)).unwrap().0, 7);
+        assert!(h.stats.summary().contains("Recv: 3 B"));
+    }
+
+    #[tokio::test]
+    async fn compressed_data_delivers_and_counts_savings() {
+        let payload = vec![0xABu8; 4096];
+        let compressed = CompressionAlgo::Zstd
+            .compress_to_bytes(&payload)
+            .expect("compressible");
+
+        let mut h = Harness::new().await;
+        let mut rx = h.register_local(conn(4)).await;
+        {
+            let mut ctx = h.ctx(Some(CompressionAlgo::Zstd));
+            dispatch_frame(
+                &mut ctx,
+                Frame::CompressedDataX11(CompressedX11DataMessage {
+                    connection_id: conn(4),
+                    sequence_id: 2,
+                    original_len: payload.len(),
+                    data: compressed,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.recv().await.unwrap(), Bytes::from(payload));
+        }
+        // Client-side accounting counts the decompressed application payload.
+        let summary = h.stats.summary();
+        assert!(summary.contains("Compressed (full): 1 frames"), "{summary}");
+        assert!(summary.contains("Recv: 4.0 KB"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn compressed_frame_without_negotiated_algo_is_dropped() {
+        let mut h = Harness::new().await;
+        let mut rx = h.register_local(conn(5)).await;
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(
+                &mut ctx,
+                Frame::CompressedDataX11(CompressedX11DataMessage {
+                    connection_id: conn(5),
+                    sequence_id: 1,
+                    original_len: 8,
+                    data: Bytes::from_static(&[1, 2, 3, 4]),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(matches!(rx.try_recv().unwrap_err(), TryRecvError::Empty));
+        h.assert_nothing_emitted().await;
+    }
+
+    #[tokio::test]
+    async fn incremental_applies_against_matching_base() {
+        let mut h = Harness::new().await;
+        let old = vec![0u8; 2048];
+        let mut new = vec![0u8; 2048];
+        new[1500..1600].fill(1);
+        h.cache.update_cache(conn(6), 1, &old);
+
+        let mut rx = h.register_local(conn(6)).await;
+        let msg = IncrementalX11DataMessage {
+            connection_id: conn(6),
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: new.len(),
+            chunks: vec![IncrementalChunk {
+                offset: 1500,
+                length: 100,
+                data: Bytes::from(vec![1u8; 100]),
+            }],
+        };
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(&mut ctx, Frame::IncrementalDataX11(msg))
+                .await
+                .unwrap();
+            assert_eq!(rx.recv().await.unwrap(), Bytes::from(new));
+        }
+        let summary = h.stats.summary();
+        assert!(summary.contains("Incremental: 1 frames"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn stale_incremental_triggers_full_resend_request() {
+        let mut h = Harness::new().await;
+        let _rx = h.register_local(conn(7)).await;
+
+        let msg = IncrementalX11DataMessage {
+            connection_id: conn(7),
+            sequence_id: 2,
+            base_sequence_id: 99, // receiver has nothing cached at base 99
+            total_len: 2048,
+            chunks: vec![IncrementalChunk {
+                offset: 0,
+                length: 4,
+                data: Bytes::from_static(&[1, 2, 3, 4]),
+            }],
+        };
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(&mut ctx, Frame::IncrementalDataX11(msg))
+                .await
+                .unwrap();
+        }
+
+        match h.outbound_rx.recv().await {
+            Some(Frame::IncrementalRequestFull(m)) => assert_eq!(m.connection_id, conn(7)),
+            other => panic!("expected IncrementalRequestFull, got {other:?}"),
+        }
+        let summary = h.stats.summary();
+        assert!(summary.contains("1 fallbacks"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn compressed_incremental_roundtrips_and_reapplies() {
+        let mut h = Harness::new().await;
+        let old = vec![0u8; 2048];
+        let mut new = vec![0u8; 2048];
+        new[1000..1900].fill(0x5A);
+        h.cache.update_cache(conn(8), 5, &old);
+
+        let msg = IncrementalX11DataMessage {
+            connection_id: conn(8),
+            sequence_id: 6,
+            base_sequence_id: 5,
+            total_len: new.len(),
+            chunks: vec![IncrementalChunk {
+                offset: 1000,
+                length: 900,
+                data: Bytes::from(vec![0x5Au8; 900]),
+            }],
+        };
+        let encoded = msg.encode_payload().unwrap();
+        let original_len = encoded.len();
+        let compressed = CompressionAlgo::Zstd
+            .compress_to_bytes(&encoded)
+            .expect("diff encodable+compressible");
+
+        let mut rx = h.register_local(conn(8)).await;
+        {
+            let mut ctx = h.ctx(Some(CompressionAlgo::Zstd));
+            dispatch_frame(
+                &mut ctx,
+                Frame::CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage {
+                    connection_id: conn(8),
+                    sequence_id: 6,
+                    original_len,
+                    data: compressed,
+                }),
+            )
+            .await
+            .unwrap();
+            assert_eq!(rx.recv().await.unwrap(), Bytes::from(new));
+        }
+        let summary = h.stats.summary();
+        assert!(
+            summary.contains("Compressed (incremental): 1 frames"),
+            "{summary}"
+        );
+        assert!(summary.contains("Incremental: 1 frames"), "{summary}");
+    }
+
+    #[tokio::test]
+    async fn heartbeat_is_acked_outbound() {
+        let mut h = Harness::new().await;
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(&mut ctx, Frame::Heartbeat).await.unwrap();
+        }
+        assert!(matches!(
+            h.outbound_rx.recv().await,
+            Some(Frame::HeartbeatAck)
+        ));
+    }
+
+    #[tokio::test]
+    async fn x11_disconnect_cleans_registry_and_diff_cache() {
+        let mut h = Harness::new().await;
+        h.cache.update_cache(conn(9), 1, &[0u8; 2048]);
+        let _rx = h.register_local(conn(9)).await;
+
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(
+                &mut ctx,
+                Frame::X11Disconnect(X11DisconnectMessage {
+                    display: DisplayNumber::new(0).unwrap(),
+                    connection_id: conn(9),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+
+        assert!(h.conns.lock().await.is_empty());
+        assert!(h.cache.get_cached(conn(9)).is_none());
+    }
+
+    #[tokio::test]
+    async fn session_ack_like_unexpected_frame_is_ignored() {
+        let mut h = Harness::new().await;
+        {
+            let mut ctx = h.ctx(None);
+            dispatch_frame(
+                &mut ctx,
+                Frame::HelloAck(HelloAckMessage {
+                    version: PROTOCOL_VERSION,
+                    session_id: SessionId::new("s".into()).unwrap(),
+                    success: true,
+                    error_msg: None,
+                    compression: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        h.assert_nothing_emitted().await;
+    }
+}

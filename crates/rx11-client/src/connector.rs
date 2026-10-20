@@ -315,3 +315,60 @@ fn is_retriable(err: &anyhow::Error) -> bool {
         })
         .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn connector() -> LocalConnector {
+        LocalConnector::new(
+            "relay:7000".into(),
+            "token".into(),
+            "127.0.0.1:6000".into(),
+            None,
+            true,
+        )
+    }
+
+    #[test]
+    fn backoff_first_retry_is_base_doubled_plus_jitter() {
+        let c = connector();
+        let d = c.calculate_backoff(1);
+        assert!(
+            d >= Duration::from_millis(2000) && d <= Duration::from_millis(2500),
+            "unexpected first delay {d:?}"
+        );
+    }
+
+    #[test]
+    fn backoff_saturates_at_max_delay() {
+        let c = connector();
+        for attempt in [10, 32, 1000] {
+            assert_eq!(
+                c.calculate_backoff(attempt),
+                ClientDefaults::RETRY_MAX_DELAY,
+                "attempt {attempt} should clamp to max delay"
+            );
+        }
+    }
+
+    #[test]
+    fn retriable_classification_covers_all_error_sources() {
+        assert!(is_retriable(&anyhow::Error::from(Rx11Error::Timeout)));
+        assert!(is_retriable(&anyhow::Error::from(
+            Rx11Error::ConnectionClosed
+        )));
+        assert!(is_retriable(&anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "no relay"
+        ))));
+        assert!(!is_retriable(&anyhow::Error::from(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "firewall"
+        ))));
+        assert!(!is_retriable(&anyhow::Error::from(Rx11Error::Protocol(
+            "bad frame".into()
+        ))));
+        assert!(!is_retriable(&anyhow::anyhow!("unrelated error")));
+    }
+}

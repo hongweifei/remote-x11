@@ -174,14 +174,15 @@ const SSH_TUNNEL_OPTS: [&str; 5] = [
     "ServerAliveCountMax=3",
 ];
 
-pub async fn create_forward_tunnel(
+/// Build the full ssh(1) argv for a `-L` forward tunnel (pure: unit-tested).
+fn build_tunnel_args(
     ssh_host: &str,
     ssh_port: u16,
     ssh_user: Option<&str>,
     remote_relay_port: u16,
     local_bind_port: u16,
     identity_file: Option<&str>,
-) -> anyhow::Result<tokio::process::Child> {
+) -> Vec<String> {
     let mut args: Vec<String> = vec!["-N".to_string(), "-T".to_string()];
     args.extend(
         SSH_TUNNEL_OPTS
@@ -208,6 +209,25 @@ pub async fn create_forward_tunnel(
         None => ssh_host.to_string(),
     };
     args.push(target);
+    args
+}
+
+pub async fn create_forward_tunnel(
+    ssh_host: &str,
+    ssh_port: u16,
+    ssh_user: Option<&str>,
+    remote_relay_port: u16,
+    local_bind_port: u16,
+    identity_file: Option<&str>,
+) -> anyhow::Result<tokio::process::Child> {
+    let args = build_tunnel_args(
+        ssh_host,
+        ssh_port,
+        ssh_user,
+        remote_relay_port,
+        local_bind_port,
+        identity_file,
+    );
 
     info!(
         "Starting SSH tunnel: {}@{}:{} -> 127.0.0.1:{}",
@@ -229,6 +249,40 @@ pub async fn create_forward_tunnel(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_build_tunnel_args_full_shape() {
+        let args = build_tunnel_args(
+            "example.com",
+            2222,
+            Some("root"),
+            7000,
+            17001,
+            Some("/home/me/.ssh/id_ed25519"),
+        );
+        assert_eq!(&args[0..2], ["-N", "-T"]);
+        // every ssh option is an "-o key=value" pair
+        let opts: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-o")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(opts, SSH_TUNNEL_OPTS.to_vec());
+        let l_idx = args.iter().position(|a| a == "-L").unwrap();
+        assert_eq!(args[l_idx + 1], "127.0.0.1:17001:127.0.0.1:7000");
+        let i_idx = args.iter().position(|a| a == "-i").unwrap();
+        assert_eq!(args[i_idx + 1], "/home/me/.ssh/id_ed25519");
+        let p_idx = args.iter().position(|a| a == "-p").unwrap();
+        assert_eq!(args[p_idx + 1], "2222");
+        assert_eq!(args.last().unwrap(), "root@example.com");
+    }
+
+    #[test]
+    fn test_build_tunnel_args_optional_identity_absent() {
+        let args = build_tunnel_args("host", 22, None, 7000, 12345, None);
+        assert!(!args.iter().any(|a| a == "-i"));
+        assert_eq!(args.last().unwrap(), "host");
+    }
 
     #[tokio::test]
     async fn test_check_tunnel_health_unreachable() {
