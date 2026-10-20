@@ -22,3 +22,16 @@ pub fn config_path_cmd() -> anyhow::Result<()> {
     println!("{}", config_path()?.display());
     Ok(())
 }
+
+/// Print the config file path and, when it exists, its raw contents.
+pub fn config_show() -> anyhow::Result<()> {
+    let cfg_path = config_path()?;
+    println!("Config file: {}", cfg_path.display());
+    match std::fs::read_to_string(&cfg_path) {
+        Ok(content) => print!("{}", content),
+        Err(_) => {
+            println!("(no config file yet — using defaults; run `rx11 config init` to create one)")
+        }
+    }
+    Ok(())
+}

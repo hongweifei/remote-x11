@@ -222,6 +222,8 @@ pub enum ConfigAction {
     Init,
     #[command(about = "Show config file path")]
     Path,
+    #[command(about = "Show config file path and contents")]
+    Show,
 }
 
 /// Arguments of the `ssh` subcommand, grouped to keep the handler

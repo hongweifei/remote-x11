@@ -8,7 +8,7 @@ mod server;
 mod ssh;
 
 pub use client::client;
-pub use config_cmd::{config_init, config_path_cmd};
+pub use config_cmd::{config_init, config_path_cmd, config_show};
 pub use run::run;
 pub use server::server;
 pub use ssh::ssh;

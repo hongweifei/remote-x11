@@ -46,6 +46,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Config { action } => match action {
             ConfigAction::Init => commands::config_init().await,
             ConfigAction::Path => commands::config_path_cmd(),
+            ConfigAction::Show => commands::config_show(),
         },
     }
 }

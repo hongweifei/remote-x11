@@ -76,10 +76,31 @@ pub async fn ssh(args: SshArgs) -> anyhow::Result<()> {
 
     let connector = LocalConnector::new(local_addr, token, x11, display, auto_display);
 
-    tokio::select! {
-        r = connector.connect_and_serve() => r,
-        status = ssh_tunnel.wait() => {
+    /// Which branch ended the session.
+    enum SessionEnd {
+        Connector(anyhow::Result<()>),
+        TunnelExit(anyhow::Result<std::process::ExitStatus>),
+        Unhealthy,
+    }
+
+    let dead = ssh_tunnel.dead_notify();
+    let outcome = tokio::select! {
+        r = connector.connect_and_serve() => SessionEnd::Connector(r),
+        status = ssh_tunnel.wait() => SessionEnd::TunnelExit(status),
+        _ = dead.notified() => SessionEnd::Unhealthy,
+    };
+
+    // Idempotent cleanup for every exit path (the health task's abort and
+    // child kill live inside SshTunnel::kill).
+    let _ = ssh_tunnel.kill().await;
+
+    match outcome {
+        SessionEnd::Connector(r) => r,
+        SessionEnd::TunnelExit(status) => {
             anyhow::bail!("SSH tunnel exited with status: {:?}", status?)
+        }
+        SessionEnd::Unhealthy => {
+            anyhow::bail!("SSH tunnel health check failed; aborting session")
         }
     }
 }
