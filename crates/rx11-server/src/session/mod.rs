@@ -182,12 +182,7 @@ impl SessionManager {
                 sessions.insert(session.display.get(), updated.clone());
                 drop(sessions);
 
-                if let Some(flag) = self
-                    .grace_tasks
-                    .lock()
-                    .await
-                    .remove(&session.display.get())
-                {
+                if let Some(flag) = self.grace_tasks.lock().await.remove(&session.display.get()) {
                     flag.store(true, Ordering::Relaxed);
                 }
 
@@ -460,11 +455,20 @@ mod tests {
         let (mgr, session) = seeded_manager(10, "client-1").await;
 
         assert_eq!(session.display.get(), 10);
-        assert!(mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1").await);
-        assert!(!mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-2").await);
+        assert!(
+            mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1")
+                .await
+        );
+        assert!(
+            !mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-2")
+                .await
+        );
 
         mgr.destroy_session(session.display).await;
-        assert!(!mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1").await);
+        assert!(
+            !mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1")
+                .await
+        );
     }
 
     #[tokio::test]
@@ -473,7 +477,11 @@ mod tests {
         mgr.set_x11_listener(Arc::new(MockBinder)).await;
 
         let session = mgr
-            .create_session_auto("MIT-MAGIC-COOKIE-1".into(), vec![1, 2, 3], "client-1".into())
+            .create_session_auto(
+                "MIT-MAGIC-COOKIE-1".into(),
+                vec![1, 2, 3],
+                "client-1".into(),
+            )
             .await
             .unwrap();
 
@@ -526,7 +534,9 @@ mod tests {
         let conn_id = ConnectionId::new(42);
         let disp = DisplayNumber::new(1).unwrap();
 
-        mgr.register_x11_connection(conn_id, disp, tx).await.unwrap();
+        mgr.register_x11_connection(conn_id, disp, tx)
+            .await
+            .unwrap();
 
         {
             let conns = mgr.connections.lock().await;

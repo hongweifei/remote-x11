@@ -45,7 +45,11 @@ pub(super) async fn xauth_remove(disp: u16) {
 }
 
 #[cfg(test)]
-pub(super) async fn xauth_add(_disp: u16, _auth_data: &[u8], _auth_name: &str) -> anyhow::Result<()> {
+pub(super) async fn xauth_add(
+    _disp: u16,
+    _auth_data: &[u8],
+    _auth_name: &str,
+) -> anyhow::Result<()> {
     Ok(())
 }
 

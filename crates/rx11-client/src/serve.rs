@@ -1,7 +1,6 @@
 //! The client-side relay receive loop: dispatches frames arriving from the
 //! relay server to the local X server proxy and housekeeping handlers.
 
-
 use tracing::{debug, error, info, warn};
 
 use rx11_core::compress::decompress_frame_data;
@@ -98,7 +97,8 @@ async fn on_compressed_data(ctx: &mut ServeCtx<'_>, msg: CompressedX11DataMessag
         );
         return;
     };
-    ctx.proxy.stats
+    ctx.proxy
+        .stats
         .add_compression_saved(original_len.saturating_sub(compressed_len) as u64);
     deliver(ctx, msg.connection_id, msg.sequence_id, decompressed).await;
 }
@@ -119,7 +119,10 @@ async fn on_incremental_data(ctx: &mut ServeCtx<'_>, msg: IncrementalX11DataMess
     deliver_without_cache(ctx, conn_id, decompressed).await;
 }
 
-async fn on_compressed_incremental(ctx: &mut ServeCtx<'_>, msg: CompressedIncrementalX11DataMessage) {
+async fn on_compressed_incremental(
+    ctx: &mut ServeCtx<'_>,
+    msg: CompressedIncrementalX11DataMessage,
+) {
     let Some(algo) = ctx.proxy.compression else {
         return;
     };
@@ -135,7 +138,8 @@ async fn on_compressed_incremental(ctx: &mut ServeCtx<'_>, msg: CompressedIncrem
         );
         return;
     };
-    ctx.proxy.stats
+    ctx.proxy
+        .stats
         .add_incremental_compression_saved(original_len.saturating_sub(compressed_len) as u64);
 
     // …then decode and apply the diff itself.
@@ -151,17 +155,41 @@ async fn on_compressed_incremental(ctx: &mut ServeCtx<'_>, msg: CompressedIncrem
 
 /// Statistics for the received bytes, cache refresh and delivery to the
 /// local socket — the common tail of the full-payload paths.
-async fn deliver(ctx: &mut ServeCtx<'_>, conn_id: rx11_core::types::ConnectionId, seq_id: u32, decompressed: Vec<u8>) {
-    ctx.proxy.stats.add_bytes_received(decompressed.len() as u64);
-    ctx.incremental_cache.update_cache(conn_id, seq_id, &decompressed);
-    send_data_to_local(ctx.proxy.x11_connections, conn_id, bytes::Bytes::from(decompressed)).await;
+async fn deliver(
+    ctx: &mut ServeCtx<'_>,
+    conn_id: rx11_core::types::ConnectionId,
+    seq_id: u32,
+    decompressed: Vec<u8>,
+) {
+    ctx.proxy
+        .stats
+        .add_bytes_received(decompressed.len() as u64);
+    ctx.incremental_cache
+        .update_cache(conn_id, seq_id, &decompressed);
+    send_data_to_local(
+        ctx.proxy.x11_connections,
+        conn_id,
+        bytes::Bytes::from(decompressed),
+    )
+    .await;
 }
 
 /// Same tail without touching the diff cache (already updated by
 /// `apply_incremental`).
-async fn deliver_without_cache(ctx: &mut ServeCtx<'_>, conn_id: rx11_core::types::ConnectionId, decompressed: Vec<u8>) {
-    ctx.proxy.stats.add_bytes_received(decompressed.len() as u64);
-    send_data_to_local(ctx.proxy.x11_connections, conn_id, bytes::Bytes::from(decompressed)).await;
+async fn deliver_without_cache(
+    ctx: &mut ServeCtx<'_>,
+    conn_id: rx11_core::types::ConnectionId,
+    decompressed: Vec<u8>,
+) {
+    ctx.proxy
+        .stats
+        .add_bytes_received(decompressed.len() as u64);
+    send_data_to_local(
+        ctx.proxy.x11_connections,
+        conn_id,
+        bytes::Bytes::from(decompressed),
+    )
+    .await;
 }
 
 async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {

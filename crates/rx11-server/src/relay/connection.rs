@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use rx11_core::compress::{
-    maybe_incremental_or_compress_frame, decompress_frame_data, CompressionAlgo,
+    decompress_frame_data, maybe_incremental_or_compress_frame, CompressionAlgo,
 };
 use rx11_core::config::{BufferDefaults, ServerDefaults};
 use rx11_core::incremental::ConnectionDataCache;
@@ -28,12 +28,19 @@ pub(super) async fn handle_client(
     info!("Client connected from {}", addr);
     let mut transport = Rx11Transport::new(stream)?;
 
-    let handshake =
-        server_handshake(&mut transport, auth_token, ServerDefaults::HANDSHAKE_TIMEOUT).await?;
+    let handshake = server_handshake(
+        &mut transport,
+        auth_token,
+        ServerDefaults::HANDSHAKE_TIMEOUT,
+    )
+    .await?;
     let compression = handshake.compression;
 
     if let Some(ref sid) = handshake.resume_session_id {
-        info!("Client {} requests session resume: {}", handshake.session_id, sid);
+        info!(
+            "Client {} requests session resume: {}",
+            handshake.session_id, sid
+        );
     }
     info!("Client {} authenticated successfully", handshake.session_id);
 
@@ -72,7 +79,10 @@ pub(super) async fn handle_client(
     result
 }
 
-fn spawn_heartbeat(outbound: mpsc::Sender<Frame>, interval: std::time::Duration) -> tokio::task::JoinHandle<()> {
+fn spawn_heartbeat(
+    outbound: mpsc::Sender<Frame>,
+    interval: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut timer = tokio::time::interval(interval);
         timer.tick().await; // first tick completes immediately
@@ -329,7 +339,9 @@ async fn handle_x11_event(
             .await
         }
         Some(X11ConnToRelay::Data {
-            connection_id, data, ..
+            connection_id,
+            data,
+            ..
         }) => {
             let frame = maybe_incremental_or_compress_frame(
                 connection_id,
@@ -344,7 +356,9 @@ async fn handle_x11_event(
             display,
             connection_id,
         }) => {
-            ctx.session_mgr.unregister_x11_connection(connection_id).await;
+            ctx.session_mgr
+                .unregister_x11_connection(connection_id)
+                .await;
             ctx.incremental_cache.clear_connection(connection_id);
             send_outbound(
                 ctx.outbound,
