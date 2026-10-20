@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -11,11 +12,14 @@ use rx11_core::types::{ConnectionId, DisplayNumber};
 
 use crate::session::{SessionManager, X11ConnToRelay, X11DisplayBinder, X11RelayToConn};
 
-static NEXT_CONNECTION_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Delay between polls waiting for the relay task to register a display.
+const RELAY_REGISTER_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
+static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
 fn next_connection_id() -> ConnectionId {
     loop {
-        let raw = NEXT_CONNECTION_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let raw = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let id = (raw & 0xFFFFFFFF) as u32;
         if id != 0 {
             return ConnectionId::new(id);
@@ -116,7 +120,7 @@ async fn handle_x11_connection(
             if let Some(tx) = session_mgr.get_x11_event_sender(disp).await {
                 return Ok::<_, std::convert::Infallible>(tx);
             }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(RELAY_REGISTER_RETRY).await;
         }
     })
     .await
@@ -162,8 +166,8 @@ async fn handle_x11_connection(
                     {
                         break;
                     }
-                    if buf.len() < BufferDefaults::MAX_READ_BUF {
-                        let new_size = (buf.len() * 2).min(BufferDefaults::MAX_READ_BUF);
+                    if buf.len() < BufferDefaults::PROXY_READ_BUF_MAX {
+                        let new_size = (buf.len() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
                         buf.resize(new_size, 0);
                     }
                 }

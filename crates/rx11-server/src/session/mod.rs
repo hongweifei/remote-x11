@@ -1,47 +1,39 @@
+//! Session lifecycle management: display allocation, ownership, grace
+//! periods and the registry connecting relay tasks with X11 listener tasks.
+
+mod events;
+mod xauth;
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::process::Command;
+
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use rx11_core::config::ServerDefaults;
 use rx11_core::types::{ConnectionId, DisplayNumber, SessionId};
 
+use xauth::{xauth_add, xauth_remove};
+
+pub use events::{X11ConnToRelay, X11RelayToConn};
+
+/// Bridges session creation to X11 port binding. Implemented by
+/// [`crate::x11_listener::X11Listener`; abstracted to break the dependency
+/// cycle between the two modules].
 #[async_trait::async_trait]
 pub trait X11DisplayBinder: Send + Sync {
     async fn bind_display(&self, disp: u16) -> anyhow::Result<()>;
     async fn unbind_display(&self, disp: u16);
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub id: SessionId,
     pub display: DisplayNumber,
     pub auth_name: String,
     pub auth_data: Vec<u8>,
     pub client_id: String,
-}
-
-pub enum X11ConnToRelay {
-    Connected {
-        display: DisplayNumber,
-        connection_id: ConnectionId,
-    },
-    Data {
-        display: DisplayNumber,
-        connection_id: ConnectionId,
-        data: bytes::Bytes,
-    },
-    Disconnected {
-        display: DisplayNumber,
-        connection_id: ConnectionId,
-    },
-}
-
-pub enum X11RelayToConn {
-    Data(bytes::Bytes),
-    Close,
 }
 
 struct ConnState {
@@ -89,7 +81,9 @@ impl SessionManager {
         *x11 = Some(listener);
     }
 
-    async fn create_session_inner(
+    /// Bind the X11 port, install the xauth cookie and register the session,
+    /// unwinding each step if a later one fails.
+    async fn create_session_at(
         &self,
         disp: DisplayNumber,
         auth_name: String,
@@ -111,9 +105,8 @@ impl SessionManager {
         drop(listener);
 
         if let Err(e) = xauth_add(disp_val, &auth_data, &auth_name).await {
-            let listeners = self.x11_listener.read().await;
-            if let Some(ref l) = *listeners {
-                l.unbind_display(disp_val).await;
+            if let Some(listener) = self.x11_listener.read().await.as_ref() {
+                listener.unbind_display(disp_val).await;
             }
             return Err(rx11_core::error::Rx11Error::Protocol(format!(
                 "xauth setup failed for display :{}: {}",
@@ -127,7 +120,7 @@ impl SessionManager {
             if let Some(listener) = self.x11_listener.read().await.as_ref() {
                 listener.unbind_display(disp_val).await;
             }
-            self.xauth_remove_quiet(disp_val).await;
+            xauth_remove(disp_val).await;
             return Err(rx11_core::error::Rx11Error::Protocol(format!(
                 "Display :{} already in use",
                 disp_val
@@ -141,13 +134,7 @@ impl SessionManager {
             client_id,
         });
         sessions.insert(disp_val, session.clone());
-        Ok(Session {
-            id: session.id.clone(),
-            display: session.display,
-            auth_name: session.auth_name.clone(),
-            auth_data: session.auth_data.clone(),
-            client_id: session.client_id.clone(),
-        })
+        Ok((*session).clone())
     }
 
     pub async fn create_session(
@@ -157,7 +144,7 @@ impl SessionManager {
         auth_data: Vec<u8>,
         client_id: String,
     ) -> rx11_core::error::Result<Session> {
-        self.create_session_inner(disp, auth_name, auth_data, client_id)
+        self.create_session_at(disp, auth_name, auth_data, client_id)
             .await
     }
 
@@ -175,7 +162,7 @@ impl SessionManager {
                     rx11_core::error::Rx11Error::Protocol("No available display number".into())
                 })?
         };
-        self.create_session_inner(DisplayNumber::new(disp)?, auth_name, auth_data, client_id)
+        self.create_session_at(DisplayNumber::new(disp)?, auth_name, auth_data, client_id)
             .await
     }
 
@@ -189,18 +176,18 @@ impl SessionManager {
         match session {
             Some(session) => {
                 let old_client_id = session.client_id.clone();
-                let updated = Arc::new(Session {
-                    id: session.id.clone(),
-                    display: session.display,
-                    auth_name: session.auth_name.clone(),
-                    auth_data: session.auth_data.clone(),
-                    client_id: new_client_id.clone(),
-                });
+                let mut updated = (*session).clone();
+                updated.client_id = new_client_id.clone();
+                let updated = Arc::new(updated);
                 sessions.insert(session.display.get(), updated.clone());
-
                 drop(sessions);
 
-                if let Some(flag) = self.grace_tasks.lock().await.remove(&session.display.get()) {
+                if let Some(flag) = self
+                    .grace_tasks
+                    .lock()
+                    .await
+                    .remove(&session.display.get())
+                {
                     flag.store(true, Ordering::Relaxed);
                 }
 
@@ -208,13 +195,7 @@ impl SessionManager {
                     "Session {} resumed for display :{} (old client: {}, new client: {})",
                     session_id, session.display, old_client_id, new_client_id
                 );
-                Ok(Session {
-                    id: updated.id.clone(),
-                    display: updated.display,
-                    auth_name: updated.auth_name.clone(),
-                    auth_data: updated.auth_data.clone(),
-                    client_id: updated.client_id.clone(),
-                })
+                Ok((*updated).clone())
             }
             None => Err(rx11_core::error::Rx11Error::Protocol(format!(
                 "Session {} not found or expired",
@@ -232,13 +213,18 @@ impl SessionManager {
     }
 
     pub async fn owns_connection(&self, conn_id: ConnectionId, client_id: &str) -> bool {
-        let conns = self.connections.lock().await;
-        match conns.get(&conn_id.get()) {
-            Some(state) => self.owns_session(state.display, client_id).await,
+        let display = {
+            let conns = self.connections.lock().await;
+            conns.get(&conn_id.get()).map(|state| state.display)
+        };
+        match display {
+            Some(disp) => self.owns_session(disp, client_id).await,
             None => false,
         }
     }
 
+    /// Start the grace period for every session owned by `client_id`. If no
+    /// resume happens before the deadline, the sessions are destroyed.
     pub async fn release_session(&self, client_id: &str) {
         let cancelled = Arc::new(AtomicBool::new(false));
         let to_release: Vec<(u16, SessionId)> = {
@@ -434,56 +420,7 @@ impl SessionManager {
         }
         info!("All sessions destroyed");
     }
-
-    async fn xauth_remove_quiet(&self, disp: u16) {
-        let display_str = format!(":{}", disp);
-        let _ = Command::new("xauth")
-            .args(["remove", &display_str])
-            .output()
-            .await;
-    }
 }
-
-#[cfg(not(test))]
-async fn xauth_add(disp: u16, auth_data: &[u8], auth_name: &str) -> anyhow::Result<()> {
-    let cookie_hex = hex::encode(auth_data);
-    let display_str = format!(":{}", disp);
-    let output = Command::new("xauth")
-        .args(["add", &display_str, auth_name, &cookie_hex])
-        .output()
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to execute xauth: {}", e))?;
-    if !output.status.success() {
-        return Err(anyhow::anyhow!(
-            "xauth add {} failed: {}",
-            display_str,
-            String::from_utf8_lossy(&output.stderr)
-        ));
-    }
-    info!("xauth add {} succeeded", display_str);
-    Ok(())
-}
-
-#[cfg(test)]
-async fn xauth_add(_disp: u16, _auth_data: &[u8], _auth_name: &str) -> anyhow::Result<()> {
-    Ok(())
-}
-
-#[cfg(not(test))]
-async fn xauth_remove(disp: u16) {
-    let display_str = format!(":{}", disp);
-    match Command::new("xauth")
-        .args(["remove", &display_str])
-        .output()
-        .await
-    {
-        Ok(_) => info!("xauth remove {} done", display_str),
-        Err(e) => warn!("Failed to execute xauth remove: {}", e),
-    }
-}
-
-#[cfg(test)]
-async fn xauth_remove(_disp: u16) {}
 
 #[cfg(test)]
 mod tests {
@@ -503,36 +440,31 @@ mod tests {
         SessionManager::new()
     }
 
-    #[tokio::test]
-    async fn test_create_and_destroy_session() {
+    async fn seeded_manager(disp: u16, client: &str) -> (SessionManager, Session) {
         let mgr = test_manager();
         mgr.set_x11_listener(Arc::new(MockBinder)).await;
-
         let session = mgr
             .create_session(
-                DisplayNumber::new(10).unwrap(),
+                DisplayNumber::new(disp).unwrap(),
                 "MIT-MAGIC-COOKIE-1".into(),
                 vec![1, 2, 3, 4],
-                "client-1".into(),
+                client.into(),
             )
             .await
             .unwrap();
+        (mgr, session)
+    }
+
+    #[tokio::test]
+    async fn test_create_and_destroy_session() {
+        let (mgr, session) = seeded_manager(10, "client-1").await;
 
         assert_eq!(session.display.get(), 10);
-        assert!(
-            mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1")
-                .await
-        );
-        assert!(
-            !mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-2")
-                .await
-        );
+        assert!(mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1").await);
+        assert!(!mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-2").await);
 
         mgr.destroy_session(session.display).await;
-        assert!(
-            !mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1")
-                .await
-        );
+        assert!(!mgr.owns_session(DisplayNumber::new(10).unwrap(), "client-1").await);
     }
 
     #[tokio::test]
@@ -541,11 +473,7 @@ mod tests {
         mgr.set_x11_listener(Arc::new(MockBinder)).await;
 
         let session = mgr
-            .create_session_auto(
-                "MIT-MAGIC-COOKIE-1".into(),
-                vec![1, 2, 3],
-                "client-1".into(),
-            )
+            .create_session_auto("MIT-MAGIC-COOKIE-1".into(), vec![1, 2, 3], "client-1".into())
             .await
             .unwrap();
 
@@ -554,17 +482,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_duplicate_display_rejected() {
-        let mgr = test_manager();
-        mgr.set_x11_listener(Arc::new(MockBinder)).await;
-
-        mgr.create_session(
-            DisplayNumber::new(5).unwrap(),
-            "auth".into(),
-            vec![1],
-            "client-1".into(),
-        )
-        .await
-        .unwrap();
+        let (mgr, _) = seeded_manager(5, "client-1").await;
 
         let result = mgr
             .create_session(
@@ -580,18 +498,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_resume_session() {
-        let mgr = test_manager();
-        mgr.set_x11_listener(Arc::new(MockBinder)).await;
-
-        let session = mgr
-            .create_session(
-                DisplayNumber::new(20).unwrap(),
-                "auth".into(),
-                vec![1],
-                "client-1".into(),
-            )
-            .await
-            .unwrap();
+        let (mgr, session) = seeded_manager(20, "client-1").await;
 
         let resumed = mgr
             .try_resume_session(&session.id, "client-2".into())
@@ -619,23 +526,19 @@ mod tests {
         let conn_id = ConnectionId::new(42);
         let disp = DisplayNumber::new(1).unwrap();
 
-        mgr.register_x11_connection(conn_id, disp, tx)
-            .await
-            .unwrap();
+        mgr.register_x11_connection(conn_id, disp, tx).await.unwrap();
 
-        let conn_state = {
+        {
             let conns = mgr.connections.lock().await;
-            conns.get(&conn_id.get()).is_some()
-        };
-        assert!(conn_state);
+            assert!(conns.contains_key(&conn_id.get()));
+        }
 
         mgr.unregister_x11_connection(conn_id).await;
 
-        let conn_state = {
+        {
             let conns = mgr.connections.lock().await;
-            conns.get(&conn_id.get()).is_some()
-        };
-        assert!(!conn_state);
+            assert!(!conns.contains_key(&conn_id.get()));
+        }
     }
 
     #[tokio::test]
