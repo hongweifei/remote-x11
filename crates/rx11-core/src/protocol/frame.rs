@@ -128,6 +128,7 @@ define_frame_types! {
         X11Disconnect(X11DisconnectMessage),
         FlowControl(FlowControlMessage),
         Error(ErrorMessage),
+        IncrementalRequestFull(IncrementalRequestFullMessage),
     }
     binary {
         DataX11(X11DataMessage),
@@ -336,6 +337,18 @@ mod tests {
                 assert_eq!(m.connection_id.get(), 100);
             }
             other => panic!("Expected X11Connect frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_encode_decode_incremental_request_full() {
+        let frame = Frame::IncrementalRequestFull(IncrementalRequestFullMessage {
+            connection_id: ConnectionId::new(2001),
+        });
+        assert_eq!(frame.msg_type(), MessageType::IncrementalRequestFull);
+        match roundtrip(&frame) {
+            Frame::IncrementalRequestFull(m) => assert_eq!(m.connection_id.get(), 2001),
+            other => panic!("Expected IncrementalRequestFull frame, got {other:?}"),
         }
     }
 

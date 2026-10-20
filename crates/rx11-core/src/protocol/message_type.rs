@@ -21,6 +21,7 @@ pub enum MessageType {
     CompressedDataX11 = 0x21,
     IncrementalDataX11 = 0x24,
     CompressedIncrementalDataX11 = 0x25,
+    IncrementalRequestFull = 0x26,
     X11Connect = 0x22,
     X11Disconnect = 0x23,
     Heartbeat = 0x30,
@@ -33,7 +34,7 @@ impl MessageType {
     /// Every defined tag. Kept in sync with the enum via the exhaustive
     /// `test_message_type_roundtrip_u8` test below.
     #[cfg(test)]
-    pub(crate) const ALL: [MessageType; 19] = [
+    pub(crate) const ALL: [MessageType; 20] = [
         MessageType::Hello,
         MessageType::HelloAck,
         MessageType::AuthRequest,
@@ -47,6 +48,7 @@ impl MessageType {
         MessageType::CompressedDataX11,
         MessageType::IncrementalDataX11,
         MessageType::CompressedIncrementalDataX11,
+        MessageType::IncrementalRequestFull,
         MessageType::X11Connect,
         MessageType::X11Disconnect,
         MessageType::Heartbeat,
@@ -74,6 +76,7 @@ impl TryFrom<u8> for MessageType {
             0x21 => Ok(MessageType::CompressedDataX11),
             0x24 => Ok(MessageType::IncrementalDataX11),
             0x25 => Ok(MessageType::CompressedIncrementalDataX11),
+            0x26 => Ok(MessageType::IncrementalRequestFull),
             0x22 => Ok(MessageType::X11Connect),
             0x23 => Ok(MessageType::X11Disconnect),
             0x30 => Ok(MessageType::Heartbeat),

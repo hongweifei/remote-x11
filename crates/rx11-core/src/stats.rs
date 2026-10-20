@@ -118,6 +118,14 @@ impl ConnectionStats {
         }
     }
 
+    /// True when no X11 connection is live and nothing moved during the
+    /// current reporting period; lets periodic loggers skip idle noise.
+    pub fn is_idle(&self) -> bool {
+        self.x11_connections_active.load(Ordering::Relaxed) == 0
+            && self.bytes_sent.load_period() == 0
+            && self.bytes_received.load_period() == 0
+    }
+
     pub fn reset_period(&self) {
         self.bytes_sent.reset_period();
         self.bytes_received.reset_period();
@@ -385,6 +393,22 @@ mod tests {
         let stats = ConnectionStats::new();
         stats.dec_x11_connections();
         assert_eq!(stats.x11_connections_active.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn test_is_idle() {
+        let stats = ConnectionStats::new();
+        assert!(stats.is_idle());
+
+        stats.add_bytes_sent(10);
+        assert!(!stats.is_idle());
+
+        // idle again once the period counter is reset and no conn is live
+        stats.reset_period();
+        assert!(stats.is_idle());
+
+        stats.inc_x11_connections();
+        assert!(!stats.is_idle());
     }
 
     #[test]

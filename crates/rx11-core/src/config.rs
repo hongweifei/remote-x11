@@ -18,6 +18,8 @@ impl ServerDefaults {
     pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
     pub const SESSION_GRACE_PERIOD: Duration = Duration::from_secs(60);
     pub const MAX_X11_CONNECTIONS_PER_DISPLAY: usize = 64;
+    /// Interval between periodic relay status summary log lines.
+    pub const STATUS_INTERVAL: Duration = Duration::from_secs(30);
 }
 
 impl ClientDefaults {

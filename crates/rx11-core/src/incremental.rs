@@ -42,6 +42,16 @@ impl ConnectionDataCache {
             .map(|cached| (cached.sequence_id, cached.data.as_slice()))
     }
 
+    /// Sequence number the next outgoing frame for this connection should
+    /// carry: strictly greater than the cached base so the receiver can
+    /// detect stale diffs. Returns 1 when nothing is cached yet.
+    pub fn next_sequence_for(&self, connection_id: ConnectionId) -> u32 {
+        self.last_data
+            .get(&connection_id)
+            .map(|cached| cached.sequence_id.wrapping_add(1).max(1))
+            .unwrap_or(1)
+    }
+
     pub fn compute_incremental(
         &self,
         connection_id: ConnectionId,
@@ -169,6 +179,19 @@ mod tests {
 
         assert_eq!(seq, 1);
         assert_eq!(cached, &data[..]);
+    }
+
+    #[test]
+    fn test_next_sequence_for() {
+        let mut cache = ConnectionDataCache::new();
+        let conn_id = ConnectionId::new(7);
+        assert_eq!(cache.next_sequence_for(conn_id), 1);
+
+        cache.update_cache(conn_id, 41, &[0u8; 2048]);
+        assert_eq!(cache.next_sequence_for(conn_id), 42);
+
+        cache.clear_connection(conn_id);
+        assert_eq!(cache.next_sequence_for(conn_id), 1);
     }
 
     #[test]

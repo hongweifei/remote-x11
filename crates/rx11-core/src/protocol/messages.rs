@@ -126,6 +126,13 @@ pub struct CompressedIncrementalX11DataMessage {
     pub data: Bytes,
 }
 
+/// Sent by the receiver when an incremental diff could not be applied
+/// against its cache, asking the sender to fall back to full frames.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IncrementalRequestFullMessage {
+    pub connection_id: ConnectionId,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct X11ConnectMessage {
     pub display: DisplayNumber,

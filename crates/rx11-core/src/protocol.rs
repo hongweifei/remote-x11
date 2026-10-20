@@ -19,7 +19,7 @@ pub use handshake::{client_handshake, server_handshake, HandshakeResult};
 pub use message_type::MessageType;
 pub use messages::*;
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAGIC_BYTES: [u8; 4] = *b"RX11";
 pub const DEFAULT_RELAY_PORT: u16 = 7000;
 pub const DEFAULT_X11_PORT: u16 = 6000;
