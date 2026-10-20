@@ -30,7 +30,7 @@
 
 - **多连接多路复用** — 单个中继会话上承载多个 X11 应用连接，通过 `connection_id` 区分
 - **自动重连 + 会话恢复** — 网络中断后客户端自动指数退避重连（最多 10 次），服务端保留会话 60 秒宽限期，重连后已建立的 X11 应用连接不受影响
-- **双向心跳检测** — 客户端和服务端互相发送心跳，90 秒无响应自动断开，避免半开连接
+- **心跳保活** — 服务端每 30 秒发送心跳，客户端即时应答；服务端 90 秒无响应断开，客户端 100 秒无数据超时重连，避免半开连接
 - **X Server 自动检测** — 连接前自动探测本地 X Server 是否可用，并给出平台特定提示
 - **xauth 集成** — 服务端自动管理 `xauth` 条目（MIT-MAGIC-COOKIE-1），增强安全性
 - **优雅关闭** — Ctrl+C 时发送 `SessionDestroy` 帧清理远程会话；`rx11 run` 自动将信号转发给子进程
@@ -38,7 +38,9 @@
 - **配置文件** — 支持 TOML 配置文件，CLI 参数 > 环境变量 > 配置文件 > 默认值
 - **多 Display** — 通过 `-d` 参数同时运行多个独立的 GUI 会话
 - **Display 自动分配** — 默认由服务端自动分配可用的 Display 编号，需要时可手动指定
-- **数据压缩** — 支持 zstd/lz4/zlib 三种算法，自动协商，超过 64 字节的数据自动压缩，压缩后更大则回退
+- **数据压缩** — 支持 zstd/lz4/zlib 三种算法，自动协商，超过 256 字节的数据自动压缩，压缩后更大则回退
+- **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
+- **双向统计** — 客户端与服务端各自每 30 秒输出收发字节、压缩/增量节省量与活跃连接数
 - **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
 - **SSH 端口冲突检测** — 启动 SSH 隧道前自动检测本地端口是否被占用
 
@@ -201,6 +203,7 @@ rx11 gen-token
 ```bash
 rx11 config init   # 生成默认配置文件 ~/.config/rx11/config.toml
 rx11 config path   # 显示配置文件路径
+rx11 config show   # 显示配置文件路径与当前内容
 ```
 
 ---
@@ -336,29 +339,37 @@ rx11 使用自定义二进制帧协议，每帧结构：
 | CompressedDataX11 | 0x21 | 压缩的 X11 数据帧 |
 | X11Connect | 0x22 | X11 应用连接通知 |
 | X11Disconnect | 0x23 | X11 应用断开通知 |
-| Heartbeat | 0x30 | 心跳（双向） |
+| IncrementalDataX11 | 0x24 | X11 增量差分帧（二进制） |
+| CompressedIncrementalDataX11 | 0x25 | 压缩后的增量差分帧 |
+| IncrementalRequestFull | 0x26 | 请求对端停止差分、回退全帧（自愈） |
+| Heartbeat | 0x30 | 心跳（服务端发起） |
 | HeartbeatAck | 0x31 | 心跳响应 |
+| FlowControl | 0x40 | 流控（预留，当前仅记录日志） |
 | Error | 0xFF | 错误 |
 
-控制帧的 Payload 使用 JSON 编码。X11 数据帧使用二进制编码：
+当前协议版本号为 **4**（`Hello.version`），版本不匹配时握手直接失败。
+
+控制帧的 Payload 使用 JSON 编码。X11 数据帧使用二进制编码，`DataX11` 帧格式：
 
 ```
-┌───────────────┬─────────────────┐
-│ Connection ID │ X11 Data        │
-│ 4 bytes       │ remaining bytes │
-│ (BE u32)      │                 │
-└───────────────┴─────────────────┘
+┌───────────────┬─────────────┬─────────────────┐
+│ Connection ID │ Sequence ID │ X11 Data        │
+│ 4 bytes       │ 4 bytes     │ remaining bytes │
+│ (BE u32)      │ (BE u32)    │                 │
+└───────────────┴─────────────┴─────────────────┘
 ```
 
-CompressedDataX11 帧格式：
+`CompressedDataX11` 帧格式（多一个原始长度字段，用于解压校验）：
 
 ```
-┌───────────────┬──────────────┬─────────────────┐
-│ Connection ID │ Original Len │ Compressed Data │
-│ 4 bytes       │ 4 bytes      │ remaining bytes │
-│ (BE u32)      │ (BE u32)     │                 │
-└───────────────┴──────────────┴─────────────────┘
+┌───────────────┬─────────────┬──────────────┬─────────────────┐
+│ Connection ID │ Sequence ID │ Original Len │ Compressed Data │
+│ 4 bytes       │ 4 bytes     │ 4 bytes      │ remaining bytes │
+│ (BE u32)      │ (BE u32)    │ (BE u32)     │                 │
+└───────────────┴─────────────┴──────────────┴─────────────────┘
 ```
+
+`IncrementalDataX11` 帧头为 `[conn][seq][base_seq][total_len][chunk_count: u16]`，随后每块 `[offset][length][chunk]`；接收端依据 `base_seq` 与自身缓存对齐，失步时发送 `IncrementalRequestFull` 请求全帧。
 
 `X11Connect` / `X11Disconnect` 帧携带 `{display, connection_id}`，用于通知对端 X11 应用的连接与断开。多连接通过 `connection_id` 实现多路复用。
 
@@ -374,7 +385,8 @@ Client                          Server
   │◄── SessionAck ──────────────│  (含 session_id)
   │◄──► X11Connect/Disconnect ──│  (X11 应用连接/断开通知)
   │◄──► DataX11 (双向) ────────►│  (X11 数据转发，含 connection_id)
-  │◄──► Heartbeat / HeartbeatAck│  (双向保活)
+  │─── IncrementalRequestFull ─►│  (增量失步时请求回退全帧)
+  │◄──► Heartbeat / HeartbeatAck│  (服务端保活)
   │─── SessionDestroy ──────────►│  (可选，显式销毁)
 ```
 

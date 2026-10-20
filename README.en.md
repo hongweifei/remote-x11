@@ -30,15 +30,16 @@ Supports **TCP direct** and **SSH tunnel** modes.
 
 - **Multi-connection multiplexing** — Multiple X11 application connections over a single relay session, distinguished by `connection_id`
 - **Auto-reconnect + session resume** — Exponential backoff reconnection (up to 10 retries) on network interruption; server preserves sessions for 60s grace period, existing X11 connections survive reconnection
-- **Bidirectional heartbeat** — Client and server exchange heartbeats; auto-disconnect after 90s of no response to avoid half-open connections
+- **Heartbeat keepalive** — Server sends heartbeats every 30s and the client replies immediately; the server drops a silent client after 90s, the client times out and reconnects after 100s without data — no half-open connections
 - **X Server auto-detection** — Probes local X Server availability before connecting, with platform-specific hints
 - **xauth integration** — Server automatically manages `xauth` entries (MIT-MAGIC-COOKIE-1) for enhanced security
 - **Graceful shutdown** — Sends `SessionDestroy` frame on Ctrl+C to clean up remote sessions; `rx11 run` forwards signals to child processes
-- **Connection statistics** — Reports bytes sent/received, frame counts, active connections every 30 seconds
+- **Data compression** — zstd/lz4/zlib with auto-negotiation; payloads over 256 bytes are compressed, falling back to raw when compression does not help
+- **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
+- **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
 - **Multiple displays** — Run multiple independent GUI sessions simultaneously with the `-d` flag
 - **Auto display assignment** — Server automatically assigns available display numbers by default; manual override available
-- **Data compression** — zstd/lz4/zlib algorithms with auto-negotiation; data over 64 bytes is auto-compressed with fallback if compression increases size
 - **Security hardening** — Session/connection ownership validation, auth data length limits, decompression size verification, frame sync recovery, read_buf limits for DoS prevention
 - **SSH port conflict detection** — Checks for local port conflicts before establishing SSH tunnels
 
@@ -201,6 +202,7 @@ Outputs a random SHA-256 token for client-server authentication.
 ```bash
 rx11 config init   # Generate default config file ~/.config/rx11/config.toml
 rx11 config path   # Show config file path
+rx11 config show   # Show config file path and current contents
 ```
 
 ---
@@ -336,29 +338,37 @@ Frame types:
 | CompressedDataX11 | 0x21 | Compressed X11 data frame |
 | X11Connect | 0x22 | X11 application connection notification |
 | X11Disconnect | 0x23 | X11 application disconnection notification |
-| Heartbeat | 0x30 | Heartbeat (bidirectional) |
+| IncrementalDataX11 | 0x24 | X11 incremental diff frame (binary) |
+| CompressedIncrementalDataX11 | 0x25 | Compressed incremental diff frame |
+| IncrementalRequestFull | 0x26 | Ask peer to stop diffing and resend full frames (self-heal) |
+| Heartbeat | 0x30 | Heartbeat (server-initiated) |
 | HeartbeatAck | 0x31 | Heartbeat response |
+| FlowControl | 0x40 | Flow control (reserved; currently logged only) |
 | Error | 0xFF | Error |
 
-Control frame payloads use JSON encoding. X11 data frames use binary encoding:
+The current protocol version is **4** (`Hello.version`); a version mismatch fails the handshake immediately.
+
+Control frame payloads use JSON encoding. Binary `DataX11` frames look like:
 
 ```
-┌───────────────┬─────────────────┐
-│ Connection ID │ X11 Data        │
-│ 4 bytes       │ remaining bytes │
-│ (BE u32)      │                 │
-└───────────────┴─────────────────┘
+┌───────────────┬─────────────┬─────────────────┐
+│ Connection ID │ Sequence ID │ X11 Data        │
+│ 4 bytes       │ 4 bytes     │ remaining bytes │
+│ (BE u32)      │ (BE u32)    │                 │
+└───────────────┴─────────────┴─────────────────┘
 ```
 
-CompressedDataX11 frame format:
+`CompressedDataX11` frames add an original-length field used to validate decompression:
 
 ```
-┌───────────────┬──────────────┬─────────────────┐
-│ Connection ID │ Original Len │ Compressed Data │
-│ 4 bytes       │ 4 bytes      │ remaining bytes │
-│ (BE u32)      │ (BE u32)     │                 │
-└───────────────┴──────────────┴─────────────────┘
+┌───────────────┬─────────────┬──────────────┬─────────────────┐
+│ Connection ID │ Sequence ID │ Original Len │ Compressed Data │
+│ 4 bytes       │ 4 bytes     │ 4 bytes      │ remaining bytes │
+│ (BE u32)      │ (BE u32)    │ (BE u32)     │                 │
+└───────────────┴─────────────┴──────────────┴─────────────────┘
 ```
+
+`IncrementalDataX11` frames start with `[conn][seq][base_seq][total_len][chunk_count: u16]` followed by `[offset][length][chunk]` per chunk; the receiver matches `base_seq` against its cache and sends `IncrementalRequestFull` to resynchronize when it falls out of step.
 
 `X11Connect` / `X11Disconnect` frames carry `{display, connection_id}` to notify the peer of X11 application connect/disconnect events. Multiple connections are multiplexed via `connection_id`.
 
@@ -374,7 +384,8 @@ Client                          Server
   │◄── SessionAck ──────────────│  (includes session_id)
   │◄──► X11Connect/Disconnect ──│  (X11 app connect/disconnect notifications)
   │◄──► DataX11 (bidirectional)►│  (X11 data relay, includes connection_id)
-  │◄──► Heartbeat / HeartbeatAck│  (bidirectional keepalive)
+  │─── IncrementalRequestFull ─►│  (self-heal: request full frames)
+  │◄──► Heartbeat / HeartbeatAck│  (server-driven keepalive)
   │─── SessionDestroy ──────────►│  (optional, explicit destroy)
 ```
 
