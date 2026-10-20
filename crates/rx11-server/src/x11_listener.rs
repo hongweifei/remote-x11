@@ -208,3 +208,18 @@ async fn handle_x11_connection(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_next_connection_id_is_nonzero_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..1000 {
+            let id = next_connection_id();
+            assert_ne!(id.get(), 0, "connection id 0 is reserved");
+            assert!(seen.insert(id.get()), "duplicate connection id {}", id);
+        }
+    }
+}

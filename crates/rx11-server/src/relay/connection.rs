@@ -428,3 +428,89 @@ async fn handle_x11_event(
         None => RelayAction::Disconnect,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bytes::Bytes;
+    use rx11_core::protocol::{CompressedIncrementalX11DataMessage, IncrementalChunk};
+    use rx11_core::types::ConnectionId;
+
+    fn conn() -> ConnectionId {
+        ConnectionId::new(1)
+    }
+
+    #[test]
+    fn test_record_outbound_plain_counts_bytes_only() {
+        let stats = ConnectionStats::new();
+        let frame = Frame::DataX11(X11DataMessage {
+            connection_id: conn(),
+            sequence_id: 1,
+            data: Bytes::from(vec![7u8; 600]),
+        });
+        record_outbound_frame(&stats, &frame, 600);
+        let summary = stats.summary();
+        assert!(summary.contains("Sent: 600 B"), "{summary}");
+        assert!(!summary.contains("Compressed (full)"), "{summary}");
+        assert!(!summary.contains("Incremental"), "{summary}");
+    }
+
+    #[test]
+    fn test_record_outbound_compressed_counts_savings() {
+        let stats = ConnectionStats::new();
+        let frame = Frame::CompressedDataX11(CompressedX11DataMessage {
+            connection_id: conn(),
+            sequence_id: 2,
+            original_len: 1000,
+            data: Bytes::from(vec![0u8; 300]),
+        });
+        record_outbound_frame(&stats, &frame, 1000);
+        let summary = stats.summary();
+        assert!(summary.contains("Sent: 300 B"), "{summary}");
+        assert!(
+            summary.contains("Compressed (full): 1 frames, saved 700 B"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn test_record_outbound_incremental_counts_diff_savings() {
+        let stats = ConnectionStats::new();
+        let frame = Frame::IncrementalDataX11(IncrementalX11DataMessage {
+            connection_id: conn(),
+            sequence_id: 3,
+            base_sequence_id: 2,
+            total_len: 4096,
+            chunks: vec![IncrementalChunk {
+                offset: 1024,
+                length: 256,
+                data: Bytes::from(vec![1u8; 256]),
+            }],
+        });
+        record_outbound_frame(&stats, &frame, 4096);
+        let summary = stats.summary();
+        assert!(summary.contains("Sent: 256 B"), "{summary}");
+        assert!(
+            summary.contains("Incremental: 1 frames, saved 3.8 KB"),
+            "{summary}"
+        );
+    }
+
+    #[test]
+    fn test_record_outbound_compressed_incremental_uses_encoded_len() {
+        let stats = ConnectionStats::new();
+        // original_len carries the encoded-diff length, not the app payload.
+        let frame = Frame::CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage {
+            connection_id: conn(),
+            sequence_id: 4,
+            original_len: 512,
+            data: Bytes::from(vec![0u8; 120]),
+        });
+        record_outbound_frame(&stats, &frame, 4096);
+        let summary = stats.summary();
+        assert!(
+            summary.contains("Compressed (incremental): 1 frames, saved 392 B"),
+            "{summary}"
+        );
+    }
+}

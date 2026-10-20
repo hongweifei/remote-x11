@@ -591,6 +591,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_release_then_resume_cancels_grace() {
+        let (mgr, session) = seeded_manager(15, "client-1").await;
+
+        mgr.release_session("client-1").await;
+        // Session survives the grace period and a cancel flag is armed.
+        assert!(
+            mgr.owns_session(DisplayNumber::new(15).unwrap(), "client-1")
+                .await
+        );
+        assert!(mgr.grace_tasks.lock().await.contains_key(&15));
+
+        let resumed = mgr
+            .try_resume_session(&session.id, "client-2".into())
+            .await
+            .unwrap();
+        assert_eq!(resumed.client_id, "client-2");
+        // Resuming must cancel and remove the pending grace task.
+        assert!(!mgr.grace_tasks.lock().await.contains_key(&15));
+    }
+
+    #[tokio::test]
     async fn test_destroy_all_sessions() {
         let mgr = test_manager();
         mgr.set_x11_listener(Arc::new(MockBinder)).await;
