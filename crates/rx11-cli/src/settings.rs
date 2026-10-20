@@ -62,11 +62,22 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # identity = "~/.ssh/id_rsa"
 "#;
 
-fn config_home() -> Option<PathBuf> {
-    std::env::var("HOME")
+/// Test helper: serialize every test that touches HOME/USERPROFILE, since
+/// env is process-global and cargo runs tests in parallel threads.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+fn non_empty_var(key: &str) -> Option<PathBuf> {
+    // An empty-but-set HOME (e.g. `HOME= cmd`) must not degrade config paths
+    // to relative paths; treat it as unset.
+    std::env::var(key)
         .ok()
+        .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| std::env::var("USERPROFILE").ok().map(PathBuf::from))
+}
+
+fn config_home() -> Option<PathBuf> {
+    non_empty_var("HOME").or_else(|| non_empty_var("USERPROFILE"))
 }
 
 /// `~/.config/rx11/config.toml`
@@ -106,4 +117,62 @@ pub fn load_config() -> Config {
         }
     }
     Config::default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_template_parses_with_all_sections() {
+        let cfg: Config = toml::from_str(CONFIG_TEMPLATE).expect("template must be valid TOML");
+        assert!(cfg.client.is_some());
+        assert!(cfg.server.is_some());
+        assert!(cfg.ssh.is_some());
+    }
+
+    #[tokio::test]
+    async fn config_path_and_load_follow_env_precedence() {
+        let _g = ENV_LOCK.lock().await;
+        let saved_home = std::env::var("HOME").ok();
+        let saved_profile = std::env::var("USERPROFILE").ok();
+
+        let dir = std::env::temp_dir().join(format!("rx11-cfg-{}", std::process::id()));
+        let cfg_dir = dir.join(".config").join("rx11");
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        let cfg_file = cfg_dir.join("config.toml");
+
+        std::env::set_var("HOME", &dir);
+        assert!(config_path().unwrap().starts_with(&dir));
+
+        std::fs::write(
+            &cfg_file,
+            "[client]\nrelay = \"srv:7000\"\ntoken = \"tk\"\n",
+        )
+        .unwrap();
+        let cfg = load_config();
+        assert_eq!(cfg.client.unwrap().relay.as_deref(), Some("srv:7000"));
+
+        // broken TOML degrades to defaults instead of failing startup
+        std::fs::write(&cfg_file, "this is ]=[ not toml").unwrap();
+        let cfg = load_config();
+        assert!(cfg.client.is_none());
+
+        // empty HOME is ignored; falls back to USERPROFILE
+        std::env::set_var("HOME", "");
+        std::env::set_var("USERPROFILE", &dir);
+        std::fs::write(&cfg_file, "[server]\nlisten = \"0.0.0.0:9\"\n").unwrap();
+        let cfg = load_config();
+        assert_eq!(cfg.server.unwrap().listen.as_deref(), Some("0.0.0.0:9"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+        match saved_profile {
+            Some(v) => std::env::set_var("USERPROFILE", v),
+            None => std::env::remove_var("USERPROFILE"),
+        }
+    }
 }

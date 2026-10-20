@@ -35,3 +35,31 @@ pub fn config_show() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn config_init_creates_template_then_refuses_overwrite() {
+        let _g = crate::settings::ENV_LOCK.lock().await;
+        let saved_home = std::env::var("HOME").ok();
+
+        let dir = std::env::temp_dir().join(format!("rx11-init-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::env::set_var("HOME", &dir);
+
+        config_init().await.expect("first init must succeed");
+        let created = std::fs::read_to_string(config_path().unwrap()).unwrap();
+        assert!(created.contains("[client]"), "template missing [client]");
+
+        let err = config_init().await.unwrap_err();
+        assert!(err.to_string().contains("already exists"), "{err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        match saved_home {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
+    }
+}
