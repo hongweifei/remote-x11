@@ -3,12 +3,14 @@
 
 use std::time::Duration;
 
+use tokio::io::{AsyncRead, AsyncWrite};
+
 use crate::auth;
 use crate::compress::CompressionAlgo;
 use crate::error::{Result, Rx11Error};
 use crate::protocol::{
-    AuthRequestMessage, AuthResponseMessage, ConnectionMode, Frame, HelloAckMessage, HelloMessage,
-    PROTOCOL_VERSION,
+    AuthRequestMessage, AuthResponseMessage, Capability, ConnectionMode, Features, Frame,
+    HelloAckMessage, HelloMessage, PROTOCOL_VERSION,
 };
 use crate::transport::Rx11Transport;
 use crate::types::{SessionId, Token};
@@ -17,6 +19,8 @@ pub struct HandshakeResult {
     pub session_id: SessionId,
     pub compression: Option<CompressionAlgo>,
     pub resume_session_id: Option<SessionId>,
+    /// Capability intersection agreed with the peer.
+    pub features: Features,
 }
 
 /// Placeholder session id for handshake failures, when no session exists yet.
@@ -31,13 +35,14 @@ fn failed_hello_ack(error_msg: String) -> Frame {
         success: false,
         error_msg: Some(error_msg),
         compression: None,
+        capabilities: Vec::new(),
     })
 }
 
 /// Server side of the handshake: validate Hello, negotiate compression, then
 /// verify the client's auth token.
-pub async fn server_handshake(
-    transport: &mut Rx11Transport,
+pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut Rx11Transport<S>,
     auth_token: &str,
     timeout: Duration,
 ) -> Result<HandshakeResult> {
@@ -68,11 +73,17 @@ pub async fn server_handshake(
     }
 
     let compression = CompressionAlgo::negotiate(&hello.compression_algos, &CompressionAlgo::ALL);
+    let features = Features::negotiate(&hello.capabilities, &Capability::advertised());
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string())?;
 
     if let Some(ref sid) = hello.resume_session_id {
         tracing::info!("Client requests session resume: {}", sid);
     }
+    tracing::debug!(
+        "Negotiated features: {:?} (compression {:?})",
+        features.to_list(),
+        compression.map(|a| a.as_str())
+    );
 
     transport
         .send_frame(&Frame::HelloAck(HelloAckMessage {
@@ -81,6 +92,7 @@ pub async fn server_handshake(
             success: true,
             error_msg: None,
             compression,
+            capabilities: features.to_list(),
         }))
         .await?;
 
@@ -108,11 +120,12 @@ pub async fn server_handshake(
         session_id,
         compression,
         resume_session_id: hello.resume_session_id,
+        features,
     })
 }
 
-async fn send_auth_response(
-    transport: &mut Rx11Transport,
+async fn send_auth_response<S: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut Rx11Transport<S>,
     success: bool,
     error_msg: Option<String>,
 ) -> Result<()> {
@@ -126,8 +139,8 @@ async fn send_auth_response(
 
 /// Client side of the handshake: send Hello with our capabilities, then the
 /// auth token, validating each server response along the way.
-pub async fn client_handshake(
-    transport: &mut Rx11Transport,
+pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut Rx11Transport<S>,
     auth_token: &Token,
     resume_session_id: Option<&SessionId>,
     timeout: Duration,
@@ -138,6 +151,7 @@ pub async fn client_handshake(
             mode: ConnectionMode::Client,
             resume_session_id: resume_session_id.cloned(),
             compression_algos: CompressionAlgo::ALL.to_vec(),
+            capabilities: Capability::advertised(),
         }))
         .await?;
 
@@ -188,9 +202,12 @@ pub async fn client_handshake(
         _ => return Err(Rx11Error::Protocol("Expected AuthResponse frame".into())),
     }
 
+    // The server's echo is authoritative: it already intersects with what we
+    // advertised, and tolerates servers advertising fewer features than us.
     Ok(HandshakeResult {
         session_id: hello_ack.session_id,
         compression: hello_ack.compression,
         resume_session_id: resume_session_id.cloned(),
+        features: Features::negotiate(&Capability::advertised(), &hello_ack.capabilities),
     })
 }

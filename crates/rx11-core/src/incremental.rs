@@ -1,12 +1,30 @@
-use crate::config::IncrementalDefaults;
+use crate::config::{IncrementalDefaults, RuntimeConfig};
 use crate::protocol::{IncrementalChunk, IncrementalX11DataMessage};
 use crate::types::ConnectionId;
 use bytes::Bytes;
 use std::collections::HashMap;
 
+/// Tuning knobs captured at cache construction (from `RuntimeConfig`).
+#[derive(Debug, Clone, Copy)]
+pub struct DiffParams {
+    pub chunk_size: usize,
+    pub min_block_size: usize,
+    pub min_savings_ratio: f64,
+}
+
+impl Default for DiffParams {
+    fn default() -> Self {
+        Self {
+            chunk_size: IncrementalDefaults::DEFAULT_CHUNK_SIZE,
+            min_block_size: IncrementalDefaults::MIN_BLOCK_SIZE_FOR_DIFF,
+            min_savings_ratio: IncrementalDefaults::MIN_SAVINGS_RATIO,
+        }
+    }
+}
+
 pub struct ConnectionDataCache {
     last_data: HashMap<ConnectionId, CachedData>,
-    chunk_size: usize,
+    params: DiffParams,
 }
 
 struct CachedData {
@@ -16,14 +34,33 @@ struct CachedData {
 
 impl ConnectionDataCache {
     pub fn new() -> Self {
-        Self::with_chunk_size(IncrementalDefaults::DEFAULT_CHUNK_SIZE)
-    }
-
-    pub fn with_chunk_size(chunk_size: usize) -> Self {
         Self {
             last_data: HashMap::new(),
-            chunk_size,
+            params: DiffParams::default(),
         }
+    }
+
+    pub fn with_params(params: DiffParams) -> Self {
+        Self {
+            last_data: HashMap::new(),
+            params,
+        }
+    }
+
+    pub fn from_runtime(runtime: &RuntimeConfig) -> Self {
+        Self::with_params(DiffParams {
+            chunk_size: runtime.diff_chunk_size,
+            min_block_size: runtime.diff_min_block_size,
+            min_savings_ratio: runtime.diff_min_savings_ratio,
+        })
+    }
+
+    /// Test/compat helper: override only the chunk size.
+    pub fn with_chunk_size(chunk_size: usize) -> Self {
+        Self::with_params(DiffParams {
+            chunk_size,
+            ..DiffParams::default()
+        })
     }
 
     pub fn update_cache(&mut self, connection_id: ConnectionId, sequence_id: u32, data: &[u8]) {
@@ -60,7 +97,7 @@ impl ConnectionDataCache {
     ) -> Option<IncrementalX11DataMessage> {
         let (base_sequence_id, old_data) = self.get_cached(connection_id)?;
 
-        if new_data.len() < IncrementalDefaults::MIN_BLOCK_SIZE_FOR_DIFF {
+        if new_data.len() < self.params.min_block_size {
             return None;
         }
 
@@ -78,7 +115,7 @@ impl ConnectionDataCache {
 
         // Only send a diff when it saves a meaningful fraction of the base
         // frame; the floor matches the previous `len() / 10` integer rule.
-        let min_saved = (old_data.len() as f64 * IncrementalDefaults::MIN_SAVINGS_RATIO) as usize;
+        let min_saved = (old_data.len() as f64 * self.params.min_savings_ratio) as usize;
         if saved_bytes < min_saved {
             return None;
         }
@@ -97,11 +134,11 @@ impl ConnectionDataCache {
         let mut offset = 0;
 
         while offset < new_data.len() {
-            let chunk_end = (offset + self.chunk_size).min(new_data.len());
+            let chunk_end = (offset + self.params.chunk_size).min(new_data.len());
             let new_chunk = &new_data[offset..chunk_end];
 
             let old_chunk = if offset < old_data.len() {
-                let old_end = (offset + self.chunk_size).min(old_data.len());
+                let old_end = (offset + self.params.chunk_size).min(old_data.len());
                 &old_data[offset..old_end]
             } else {
                 &[]

@@ -65,3 +65,32 @@ impl IncrementalDefaults {
     /// frame to be worth sending.
     pub const MIN_SAVINGS_RATIO: f64 = 0.1;
 }
+
+/// Runtime-tunable knobs, threaded from the CLI config file (`[runtime]`
+/// section) into server and client. Defaults match the compile-time
+/// constants above; new tunables are added here rather than at call sites.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeConfig {
+    pub heartbeat_interval: Duration,
+    pub heartbeat_timeout: Duration,
+    pub client_read_timeout: Duration,
+    pub compression_threshold: usize,
+    pub diff_chunk_size: usize,
+    pub diff_min_block_size: usize,
+    /// Minimum fraction of the base frame a diff must save to be sent.
+    pub diff_min_savings_ratio: f64,
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_interval: ServerDefaults::HEARTBEAT_INTERVAL,
+            heartbeat_timeout: ServerDefaults::HEARTBEAT_TIMEOUT,
+            client_read_timeout: ClientDefaults::READ_TIMEOUT,
+            compression_threshold: crate::compress::COMPRESSION_THRESHOLD,
+            diff_chunk_size: IncrementalDefaults::DEFAULT_CHUNK_SIZE,
+            diff_min_block_size: IncrementalDefaults::MIN_BLOCK_SIZE_FOR_DIFF,
+            diff_min_savings_ratio: IncrementalDefaults::MIN_SAVINGS_RATIO,
+        }
+    }
+}

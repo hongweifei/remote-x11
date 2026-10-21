@@ -6,12 +6,7 @@ use std::io::{Read, Write};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
-use crate::incremental::ConnectionDataCache;
-use crate::protocol::{
-    BinaryMessageCodec, CompressedIncrementalX11DataMessage, CompressedPayload,
-    CompressedX11DataMessage, Frame, X11DataMessage,
-};
-use crate::types::ConnectionId;
+use crate::protocol::CompressedPayload;
 
 /// Payloads smaller than this skip compression entirely.
 pub const COMPRESSION_THRESHOLD: usize = 256;
@@ -50,7 +45,13 @@ impl CompressionAlgo {
     /// Compress when the payload is worth it (above the threshold and
     /// actually smaller afterwards); `None` means "send uncompressed".
     pub fn compress_to_bytes(&self, data: &[u8]) -> Option<Bytes> {
-        if data.len() < COMPRESSION_THRESHOLD {
+        self.compress_with(data, COMPRESSION_THRESHOLD)
+    }
+
+    /// [`Self::compress_to_bytes`] with an explicit minimum-size threshold,
+    /// as configured by [`crate::config::RuntimeConfig`].
+    pub fn compress_with(&self, data: &[u8], threshold: usize) -> Option<Bytes> {
+        if data.len() < threshold {
             return None;
         }
         let compressed = match self {
@@ -89,78 +90,6 @@ impl CompressionAlgo {
         }
         None
     }
-}
-
-/// Compress the payload when possible, otherwise fall back to a plain
-/// `DataX11` frame. Shared tail of both frame builders below.
-fn plain_or_compressed_frame(
-    connection_id: ConnectionId,
-    sequence_id: u32,
-    data: Bytes,
-    compression_algo: Option<CompressionAlgo>,
-) -> Frame {
-    if let Some(algo) = compression_algo {
-        if let Some(compressed) = algo.compress_to_bytes(&data) {
-            return Frame::CompressedDataX11(CompressedX11DataMessage {
-                connection_id,
-                sequence_id,
-                original_len: data.len(),
-                data: compressed,
-            });
-        }
-    }
-    Frame::DataX11(X11DataMessage {
-        connection_id,
-        sequence_id,
-        data,
-    })
-}
-
-/// Build the outbound frame for a raw X11 payload.
-pub fn maybe_compress_frame(
-    connection_id: ConnectionId,
-    sequence_id: u32,
-    data: Bytes,
-    compression_algo: Option<CompressionAlgo>,
-) -> Frame {
-    plain_or_compressed_frame(connection_id, sequence_id, data, compression_algo)
-}
-
-/// Try sending an incremental diff frame, optionally compressed; falls back
-/// to [`maybe_compress_frame`] when no useful diff exists.
-pub fn maybe_incremental_or_compress_frame(
-    connection_id: ConnectionId,
-    sequence_id: u32,
-    data: Bytes,
-    compression_algo: Option<CompressionAlgo>,
-    incremental_cache: Option<&mut ConnectionDataCache>,
-) -> Frame {
-    if let Some(cache) = incremental_cache {
-        if let Some(incremental_msg) = cache.compute_incremental(connection_id, sequence_id, &data)
-        {
-            cache.update_cache(connection_id, sequence_id, &data);
-
-            if let Some(algo) = compression_algo {
-                if let Ok(encoded) = incremental_msg.encode_payload() {
-                    if let Some(compressed) = algo.compress_to_bytes(&encoded) {
-                        return Frame::CompressedIncrementalDataX11(
-                            CompressedIncrementalX11DataMessage {
-                                connection_id,
-                                sequence_id,
-                                original_len: encoded.len(),
-                                data: compressed,
-                            },
-                        );
-                    }
-                }
-            }
-
-            return Frame::IncrementalDataX11(incremental_msg);
-        }
-        cache.update_cache(connection_id, sequence_id, &data);
-    }
-
-    plain_or_compressed_frame(connection_id, sequence_id, data, compression_algo)
 }
 
 /// Decompress a compressed-payload frame using the negotiated algorithm.
@@ -210,6 +139,10 @@ fn decompress_zlib(compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::{
+        CompressedIncrementalX11DataMessage, CompressedX11DataMessage,
+    };
+    use crate::types::ConnectionId;
 
     #[test]
     fn test_small_data_skipped() {

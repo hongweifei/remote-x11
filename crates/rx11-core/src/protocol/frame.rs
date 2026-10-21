@@ -1,6 +1,6 @@
 //! The [`Frame`] enum, its derive macro and frame-level (de)serialization.
 //!
-//! Frames are `MAGIC(4) || type(1) || payload_len(4, BE) || payload`. The
+//! Frames are `MAGIC(4) || version(1) || type(1) || payload_len(4, BE) || payload`. The
 //! `define_frame_types!` macro is the single source of truth mapping each
 //! `MessageType` tag to its payload kind (JSON, binary or empty).
 
@@ -149,6 +149,7 @@ fn encode_raw(msg_type: u8, payload: &[u8]) -> Result<Bytes> {
         .map_err(|_| Rx11Error::Protocol("payload exceeds u32 max".into()))?;
     let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + payload.len());
     buf.extend_from_slice(&MAGIC_BYTES);
+    buf.extend_from_slice(&[WIRE_VERSION]);
     buf.extend_from_slice(&[msg_type]);
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(payload);
@@ -166,8 +167,15 @@ pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
     if data[0..4] != MAGIC_BYTES {
         return Err(Rx11Error::Protocol("Invalid magic bytes".into()));
     }
-    let msg_type_byte = data[4];
-    let payload_len = u32::from_be_bytes([data[5], data[6], data[7], data[8]]) as usize;
+    let wire_version = data[4];
+    if wire_version != WIRE_VERSION {
+        return Err(Rx11Error::Protocol(format!(
+            "Unsupported protocol version: {} (expected {})",
+            wire_version, WIRE_VERSION
+        )));
+    }
+    let msg_type_byte = data[5];
+    let payload_len = u32::from_be_bytes([data[6], data[7], data[8], data[9]]) as usize;
     if payload_len > MAX_FRAME_SIZE {
         return Err(Rx11Error::Protocol(format!(
             "Frame payload too large: {} bytes (max {})",
@@ -208,6 +216,7 @@ mod tests {
             mode: ConnectionMode::Client,
             resume_session_id: None,
             compression_algos: vec![],
+            capabilities: vec![],
         });
         match roundtrip(&frame) {
             Frame::Hello(m) => {
@@ -227,6 +236,7 @@ mod tests {
             success: true,
             error_msg: None,
             compression: None,
+            capabilities: vec![],
         });
         match roundtrip(&frame) {
             Frame::HelloAck(m) => {
@@ -390,14 +400,14 @@ mod tests {
 
     #[test]
     fn test_decode_incomplete_returns_none() {
-        let data = [b'R', b'X', b'1', b'1', 0x01];
+        let data = [b'R', b'X', b'1', b'1', 1, 0x01];
         let result = decode_frame(&data).unwrap();
         assert!(result.is_none());
     }
 
     #[test]
     fn test_decode_invalid_magic() {
-        let data = [b'X', b'X', b'X', b'X', 0x01, 0, 0, 0, 0];
+        let data = [b'X', b'X', b'X', b'X', 0x01, 0, 0, 0, 0, 0];
         let result = decode_frame(&data);
         assert!(result.is_err());
     }
@@ -406,6 +416,7 @@ mod tests {
     fn test_decode_unknown_type() {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
+        data.push(WIRE_VERSION);
         data.push(0xFE);
         data.extend_from_slice(&0u32.to_be_bytes());
         let result = decode_frame(&data);
@@ -421,6 +432,7 @@ mod tests {
     fn test_data_x11_too_short_payload() {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
+        data.push(WIRE_VERSION);
         data.push(0x20);
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(&[0, 1, 2, 3, 4]);
@@ -432,6 +444,7 @@ mod tests {
     fn test_empty_frame_with_nonempty_payload_rejected() {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
+        data.push(WIRE_VERSION);
         data.push(MessageType::Heartbeat as u8);
         data.extend_from_slice(&1u32.to_be_bytes());
         data.push(0xFF);
@@ -461,5 +474,27 @@ mod tests {
         };
         let frame: Frame = msg.into();
         assert_eq!(frame.msg_type(), MessageType::DataX11);
+    }
+
+    #[test]
+    fn test_header_layout_is_magic_version_type_len() {
+        let frame = Frame::Heartbeat;
+        let encoded = encode_frame(&frame).unwrap();
+        assert_eq!(&encoded[0..4], &MAGIC_BYTES);
+        assert_eq!(encoded[4], WIRE_VERSION);
+        assert_eq!(encoded[5], MessageType::Heartbeat as u8);
+        assert_eq!(&encoded[6..10], &0u32.to_be_bytes());
+        assert_eq!(encoded.len(), frame_header_size());
+    }
+
+    #[test]
+    fn test_decode_rejects_other_wire_version() {
+        let mut data = Vec::new();
+        data.extend_from_slice(&MAGIC_BYTES);
+        data.push(WIRE_VERSION + 9);
+        data.push(MessageType::Heartbeat as u8);
+        data.extend_from_slice(&0u32.to_be_bytes());
+        let err = decode_frame(&data).unwrap_err();
+        assert!(err.to_string().contains("Unsupported protocol version"), "{err}");
     }
 }

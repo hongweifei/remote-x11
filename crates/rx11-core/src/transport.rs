@@ -2,7 +2,7 @@
 //! resynchronizing on the magic bytes after protocol errors.
 
 use bytes::{Buf, BytesMut};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::warn;
 
@@ -71,18 +71,20 @@ async fn recv_frame_inner<R: AsyncReadExt + Unpin>(
     }
 }
 
-pub struct Rx11Transport {
+/// Framed transport over any duplex byte stream. `S` defaults to `TcpStream`
+/// but supports in-memory duplexes (tests) and, in the future, TLS or unix
+/// sockets without touching protocol logic.
+pub struct Rx11Transport<S = TcpStream> {
     read_buf: BytesMut,
-    stream: TcpStream,
+    stream: S,
 }
 
-impl Rx11Transport {
-    pub fn new(stream: TcpStream) -> Result<Self> {
-        stream.set_nodelay(true)?;
-        Ok(Self {
+impl<S: AsyncRead + AsyncWrite + Unpin> Rx11Transport<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
             read_buf: BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF),
             stream,
-        })
+        }
     }
 
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
@@ -96,7 +98,7 @@ impl Rx11Transport {
         recv_frame_inner(&mut self.read_buf, &mut self.stream).await
     }
 
-    pub fn split(self) -> (Rx11TransportReadHalf, Rx11TransportWriteHalf) {
+    pub fn split(self) -> (Rx11TransportReadHalf<S>, Rx11TransportWriteHalf<S>) {
         let (read_half, write_half) = tokio::io::split(self.stream);
         (
             Rx11TransportReadHalf {
@@ -108,22 +110,31 @@ impl Rx11Transport {
     }
 }
 
-pub struct Rx11TransportReadHalf {
-    read_buf: BytesMut,
-    read_half: tokio::io::ReadHalf<TcpStream>,
+impl Rx11Transport<TcpStream> {
+    /// Wrap an accepted/connected TCP stream with the socket options the
+    /// relay depends on (no Nagle).
+    pub fn connect_tcp(stream: TcpStream) -> Result<Self> {
+        stream.set_nodelay(true)?;
+        Ok(Self::new(stream))
+    }
 }
 
-impl Rx11TransportReadHalf {
+pub struct Rx11TransportReadHalf<S = TcpStream> {
+    read_buf: BytesMut,
+    read_half: tokio::io::ReadHalf<S>,
+}
+
+impl<S: AsyncRead + Unpin> Rx11TransportReadHalf<S> {
     pub async fn recv_frame(&mut self) -> Result<Frame> {
         recv_frame_inner(&mut self.read_buf, &mut self.read_half).await
     }
 }
 
-pub struct Rx11TransportWriteHalf {
-    write_half: tokio::io::WriteHalf<TcpStream>,
+pub struct Rx11TransportWriteHalf<S = TcpStream> {
+    write_half: tokio::io::WriteHalf<S>,
 }
 
-impl Rx11TransportWriteHalf {
+impl<S: AsyncWrite + Unpin> Rx11TransportWriteHalf<S> {
     pub async fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         let data = encode_frame(frame)?;
         self.write_half

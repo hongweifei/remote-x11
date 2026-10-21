@@ -2,7 +2,8 @@
 //!
 //! - [`protocol`] — frame layout, message types, codecs and handshake
 //! - [`transport`] — TCP framing over tokio with resynchronization
-//! - [`compress`] — zstd/lz4/zlib negotiation and frame helpers
+//! - [`compress`] — zstd/lz4/zlib algorithm negotiation
+//! - [`dataplane`] — capability-gated frame build/apply policy chain
 //! - [`incremental`] — chunked diff encoding for repeated payloads
 //! - [`auth`] — token and X cookie generation, constant-time verification
 //! - [`types`] — validated newtypes (`SessionId`, `Token`, `DisplayNumber`, …)
@@ -13,6 +14,7 @@
 pub mod auth;
 pub mod compress;
 pub mod config;
+pub mod dataplane;
 pub mod error;
 pub mod incremental;
 pub mod protocol;

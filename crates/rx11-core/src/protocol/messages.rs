@@ -22,6 +22,9 @@ pub struct HelloMessage {
     pub resume_session_id: Option<SessionId>,
     #[serde(default = "default_compression_algos")]
     pub compression_algos: Vec<CompressionAlgo>,
+    /// Feature names advertised by the sender; unknown names are ignored.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 fn default_compression_algos() -> Vec<CompressionAlgo> {
@@ -36,6 +39,9 @@ pub struct HelloAckMessage {
     pub error_msg: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compression: Option<CompressionAlgo>,
+    /// Negotiated (intersected) capability names the server will honor.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
