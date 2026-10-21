@@ -10,9 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use rx11_core::dataplane::{DataPlane, InboundOutcome};
 use rx11_core::incremental::ConnectionDataCache;
-use rx11_core::protocol::{
-    Capability, Frame, IncrementalRequestFullMessage, SessionDestroyMessage,
-};
+use rx11_core::protocol::{Capability, Frame, SessionDestroyMessage, StreamResyncRequestMessage};
 use rx11_core::transport::Rx11TransportReadHalf;
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
@@ -70,15 +68,28 @@ pub(crate) async fn serve(ctx: &mut ServeCtx<'_>) -> anyhow::Result<()> {
 
 async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<()> {
     match frame {
-        Frame::X11Connect(msg) => {
-            info!("X11 client connected ({})", msg.connection_id);
-            ctx.proxy.stats.inc_x11_connections();
-            spawn_local_connection(msg.connection_id, msg.display, &ctx.proxy).await?;
+        Frame::ChannelOpen(msg) => {
+            // Channel-kind routing: each openable kind gets a branch here.
+            // Unknown/unimplemented kinds are refused explicitly so the peer
+            // never waits on a channel that will stay silent.
+            if msg.kind.is_x11() {
+                info!(
+                    "X11 client connected ({}) display={:?}",
+                    msg.connection_id, msg.display
+                );
+                ctx.proxy.stats.inc_x11_connections();
+                spawn_local_connection(msg.connection_id, &ctx.proxy).await?;
+            } else {
+                warn!(
+                    "Relay opened unsupported channel kind '{}' ({}); ignoring",
+                    msg.kind, msg.connection_id
+                );
+            }
         }
-        frame @ (Frame::DataX11(_)
-        | Frame::CompressedDataX11(_)
-        | Frame::IncrementalDataX11(_)
-        | Frame::CompressedIncrementalDataX11(_)) => {
+        frame @ (Frame::StreamData(_)
+        | Frame::CompressedStreamData(_)
+        | Frame::IncrementalStreamData(_)
+        | Frame::CompressedIncrementalStreamData(_)) => {
             // Copy the (small, Copy) policy so the cache borrow below stays
             // disjoint from the dataplane read.
             let dataplane = ctx.proxy.dataplane.clone();
@@ -115,11 +126,9 @@ async fn request_full_resend(ctx: &mut ServeCtx<'_>, conn_id: ConnectionId) {
     let _ = ctx
         .proxy
         .outbound
-        .send(Frame::IncrementalRequestFull(
-            IncrementalRequestFullMessage {
-                connection_id: conn_id,
-            },
-        ))
+        .send(Frame::StreamResyncRequest(StreamResyncRequestMessage {
+            connection_id: conn_id,
+        }))
         .await;
 }
 
@@ -131,7 +140,7 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
         Frame::SessionDestroy(msg) => {
             info!("Session destroyed for display {}", msg.display);
         }
-        Frame::X11Disconnect(msg) => {
+        Frame::ChannelClose(msg) => {
             debug!("Remote X11 client disconnected ({})", msg.connection_id);
             let mut conns = ctx.proxy.x11_connections.lock().await;
             conns.remove(&msg.connection_id.get());
@@ -160,9 +169,9 @@ mod tests {
     use rx11_core::compress::CompressionAlgo;
     use rx11_core::config::RuntimeConfig;
     use rx11_core::protocol::{
-        BinaryMessageCodec, CompressedIncrementalX11DataMessage, CompressedX11DataMessage,
-        Features, HelloAckMessage, IncrementalChunk, IncrementalX11DataMessage, X11DataMessage,
-        X11DisconnectMessage, PROTOCOL_VERSION,
+        BinaryMessageCodec, ChannelCloseMessage, CompressedIncrementalStreamDataMessage,
+        CompressedStreamDataMessage, Features, HelloAckMessage, IncrementalChunk,
+        IncrementalStreamDataMessage, StreamDataMessage, PROTOCOL_VERSION,
     };
     use rx11_core::stats::ConnectionStats;
     use rx11_core::transport::{Rx11Transport, Rx11TransportWriteHalf};
@@ -255,7 +264,7 @@ mod tests {
             let mut ctx = h.ctx();
             dispatch_frame(
                 &mut ctx,
-                Frame::DataX11(X11DataMessage {
+                Frame::StreamData(StreamDataMessage {
                     connection_id: conn(3),
                     sequence_id: 7,
                     data: Bytes::from_static(&[1, 2, 3]),
@@ -282,7 +291,7 @@ mod tests {
             let mut ctx = h.ctx();
             dispatch_frame(
                 &mut ctx,
-                Frame::CompressedDataX11(CompressedX11DataMessage {
+                Frame::CompressedStreamData(CompressedStreamDataMessage {
                     connection_id: conn(4),
                     sequence_id: 2,
                     original_len: payload.len(),
@@ -307,7 +316,7 @@ mod tests {
             let mut ctx = h.ctx();
             dispatch_frame(
                 &mut ctx,
-                Frame::CompressedDataX11(CompressedX11DataMessage {
+                Frame::CompressedStreamData(CompressedStreamDataMessage {
                     connection_id: conn(5),
                     sequence_id: 1,
                     original_len: 8,
@@ -330,7 +339,7 @@ mod tests {
         h.cache.update_cache(conn(6), 1, &old);
 
         let mut rx = h.register_local(conn(6)).await;
-        let msg = IncrementalX11DataMessage {
+        let msg = IncrementalStreamDataMessage {
             connection_id: conn(6),
             sequence_id: 2,
             base_sequence_id: 1,
@@ -343,7 +352,7 @@ mod tests {
         };
         {
             let mut ctx = h.ctx();
-            dispatch_frame(&mut ctx, Frame::IncrementalDataX11(msg))
+            dispatch_frame(&mut ctx, Frame::IncrementalStreamData(msg))
                 .await
                 .unwrap();
         }
@@ -357,7 +366,7 @@ mod tests {
         let mut h = Harness::new(None).await;
         let _rx = h.register_local(conn(7)).await;
 
-        let msg = IncrementalX11DataMessage {
+        let msg = IncrementalStreamDataMessage {
             connection_id: conn(7),
             sequence_id: 2,
             base_sequence_id: 99, // receiver has nothing cached at base 99
@@ -370,14 +379,14 @@ mod tests {
         };
         {
             let mut ctx = h.ctx();
-            dispatch_frame(&mut ctx, Frame::IncrementalDataX11(msg))
+            dispatch_frame(&mut ctx, Frame::IncrementalStreamData(msg))
                 .await
                 .unwrap();
         }
 
         match h.outbound_rx.recv().await {
-            Some(Frame::IncrementalRequestFull(m)) => assert_eq!(m.connection_id, conn(7)),
-            other => panic!("expected IncrementalRequestFull, got {other:?}"),
+            Some(Frame::StreamResyncRequest(m)) => assert_eq!(m.connection_id, conn(7)),
+            other => panic!("expected StreamResyncRequest, got {other:?}"),
         }
         let summary = h.stats.summary();
         assert!(summary.contains("1 fallbacks"), "{summary}");
@@ -391,7 +400,7 @@ mod tests {
         new[1000..1900].fill(0x5A);
         h.cache.update_cache(conn(8), 5, &old);
 
-        let msg = IncrementalX11DataMessage {
+        let msg = IncrementalStreamDataMessage {
             connection_id: conn(8),
             sequence_id: 6,
             base_sequence_id: 5,
@@ -413,7 +422,7 @@ mod tests {
             let mut ctx = h.ctx();
             dispatch_frame(
                 &mut ctx,
-                Frame::CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage {
+                Frame::CompressedIncrementalStreamData(CompressedIncrementalStreamDataMessage {
                     connection_id: conn(8),
                     sequence_id: 6,
                     original_len,
@@ -442,7 +451,7 @@ mod tests {
             let mut ctx = h.ctx();
             dispatch_frame(
                 &mut ctx,
-                Frame::IncrementalDataX11(IncrementalX11DataMessage {
+                Frame::IncrementalStreamData(IncrementalStreamDataMessage {
                     connection_id: conn(11),
                     sequence_id: 2,
                     base_sequence_id: 1,
@@ -458,7 +467,7 @@ mod tests {
         // and one request frame is emitted.
         assert!(matches!(
             h.outbound_rx.recv().await,
-            Some(Frame::IncrementalRequestFull(_))
+            Some(Frame::StreamResyncRequest(_))
         ));
     }
 
@@ -485,8 +494,7 @@ mod tests {
             let mut ctx = h.ctx();
             dispatch_frame(
                 &mut ctx,
-                Frame::X11Disconnect(X11DisconnectMessage {
-                    display: DisplayNumber::new(0).unwrap(),
+                Frame::ChannelClose(ChannelCloseMessage {
                     connection_id: conn(9),
                 }),
             )

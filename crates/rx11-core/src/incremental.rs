@@ -1,5 +1,5 @@
 use crate::config::{IncrementalDefaults, RuntimeConfig};
-use crate::protocol::{IncrementalChunk, IncrementalX11DataMessage};
+use crate::protocol::{IncrementalChunk, IncrementalStreamDataMessage};
 use crate::types::ConnectionId;
 use bytes::Bytes;
 use std::collections::HashMap;
@@ -94,7 +94,7 @@ impl ConnectionDataCache {
         connection_id: ConnectionId,
         new_sequence_id: u32,
         new_data: &[u8],
-    ) -> Option<IncrementalX11DataMessage> {
+    ) -> Option<IncrementalStreamDataMessage> {
         let (base_sequence_id, old_data) = self.get_cached(connection_id)?;
 
         if new_data.len() < self.params.min_block_size {
@@ -120,7 +120,7 @@ impl ConnectionDataCache {
             return None;
         }
 
-        Some(IncrementalX11DataMessage {
+        Some(IncrementalStreamDataMessage {
             connection_id,
             sequence_id: new_sequence_id,
             base_sequence_id,
@@ -158,7 +158,7 @@ impl ConnectionDataCache {
         chunks
     }
 
-    pub fn apply_incremental(&mut self, msg: &IncrementalX11DataMessage) -> Option<Vec<u8>> {
+    pub fn apply_incremental(&mut self, msg: &IncrementalStreamDataMessage) -> Option<Vec<u8>> {
         let (cached_seq, cached_data) = self.get_cached(msg.connection_id)?;
 
         if cached_seq != msg.base_sequence_id {
@@ -226,7 +226,7 @@ mod tests {
     fn test_apply_rejects_out_of_bounds_chunk() {
         let mut cache = ConnectionDataCache::with_chunk_size(1024);
         cache.update_cache(ConnectionId::new(1), 1, &[0u8; 2048]);
-        let msg = IncrementalX11DataMessage {
+        let msg = IncrementalStreamDataMessage {
             connection_id: ConnectionId::new(1),
             sequence_id: 2,
             base_sequence_id: 1,
@@ -247,7 +247,7 @@ mod tests {
     fn test_apply_rejects_declared_length_mismatch() {
         let mut cache = ConnectionDataCache::new();
         cache.update_cache(ConnectionId::new(1), 1, &[0u8; 2048]);
-        let msg = IncrementalX11DataMessage {
+        let msg = IncrementalStreamDataMessage {
             connection_id: ConnectionId::new(1),
             sequence_id: 2,
             base_sequence_id: 1,

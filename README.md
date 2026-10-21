@@ -41,6 +41,7 @@
 - **数据压缩** — 支持 zstd/lz4/zlib 三种算法，自动协商，超过 256 字节的数据自动压缩，压缩后更大则回退
 - **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
 - **能力协商** — 增量/重同步/流控等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
+- **通道类型可扩展** — 数据面帧族与载荷类型解耦：`ChannelOpen.kind` 声明类型（当前 `x11`），kind 即能力名，未知 kind 安全穿透不解析错
 - **双向统计** — 客户端与服务端各自每 30 秒输出收发字节、压缩/增量节省量与活跃连接数
 - **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
 - **SSH 端口冲突检测** — 启动 SSH 隧道前自动检测本地端口是否被占用
@@ -345,13 +346,13 @@ rx11 使用自定义二进制帧协议，每帧结构：
 | SessionDestroy | 0x12 | 销毁会话 |
 | SessionResume | 0x13 | 恢复已有的会话 |
 | SessionAutoCreate | 0x14 | 自动分配 Display 并创建会话 |
-| X11Connect | 0x18 | X11 应用连接通知 |
-| X11Disconnect | 0x19 | X11 应用断开通知 |
-| IncrementalRequestFull | 0x1A | 请求对端停止差分、回退全帧（自愈） |
-| DataX11 | 0x20 | X11 数据帧（二进制，非 JSON） |
-| CompressedDataX11 | 0x21 | 压缩的 X11 数据帧 |
-| IncrementalDataX11 | 0x22 | X11 增量差分帧（二进制） |
-| CompressedIncrementalDataX11 | 0x23 | 压缩后的增量差分帧 |
+| ChannelOpen | 0x18 | 打开多路复用通道（`kind` + 可选 `display`） |
+| ChannelClose | 0x19 | 按通道号关闭通道 |
+| StreamResyncRequest | 0x1A | 请求对端停止差分、回退全帧（自愈） |
+| StreamData | 0x20 | 通道数据帧（二进制载荷，类型无关） |
+| CompressedStreamData | 0x21 | 压缩的通道数据帧 |
+| IncrementalStreamData | 0x22 | 通道增量差分帧（二进制） |
+| CompressedIncrementalStreamData | 0x23 | 压缩后的增量差分帧 |
 | Heartbeat | 0x30 | 心跳（服务端发起） |
 | HeartbeatAck | 0x31 | 心跳响应 |
 | FlowControl | 0x40 | 流控（预留，当前仅记录日志） |
@@ -401,9 +402,9 @@ Client                          Server
   │◄── AuthResponse ────────────│
   │─── SessionCreate ──────────►│  (或 SessionResume / SessionAutoCreate)
   │◄── SessionAck ──────────────│  (含 session_id)
-  │◄──► X11Connect/Disconnect ──│  (X11 应用连接/断开通知)
-  │◄──► DataX11 (双向) ────────►│  (X11 数据转发，含 connection_id)
-  │─── IncrementalRequestFull ─►│  (增量失步时请求回退全帧)
+  │◄──► ChannelOpen/Close ────│  (通道开闭，kind=x11)
+  │◄──► StreamData (双向) ────────►│  (X11 数据转发，含 connection_id)
+  │─── StreamResyncRequest ────►│  (增量失步时请求回退全帧)
   │◄──► Heartbeat / HeartbeatAck│  (服务端保活)
   │─── SessionDestroy ──────────►│  (可选，显式销毁)
 ```

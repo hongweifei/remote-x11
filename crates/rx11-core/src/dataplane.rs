@@ -16,8 +16,8 @@ use crate::compress::CompressionAlgo;
 use crate::config::RuntimeConfig;
 use crate::incremental::ConnectionDataCache;
 use crate::protocol::{
-    BinaryMessageCodec, Capability, CompressedIncrementalX11DataMessage, CompressedX11DataMessage,
-    Features, Frame, IncrementalX11DataMessage, X11DataMessage,
+    BinaryMessageCodec, Capability, CompressedIncrementalStreamDataMessage,
+    CompressedStreamDataMessage, Features, Frame, IncrementalStreamDataMessage, StreamDataMessage,
 };
 use crate::stats::ConnectionStats;
 use crate::types::ConnectionId;
@@ -72,14 +72,14 @@ impl DataPlane {
     ) -> Frame {
         let original_len = data.len();
         if let Some(compressed) = self.compress(&data) {
-            return Frame::CompressedDataX11(CompressedX11DataMessage {
+            return Frame::CompressedStreamData(CompressedStreamDataMessage {
                 connection_id,
                 sequence_id,
                 original_len,
                 data: compressed,
             });
         }
-        Frame::DataX11(X11DataMessage {
+        Frame::StreamData(StreamDataMessage {
             connection_id,
             sequence_id,
             data,
@@ -87,13 +87,13 @@ impl DataPlane {
     }
 
     /// Wrap a computed diff, optionally compressing the encoded diff.
-    fn wrap_diff(&self, diff: IncrementalX11DataMessage, conn: ConnectionId, seq: u32) -> Frame {
+    fn wrap_diff(&self, diff: IncrementalStreamDataMessage, conn: ConnectionId, seq: u32) -> Frame {
         if self.compression.is_some() {
             if let Ok(encoded) = diff.encode_payload() {
                 let original_len = encoded.len();
                 if let Some(compressed) = self.compress(&encoded) {
-                    return Frame::CompressedIncrementalDataX11(
-                        CompressedIncrementalX11DataMessage {
+                    return Frame::CompressedIncrementalStreamData(
+                        CompressedIncrementalStreamDataMessage {
                             connection_id: conn,
                             sequence_id: seq,
                             original_len,
@@ -103,7 +103,7 @@ impl DataPlane {
                 }
             }
         }
-        Frame::IncrementalDataX11(diff)
+        Frame::IncrementalStreamData(diff)
     }
 
     /// Build the outbound frame for raw X11 payload. When `cache` is present
@@ -144,7 +144,7 @@ impl DataPlane {
         stats: &ConnectionStats,
     ) -> InboundOutcome {
         match frame {
-            Frame::DataX11(msg) => {
+            Frame::StreamData(msg) => {
                 stats.add_bytes_received(msg.data.len() as u64);
                 cache.update_cache(msg.connection_id, msg.sequence_id, &msg.data);
                 InboundOutcome::Payload {
@@ -152,9 +152,9 @@ impl DataPlane {
                     data: msg.data,
                 }
             }
-            Frame::CompressedDataX11(msg) => {
+            Frame::CompressedStreamData(msg) => {
                 let Some(algo) = self.compression else {
-                    tracing::warn!("CompressedDataX11 but no compression negotiated, dropping");
+                    tracing::warn!("CompressedStreamData but no compression negotiated, dropping");
                     return InboundOutcome::Dropped;
                 };
                 let original_len = msg.original_len;
@@ -174,11 +174,11 @@ impl DataPlane {
                     data,
                 }
             }
-            Frame::IncrementalDataX11(msg) => self.apply_diff(msg, cache, stats),
-            Frame::CompressedIncrementalDataX11(msg) => {
+            Frame::IncrementalStreamData(msg) => self.apply_diff(msg, cache, stats),
+            Frame::CompressedIncrementalStreamData(msg) => {
                 let Some(algo) = self.compression else {
                     tracing::warn!(
-                        "CompressedIncrementalDataX11 but no compression negotiated, dropping"
+                        "CompressedIncrementalStreamData but no compression negotiated, dropping"
                     );
                     return InboundOutcome::Dropped;
                 };
@@ -197,7 +197,7 @@ impl DataPlane {
                 stats.add_incremental_compression_saved(
                     original_len.saturating_sub(compressed_len) as u64,
                 );
-                match IncrementalX11DataMessage::decode_payload(&diff_bytes) {
+                match IncrementalStreamDataMessage::decode_payload(&diff_bytes) {
                     Ok(msg) => self.apply_diff(msg, cache, stats),
                     Err(e) => {
                         tracing::warn!("Incremental decode failed for {}: {}", conn, e);
@@ -216,7 +216,7 @@ impl DataPlane {
 
     fn apply_diff(
         &self,
-        msg: IncrementalX11DataMessage,
+        msg: IncrementalStreamDataMessage,
         cache: &mut ConnectionDataCache,
         stats: &ConnectionStats,
     ) -> InboundOutcome {
@@ -248,17 +248,17 @@ impl DataPlane {
 /// incremental savings relative to the original payload length.
 pub fn record_outbound(stats: &ConnectionStats, frame: &Frame, original_len: usize) {
     match frame {
-        Frame::DataX11(m) => stats.add_bytes_sent(m.data.len() as u64),
-        Frame::CompressedDataX11(m) => {
+        Frame::StreamData(m) => stats.add_bytes_sent(m.data.len() as u64),
+        Frame::CompressedStreamData(m) => {
             stats.add_bytes_sent(m.data.len() as u64);
             stats.add_compression_saved(m.original_len.saturating_sub(m.data.len()) as u64);
         }
-        Frame::IncrementalDataX11(m) => {
+        Frame::IncrementalStreamData(m) => {
             let chunks_len: usize = m.chunks.iter().map(|c| c.data.len()).sum();
             stats.add_bytes_sent(chunks_len as u64);
             stats.add_incremental_saved(original_len.saturating_sub(chunks_len) as u64);
         }
-        Frame::CompressedIncrementalDataX11(m) => {
+        Frame::CompressedIncrementalStreamData(m) => {
             stats.add_bytes_sent(m.data.len() as u64);
             // Two stacked layers: diff-vs-payload, then compression-vs-diff.
             stats.add_incremental_saved(original_len.saturating_sub(m.original_len) as u64);
@@ -292,7 +292,7 @@ mod tests {
     fn plain_payload_without_compression_yields_data_frame() {
         let dp = DataPlane::new(Features::default(), None, &runtime());
         let frame = dp.build_frame(conn(), 1, Bytes::from_static(b"hello"), None, None);
-        assert!(matches!(frame, Frame::DataX11(_)));
+        assert!(matches!(frame, Frame::StreamData(_)));
     }
 
     #[test]
@@ -303,7 +303,7 @@ mod tests {
         let dp = DataPlane::new(Features::default(), None, &runtime());
         let frame = dp.build_frame(conn(), 2, Bytes::from(big.clone()), Some(&mut cache), None);
         // no Incremental capability ⇒ plain frame, not a diff
-        assert!(matches!(frame, Frame::DataX11(_)), "{frame:?}");
+        assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
     }
 
     #[test]
@@ -316,7 +316,7 @@ mod tests {
         cache.update_cache(conn(), 1, &old);
         let frame = dp.build_frame(conn(), 2, Bytes::from(new.clone()), Some(&mut cache), None);
         match frame {
-            Frame::IncrementalDataX11(m) => {
+            Frame::IncrementalStreamData(m) => {
                 assert_eq!(m.base_sequence_id, 1);
                 assert_eq!(m.sequence_id, 2);
                 assert_eq!(m.chunks.len(), 1);
@@ -328,7 +328,7 @@ mod tests {
     #[test]
     fn record_outbound_counts_wire_bytes_and_savings() {
         let stats = ConnectionStats::new();
-        let frame = Frame::CompressedDataX11(CompressedX11DataMessage {
+        let frame = Frame::CompressedStreamData(CompressedStreamDataMessage {
             connection_id: conn(),
             sequence_id: 2,
             original_len: 1000,
@@ -346,12 +346,13 @@ mod tests {
     #[test]
     fn record_outbound_compressed_diff_reports_both_layers() {
         let stats = ConnectionStats::new();
-        let frame = Frame::CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage {
-            connection_id: conn(),
-            sequence_id: 4,
-            original_len: 512, // encoded diff
-            data: Bytes::from(vec![0u8; 120]),
-        });
+        let frame =
+            Frame::CompressedIncrementalStreamData(CompressedIncrementalStreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 4,
+                original_len: 512, // encoded diff
+                data: Bytes::from(vec![0u8; 120]),
+            });
         record_outbound(&stats, &frame, 4096); // app payload len
         let summary = stats.summary();
         assert!(
@@ -370,7 +371,7 @@ mod tests {
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(
-            Frame::DataX11(X11DataMessage {
+            Frame::StreamData(StreamDataMessage {
                 connection_id: conn(),
                 sequence_id: 7,
                 data: Bytes::from_static(&[1, 2, 3]),
@@ -395,7 +396,7 @@ mod tests {
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(
-            Frame::IncrementalDataX11(IncrementalX11DataMessage {
+            Frame::IncrementalStreamData(IncrementalStreamDataMessage {
                 connection_id: conn(),
                 sequence_id: 2,
                 base_sequence_id: 99,
@@ -425,7 +426,7 @@ mod tests {
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(
-            Frame::CompressedDataX11(CompressedX11DataMessage {
+            Frame::CompressedStreamData(CompressedStreamDataMessage {
                 connection_id: conn(),
                 sequence_id: 1,
                 original_len: 8,

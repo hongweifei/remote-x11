@@ -18,15 +18,15 @@ pub enum MessageType {
     SessionResume = 0x13,
     SessionAutoCreate = 0x14,
     // --- data-plane band: binary payloads (0x20-0x2F; 0x24+ reserved) ---
-    DataX11 = 0x20,
-    CompressedDataX11 = 0x21,
-    IncrementalDataX11 = 0x22,
-    CompressedIncrementalDataX11 = 0x23,
+    StreamData = 0x20,
+    CompressedStreamData = 0x21,
+    IncrementalStreamData = 0x22,
+    CompressedIncrementalStreamData = 0x23,
     // --- control band: JSON payloads (notification/request grouped with
     //     session frames; kept out of the binary band) ---
-    X11Connect = 0x18,
-    X11Disconnect = 0x19,
-    IncrementalRequestFull = 0x1A,
+    ChannelOpen = 0x18,
+    ChannelClose = 0x19,
+    StreamResyncRequest = 0x1A,
     Heartbeat = 0x30,
     HeartbeatAck = 0x31,
     FlowControl = 0x40,
@@ -47,13 +47,13 @@ impl MessageType {
         MessageType::SessionDestroy,
         MessageType::SessionResume,
         MessageType::SessionAutoCreate,
-        MessageType::DataX11,
-        MessageType::CompressedDataX11,
-        MessageType::IncrementalDataX11,
-        MessageType::CompressedIncrementalDataX11,
-        MessageType::IncrementalRequestFull,
-        MessageType::X11Connect,
-        MessageType::X11Disconnect,
+        MessageType::StreamData,
+        MessageType::CompressedStreamData,
+        MessageType::IncrementalStreamData,
+        MessageType::CompressedIncrementalStreamData,
+        MessageType::StreamResyncRequest,
+        MessageType::ChannelOpen,
+        MessageType::ChannelClose,
         MessageType::Heartbeat,
         MessageType::HeartbeatAck,
         MessageType::FlowControl,
@@ -75,13 +75,13 @@ impl TryFrom<u8> for MessageType {
             0x12 => Ok(MessageType::SessionDestroy),
             0x13 => Ok(MessageType::SessionResume),
             0x14 => Ok(MessageType::SessionAutoCreate),
-            0x20 => Ok(MessageType::DataX11),
-            0x21 => Ok(MessageType::CompressedDataX11),
-            0x22 => Ok(MessageType::IncrementalDataX11),
-            0x23 => Ok(MessageType::CompressedIncrementalDataX11),
-            0x18 => Ok(MessageType::X11Connect),
-            0x19 => Ok(MessageType::X11Disconnect),
-            0x1A => Ok(MessageType::IncrementalRequestFull),
+            0x20 => Ok(MessageType::StreamData),
+            0x21 => Ok(MessageType::CompressedStreamData),
+            0x22 => Ok(MessageType::IncrementalStreamData),
+            0x23 => Ok(MessageType::CompressedIncrementalStreamData),
+            0x18 => Ok(MessageType::ChannelOpen),
+            0x19 => Ok(MessageType::ChannelClose),
+            0x1A => Ok(MessageType::StreamResyncRequest),
             0x30 => Ok(MessageType::Heartbeat),
             0x31 => Ok(MessageType::HeartbeatAck),
             0x40 => Ok(MessageType::FlowControl),
@@ -113,18 +113,21 @@ mod tests {
             MessageType::try_from(0x10).unwrap(),
             MessageType::SessionCreate
         );
-        assert_eq!(MessageType::try_from(0x20).unwrap(), MessageType::DataX11);
+        assert_eq!(
+            MessageType::try_from(0x20).unwrap(),
+            MessageType::StreamData
+        );
         assert_eq!(
             MessageType::try_from(0x22).unwrap(),
-            MessageType::IncrementalDataX11
+            MessageType::IncrementalStreamData
         );
         assert_eq!(
             MessageType::try_from(0x23).unwrap(),
-            MessageType::CompressedIncrementalDataX11
+            MessageType::CompressedIncrementalStreamData
         );
         assert_eq!(
             MessageType::try_from(0x18).unwrap(),
-            MessageType::X11Connect
+            MessageType::ChannelOpen
         );
         assert_eq!(MessageType::try_from(0xFF).unwrap(), MessageType::Error);
     }
@@ -146,10 +149,10 @@ mod tests {
             let byte = mt as u8;
             let binary_payload = matches!(
                 mt,
-                MessageType::DataX11
-                    | MessageType::CompressedDataX11
-                    | MessageType::IncrementalDataX11
-                    | MessageType::CompressedIncrementalDataX11
+                MessageType::StreamData
+                    | MessageType::CompressedStreamData
+                    | MessageType::IncrementalStreamData
+                    | MessageType::CompressedIncrementalStreamData
             );
             assert_eq!(
                 DATA_BAND.contains(&byte),
@@ -162,7 +165,7 @@ mod tests {
     #[test]
     fn test_message_type_display() {
         assert_eq!(format!("{}", MessageType::Hello), "Hello");
-        assert_eq!(format!("{}", MessageType::DataX11), "DataX11");
+        assert_eq!(format!("{}", MessageType::StreamData), "StreamData");
         assert_eq!(format!("{}", MessageType::Error), "Error");
     }
 

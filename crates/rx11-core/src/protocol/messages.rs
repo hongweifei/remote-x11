@@ -94,14 +94,14 @@ pub struct ErrorMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct X11DataMessage {
+pub struct StreamDataMessage {
     pub connection_id: ConnectionId,
     pub sequence_id: u32,
     pub data: Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressedX11DataMessage {
+pub struct CompressedStreamDataMessage {
     pub connection_id: ConnectionId,
     pub sequence_id: u32,
     pub original_len: usize,
@@ -109,7 +109,7 @@ pub struct CompressedX11DataMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncrementalX11DataMessage {
+pub struct IncrementalStreamDataMessage {
     pub connection_id: ConnectionId,
     pub sequence_id: u32,
     pub base_sequence_id: u32,
@@ -125,7 +125,7 @@ pub struct IncrementalChunk {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressedIncrementalX11DataMessage {
+pub struct CompressedIncrementalStreamDataMessage {
     pub connection_id: ConnectionId,
     pub sequence_id: u32,
     pub original_len: usize,
@@ -135,19 +135,58 @@ pub struct CompressedIncrementalX11DataMessage {
 /// Sent by the receiver when an incremental diff could not be applied
 /// against its cache, asking the sender to fall back to full frames.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IncrementalRequestFullMessage {
+pub struct StreamResyncRequestMessage {
     pub connection_id: ConnectionId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct X11ConnectMessage {
-    pub display: DisplayNumber,
-    pub connection_id: ConnectionId,
+/// Identifies what flows over an opened channel. Wire form is the kind's
+/// lowercase name; unknown kinds decode faithfully so a future clipboard or
+/// file channel passes through without breaking existing peers (opening is
+/// still gated by the matching capability).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ChannelKind(String);
+
+impl ChannelKind {
+    pub const X11_NAME: &'static str = "x11";
+
+    pub fn new(name: impl Into<String>) -> Self {
+        Self(name.into())
+    }
+
+    pub fn x11() -> Self {
+        Self(Self::X11_NAME.to_string())
+    }
+
+    pub fn is_x11(&self) -> bool {
+        self.0 == Self::X11_NAME
+    }
+
+    pub fn name(&self) -> &str {
+        &self.0
+    }
 }
 
+impl std::fmt::Display for ChannelKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Opens a multiplexed channel. Kind-specific parameters (X11's `display`)
+/// travel as optional fields; consumers must ignore fields their kind does
+/// not define.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct X11DisconnectMessage {
-    pub display: DisplayNumber,
+pub struct ChannelOpenMessage {
+    pub connection_id: ConnectionId,
+    pub kind: ChannelKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display: Option<DisplayNumber>,
+}
+
+/// Closes a channel by id; the peer removes all per-channel state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChannelCloseMessage {
     pub connection_id: ConnectionId,
 }
 
@@ -172,7 +211,7 @@ pub trait CompressedPayload {
     fn original_len(&self) -> usize;
 }
 
-impl CompressedPayload for CompressedX11DataMessage {
+impl CompressedPayload for CompressedStreamDataMessage {
     fn compressed_data(&self) -> &Bytes {
         &self.data
     }
@@ -182,7 +221,7 @@ impl CompressedPayload for CompressedX11DataMessage {
     }
 }
 
-impl CompressedPayload for CompressedIncrementalX11DataMessage {
+impl CompressedPayload for CompressedIncrementalStreamDataMessage {
     fn compressed_data(&self) -> &Bytes {
         &self.data
     }

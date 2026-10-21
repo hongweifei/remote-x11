@@ -140,7 +140,7 @@ fn decompress_zlib(compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{CompressedIncrementalX11DataMessage, CompressedX11DataMessage};
+    use crate::protocol::{CompressedIncrementalStreamDataMessage, CompressedStreamDataMessage};
     use crate::types::ConnectionId;
 
     #[test]
@@ -292,7 +292,7 @@ mod tests {
         let data = vec![0xEF; 2048];
         let algo = CompressionAlgo::Zstd;
         let compressed = algo.compress_to_bytes(&data).expect("compressible");
-        let msg = CompressedX11DataMessage {
+        let msg = CompressedStreamDataMessage {
             connection_id: ConnectionId::new(1),
             sequence_id: 0,
             original_len: data.len(),
@@ -300,7 +300,7 @@ mod tests {
         };
         assert_eq!(decompress_frame_data(&msg, algo).unwrap(), data);
 
-        let inc_msg = CompressedIncrementalX11DataMessage {
+        let inc_msg = CompressedIncrementalStreamDataMessage {
             connection_id: ConnectionId::new(1),
             sequence_id: 0,
             original_len: data.len(),

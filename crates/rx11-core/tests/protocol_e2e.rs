@@ -17,7 +17,7 @@ use rx11_core::dataplane::{DataPlane, InboundOutcome};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{
     client_handshake, decode_frame, encode_frame, server_handshake, Capability, ConnectionMode,
-    Features, Frame, HelloMessage, IncrementalRequestFullMessage,
+    Features, Frame, HelloMessage, StreamResyncRequestMessage,
 };
 use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::{Rx11Transport, Rx11TransportReadHalf, Rx11TransportWriteHalf};
@@ -210,7 +210,7 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
         Some(&mut server_cache),
         Some(&relay_stats),
     );
-    assert!(matches!(frame, Frame::DataX11(_)), "{frame:?}");
+    assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
     relay_send(&mut session, &frame).await;
     let outcome = client_dp.apply_inbound(
         client_recv(&mut session).await,
@@ -231,7 +231,7 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
         Some(&relay_stats),
     );
     assert!(
-        matches!(frame, Frame::IncrementalDataX11(_)),
+        matches!(frame, Frame::IncrementalStreamData(_)),
         "expected diff frame, got {frame:?}"
     );
     relay_send(&mut session, &frame).await;
@@ -257,7 +257,7 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
         Some(&mut server_cache),
         Some(&relay_stats),
     );
-    assert!(matches!(frame, Frame::IncrementalDataX11(_)));
+    assert!(matches!(frame, Frame::IncrementalStreamData(_)));
     relay_send(&mut session, &frame).await;
     let arrived = client_recv(&mut session).await;
     match client_dp.apply_inbound(arrived, &mut client_cache, &client_stats) {
@@ -272,19 +272,17 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
     // the relay end clears its diff base (relay::connection would do the same).
     session
         .client_tx
-        .send_frame(&Frame::IncrementalRequestFull(
-            IncrementalRequestFullMessage {
-                connection_id: conn,
-            },
-        ))
+        .send_frame(&Frame::StreamResyncRequest(StreamResyncRequestMessage {
+            connection_id: conn,
+        }))
         .await
         .unwrap();
     match session.relay_rx.recv_frame().await.unwrap() {
-        Frame::IncrementalRequestFull(m) => {
+        Frame::StreamResyncRequest(m) => {
             assert_eq!(m.connection_id, conn);
             server_cache.clear_connection(conn);
         }
-        other => panic!("expected IncrementalRequestFull at relay, got {other:?}"),
+        other => panic!("expected StreamResyncRequest at relay, got {other:?}"),
     }
 
     // 4) Next payload must be a full frame again (base was dropped).
@@ -296,7 +294,7 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
         Some(&mut server_cache),
         Some(&relay_stats),
     );
-    assert!(matches!(frame, Frame::DataX11(_)), "{frame:?}");
+    assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
     relay_send(&mut session, &frame).await;
     match client_dp.apply_inbound(
         client_recv(&mut session).await,
@@ -336,7 +334,7 @@ async fn feature_gated_dataplane_never_emits_diffs() {
     let mut second = first.clone();
     second[500] = 1;
     let frame = dp.build_frame(conn, 2, Bytes::from(second), Some(&mut cache), None);
-    assert!(matches!(frame, Frame::DataX11(_)), "{frame:?}");
+    assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
 }
 
 #[tokio::test]

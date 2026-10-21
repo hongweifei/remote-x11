@@ -124,17 +124,17 @@ define_frame_types! {
         SessionDestroy(SessionDestroyMessage),
         SessionResume(SessionResumeMessage),
         SessionAutoCreate(SessionAutoCreateMessage) validate(validate_session_auto_create),
-        X11Connect(X11ConnectMessage),
-        X11Disconnect(X11DisconnectMessage),
+        ChannelOpen(ChannelOpenMessage),
+        ChannelClose(ChannelCloseMessage),
         FlowControl(FlowControlMessage),
         Error(ErrorMessage),
-        IncrementalRequestFull(IncrementalRequestFullMessage),
+        StreamResyncRequest(StreamResyncRequestMessage),
     }
     binary {
-        DataX11(X11DataMessage),
-        CompressedDataX11(CompressedX11DataMessage),
-        IncrementalDataX11(IncrementalX11DataMessage),
-        CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage),
+        StreamData(StreamDataMessage),
+        CompressedStreamData(CompressedStreamDataMessage),
+        IncrementalStreamData(IncrementalStreamDataMessage),
+        CompressedIncrementalStreamData(CompressedIncrementalStreamDataMessage),
     }
     empty {
         Heartbeat,
@@ -303,62 +303,84 @@ mod tests {
 
     #[test]
     fn test_encode_decode_data_x11() {
-        let frame = Frame::DataX11(X11DataMessage {
+        let frame = Frame::StreamData(StreamDataMessage {
             connection_id: ConnectionId::new(42),
             sequence_id: 7,
             data: Bytes::from_static(&[0xAA, 0xBB, 0xCC]),
         });
         match roundtrip(&frame) {
-            Frame::DataX11(m) => {
+            Frame::StreamData(m) => {
                 assert_eq!(m.connection_id.get(), 42);
                 assert_eq!(m.sequence_id, 7);
                 assert_eq!(&m.data[..], &[0xAA, 0xBB, 0xCC]);
             }
-            other => panic!("Expected DataX11 frame, got {other:?}"),
+            other => panic!("Expected StreamData frame, got {other:?}"),
         }
     }
 
     #[test]
     fn test_encode_decode_compressed_data_x11() {
-        let frame = Frame::CompressedDataX11(CompressedX11DataMessage {
+        let frame = Frame::CompressedStreamData(CompressedStreamDataMessage {
             connection_id: ConnectionId::new(42),
             sequence_id: 5,
             original_len: 1000,
             data: Bytes::from_static(&[0x01, 0x02, 0x03]),
         });
         match roundtrip(&frame) {
-            Frame::CompressedDataX11(m) => {
+            Frame::CompressedStreamData(m) => {
                 assert_eq!(m.original_len, 1000);
                 assert_eq!(&m.data[..], &[0x01, 0x02, 0x03]);
             }
-            other => panic!("Expected CompressedDataX11 frame, got {other:?}"),
+            other => panic!("Expected CompressedStreamData frame, got {other:?}"),
         }
     }
 
     #[test]
-    fn test_encode_decode_x11_connect() {
-        let frame = Frame::X11Connect(X11ConnectMessage {
-            display: DisplayNumber::new(5).unwrap(),
+    fn test_encode_decode_channel_open() {
+        let frame = Frame::ChannelOpen(ChannelOpenMessage {
             connection_id: ConnectionId::new(100),
+            kind: ChannelKind::x11(),
+            display: Some(DisplayNumber::new(5).unwrap()),
         });
         match roundtrip(&frame) {
-            Frame::X11Connect(m) => {
-                assert_eq!(m.display.get(), 5);
+            Frame::ChannelOpen(m) => {
+                assert!(m.kind.is_x11());
+                assert_eq!(m.display.unwrap().get(), 5);
                 assert_eq!(m.connection_id.get(), 100);
             }
-            other => panic!("Expected X11Connect frame, got {other:?}"),
+            other => panic!("Expected ChannelOpen frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_channel_kind_unknown_names_survive_the_wire() {
+        // A future peer opening a "clipboard" channel must decode cleanly on
+        // a build that only knows "x11" — rejection happens at routing, not
+        // at parsing.
+        let frame = Frame::ChannelOpen(ChannelOpenMessage {
+            connection_id: ConnectionId::new(1),
+            kind: ChannelKind::new("clipboard"),
+            display: None,
+        });
+        match roundtrip(&frame) {
+            Frame::ChannelOpen(m) => {
+                assert_eq!(m.kind.name(), "clipboard");
+                assert!(!m.kind.is_x11());
+                assert!(m.display.is_none());
+            }
+            other => panic!("expected ChannelOpen, got {other:?}"),
         }
     }
 
     #[test]
     fn test_encode_decode_incremental_request_full() {
-        let frame = Frame::IncrementalRequestFull(IncrementalRequestFullMessage {
+        let frame = Frame::StreamResyncRequest(StreamResyncRequestMessage {
             connection_id: ConnectionId::new(2001),
         });
-        assert_eq!(frame.msg_type(), MessageType::IncrementalRequestFull);
+        assert_eq!(frame.msg_type(), MessageType::StreamResyncRequest);
         match roundtrip(&frame) {
-            Frame::IncrementalRequestFull(m) => assert_eq!(m.connection_id.get(), 2001),
-            other => panic!("Expected IncrementalRequestFull frame, got {other:?}"),
+            Frame::StreamResyncRequest(m) => assert_eq!(m.connection_id.get(), 2001),
+            other => panic!("Expected StreamResyncRequest frame, got {other:?}"),
         }
     }
 
@@ -467,13 +489,13 @@ mod tests {
 
     #[test]
     fn test_from_binary_payload_to_frame() {
-        let msg = X11DataMessage {
+        let msg = StreamDataMessage {
             connection_id: ConnectionId::new(1),
             sequence_id: 0,
             data: Bytes::new(),
         };
         let frame: Frame = msg.into();
-        assert_eq!(frame.msg_type(), MessageType::DataX11);
+        assert_eq!(frame.msg_type(), MessageType::StreamData);
     }
 
     #[test]

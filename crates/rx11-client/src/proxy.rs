@@ -13,9 +13,9 @@ use tracing::{debug, error};
 
 use rx11_core::config::BufferDefaults;
 use rx11_core::dataplane::DataPlane;
-use rx11_core::protocol::{Frame, X11DisconnectMessage};
+use rx11_core::protocol::{ChannelCloseMessage, Frame};
 use rx11_core::stats::ConnectionStats;
-use rx11_core::types::{ConnectionId, DisplayNumber};
+use rx11_core::types::ConnectionId;
 
 /// Live local X connections: `connection_id -> (write channel, pump task)`.
 pub(crate) type X11ConnMap = HashMap<u32, (mpsc::Sender<bytes::Bytes>, JoinHandle<()>)>;
@@ -35,12 +35,11 @@ pub(crate) struct ProxyDeps<'a> {
     pub local_x11_addr: &'a str,
 }
 
-/// Open the local X server socket for a relayed `X11Connect` and spawn the
+/// Open the local X server socket for a relayed `ChannelOpen` and spawn the
 /// pump task. Connection errors are logged and reported to the relay; only
 /// socket option failures abort the session (matching previous behavior).
 pub(crate) async fn spawn_local_connection(
     conn_id: ConnectionId,
-    display: DisplayNumber,
     deps: &ProxyDeps<'_>,
 ) -> anyhow::Result<()> {
     let local_stream = match TcpStream::connect(deps.local_x11_addr).await {
@@ -50,8 +49,7 @@ pub(crate) async fn spawn_local_connection(
             deps.stats.dec_x11_connections();
             let _ = deps
                 .outbound
-                .send(Frame::X11Disconnect(X11DisconnectMessage {
-                    display,
+                .send(Frame::ChannelClose(ChannelCloseMessage {
                     connection_id: conn_id,
                 }))
                 .await;
@@ -83,8 +81,7 @@ pub(crate) async fn spawn_local_connection(
         pump_local_x11_connection(ctx).await;
 
         let _ = outbound
-            .send(Frame::X11Disconnect(X11DisconnectMessage {
-                display,
+            .send(Frame::ChannelClose(ChannelCloseMessage {
                 connection_id: conn_id,
             }))
             .await;

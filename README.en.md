@@ -37,6 +37,7 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Data compression** — zstd/lz4/zlib with auto-negotiation; payloads over 256 bytes are compressed, falling back to raw when compression does not help
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
 - **Capability negotiation** — incremental/resync/flow-control features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
+- **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11`), kinds *are* capability names, and unknown kinds pass through without parse failures
 - **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
 - **Multiple displays** — Run multiple independent GUI sessions simultaneously with the `-d` flag
@@ -344,13 +345,13 @@ Frame types:
 | SessionDestroy | 0x12 | Destroy session |
 | SessionResume | 0x13 | Resume an existing session |
 | SessionAutoCreate | 0x14 | Auto-assign display and create session |
-| X11Connect | 0x18 | X11 application connection notification |
-| X11Disconnect | 0x19 | X11 application disconnection notification |
-| IncrementalRequestFull | 0x1A | Ask peer to stop diffing and resend full frames (self-heal) |
-| DataX11 | 0x20 | X11 data frame (binary, not JSON) |
-| CompressedDataX11 | 0x21 | Compressed X11 data frame |
-| IncrementalDataX11 | 0x22 | X11 incremental diff frame (binary) |
-| CompressedIncrementalDataX11 | 0x23 | Compressed incremental diff frame |
+| ChannelOpen | 0x18 | Open a multiplexed channel (`kind` + optional `display`) |
+| ChannelClose | 0x19 | Close a channel by id |
+| StreamResyncRequest | 0x1A | Ask peer to stop diffing and resend full frames (self-heal) |
+| StreamData | 0x20 | Channel data frame (binary payload, type-agnostic) |
+| CompressedStreamData | 0x21 | Compressed channel data frame |
+| IncrementalStreamData | 0x22 | Channel incremental diff frame (binary) |
+| CompressedIncrementalStreamData | 0x23 | Compressed incremental diff frame |
 | Heartbeat | 0x30 | Heartbeat (server-initiated) |
 | HeartbeatAck | 0x31 | Heartbeat response |
 | FlowControl | 0x40 | Flow control (reserved; currently logged only) |
@@ -400,9 +401,9 @@ Client                          Server
   │◄── AuthResponse ────────────│
   │─── SessionCreate ──────────►│  (or SessionResume / SessionAutoCreate)
   │◄── SessionAck ──────────────│  (includes session_id)
-  │◄──► X11Connect/Disconnect ──│  (X11 app connect/disconnect notifications)
-  │◄──► DataX11 (bidirectional)►│  (X11 data relay, includes connection_id)
-  │─── IncrementalRequestFull ─►│  (self-heal: request full frames)
+  │◄──► ChannelOpen/Close ────│  (channel open/close, kind=x11)
+  │◄──► StreamData (bidirectional)►│  (X11 data relay, includes connection_id)
+  │─── StreamResyncRequest ────►│  (self-heal: request full frames)
   │◄──► Heartbeat / HeartbeatAck│  (server-driven keepalive)
   │─── SessionDestroy ──────────►│  (optional, explicit destroy)
 ```

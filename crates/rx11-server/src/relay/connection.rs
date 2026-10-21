@@ -217,14 +217,14 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             info!("Session destroyed for display {}", disp);
             RelayAction::Continue
         }
-        Frame::DataX11(msg) => {
+        Frame::StreamData(msg) => {
             ctx.stats.add_bytes_received(msg.data.len() as u64);
             forward_to_x11(ctx, msg.connection_id, msg.data.to_vec()).await
         }
-        Frame::IncrementalRequestFull(msg) => {
+        Frame::StreamResyncRequest(msg) => {
             if !ctx.dataplane.features.supports(Capability::RequestResync) {
                 warn!(
-                    "Client {} sent IncrementalRequestFull but resync capability was not negotiated; ignoring",
+                    "Client {} sent StreamResyncRequest but resync capability was not negotiated; ignoring",
                     ctx.transport_id
                 );
                 return RelayAction::Continue;
@@ -247,7 +247,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             ctx.incremental_cache.clear_connection(msg.connection_id);
             RelayAction::Continue
         }
-        Frame::CompressedDataX11(msg) => {
+        Frame::CompressedStreamData(msg) => {
             if !ctx
                 .session_mgr
                 .owns_connection(msg.connection_id, ctx.transport_id)
@@ -260,7 +260,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 return RelayAction::Continue;
             }
             let Some(algo) = ctx.dataplane.compression else {
-                warn!("CompressedDataX11 received but no compression negotiated, dropping");
+                warn!("CompressedStreamData received but no compression negotiated, dropping");
                 return RelayAction::Continue;
             };
             ctx.stats.add_bytes_received(msg.data.len() as u64);
@@ -301,7 +301,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
     }
 }
 
-/// Ownership-checked plain-data forwarding for the DataX11 path.
+/// Ownership-checked plain-data forwarding for the StreamData path.
 async fn forward_to_x11(
     ctx: &mut RelayContext<'_>,
     connection_id: ConnectionId,
@@ -367,9 +367,10 @@ async fn handle_x11_event(
             ctx.stats.inc_x11_connections();
             send_outbound(
                 ctx.outbound,
-                Frame::X11Connect(X11ConnectMessage {
-                    display,
+                Frame::ChannelOpen(ChannelOpenMessage {
                     connection_id,
+                    kind: ChannelKind::x11(),
+                    display: Some(display),
                 }),
             )
             .await
@@ -389,10 +390,7 @@ async fn handle_x11_event(
             );
             send_outbound(ctx.outbound, frame).await
         }
-        Some(X11ConnToRelay::Disconnected {
-            display,
-            connection_id,
-        }) => {
+        Some(X11ConnToRelay::Disconnected { connection_id, .. }) => {
             ctx.session_mgr
                 .unregister_x11_connection(connection_id)
                 .await;
@@ -400,10 +398,7 @@ async fn handle_x11_event(
             ctx.stats.dec_x11_connections();
             send_outbound(
                 ctx.outbound,
-                Frame::X11Disconnect(X11DisconnectMessage {
-                    display,
-                    connection_id,
-                }),
+                Frame::ChannelClose(ChannelCloseMessage { connection_id }),
             )
             .await
         }
