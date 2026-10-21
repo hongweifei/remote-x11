@@ -325,11 +325,11 @@ After the 60-second grace period expires, the server automatically destroys the 
 rx11 uses a custom binary frame protocol. Each frame:
 
 ```
-┌──────────┬─────────┬──────────┬────────────┬─────────────┐
-│ Magic    │ Version │ Type     │ Length     │ Payload     │
-│ 4 bytes  │ 1 byte  │ 1 byte   │ 4 bytes    │ N bytes     │
-│ RX11     │ (u8=1)  │          │ (BE u32)   │             │
-└──────────┴─────────┴──────────┴────────────┴─────────────┘
+┌──────────┬─────────┬───────────┬────────────┬─────────────┐
+│ Magic    │ Version │ Type      │ Length     │ Payload     │
+│ 4 bytes  │ 1 byte  │ 2 bytes   │ 4 bytes    │ N bytes     │
+│ RX11     │ (u8=1)  │ (BE u16)  │ (BE u32)   │             │
+└──────────┴─────────┴───────────┴────────────┴─────────────┘
 ```
 
 Frame types:
@@ -359,7 +359,7 @@ Frame types:
 
 The current protocol version is **1**, enforced twice: a frame-header version octet and `Hello.version`; any mismatch fails the handshake immediately.
 
-**Tag band convention**: `0x0x` handshake, `0x1x` JSON control frames (session/notify/request), `0x2x` binary data-plane frames (0x24+ reserved), `0x3x` keepalive, `0x4x` flow control, `0xFF` error. A unit test locks "only binary data frames may live in 0x2x", so new frames cannot be mis-banded.
+**Tag band convention**: `0x0x` handshake, `0x1x` JSON control frames (session/notify/request), `0x2x` binary data-plane frames (0x24+ reserved), `0x3x` keepalive, `0x4x` flow control, `0xFF` error. A unit test locks "only binary data frames may live in 0x2x", so new frames cannot be mis-banded. The Type field is **u16** (65536 slots): today's tags all live in the low byte and the high byte is reserved for future major partitions (e.g. per-channel subtype ranges) — the old "max 256 frame types" ceiling is gone.
 
 **Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
 feature names (`incremental`, `request_resync`, `flow_control`, …) and the server

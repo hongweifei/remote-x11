@@ -1,6 +1,7 @@
 //! The [`Frame`] enum, its derive macro and frame-level (de)serialization.
 //!
-//! Frames are `MAGIC(4) || version(1) || type(1) || payload_len(4, BE) || payload`. The
+//! Frames are `MAGIC(4) || version(1) || type(2, BE) || payload_len(4, BE) ||
+//! payload`. The
 //! `define_frame_types!` macro is the single source of truth mapping each
 //! `MessageType` tag to its payload kind (JSON, binary or empty).
 
@@ -51,17 +52,17 @@ macro_rules! define_frame_types {
                                     json.len(), MAX_FRAME_SIZE
                                 )));
                             }
-                            encode_raw(MessageType::$JVar as u8, &json)
+                            encode_raw(MessageType::$JVar as u16, &json)
                         }
                     )*
                     $(
                         Frame::$BVar(msg) => {
                             let payload = < $BPayload as BinaryMessageCodec >::encode_payload(msg)?;
-                            encode_raw(MessageType::$BVar as u8, &payload)
+                            encode_raw(MessageType::$BVar as u16, &payload)
                         }
                     )*
                     $(
-                        Frame::$EVar => encode_raw(MessageType::$EVar as u8, &[]),
+                        Frame::$EVar => encode_raw(MessageType::$EVar as u16, &[]),
                     )*
                 }
             }
@@ -142,7 +143,7 @@ define_frame_types! {
     }
 }
 
-fn encode_raw(msg_type: u8, payload: &[u8]) -> Result<Bytes> {
+fn encode_raw(msg_type: u16, payload: &[u8]) -> Result<Bytes> {
     let len: u32 = payload
         .len()
         .try_into()
@@ -150,7 +151,7 @@ fn encode_raw(msg_type: u8, payload: &[u8]) -> Result<Bytes> {
     let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + payload.len());
     buf.extend_from_slice(&MAGIC_BYTES);
     buf.extend_from_slice(&[WIRE_VERSION]);
-    buf.extend_from_slice(&[msg_type]);
+    buf.extend_from_slice(&msg_type.to_be_bytes());
     buf.extend_from_slice(&len.to_be_bytes());
     buf.extend_from_slice(payload);
     Ok(buf.freeze())
@@ -174,8 +175,8 @@ pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
             wire_version, WIRE_VERSION
         )));
     }
-    let msg_type_byte = data[5];
-    let payload_len = u32::from_be_bytes([data[6], data[7], data[8], data[9]]) as usize;
+    let msg_type = u16::from_be_bytes([data[5], data[6]]);
+    let payload_len = u32::from_be_bytes([data[7], data[8], data[9], data[10]]) as usize;
     if payload_len > MAX_FRAME_SIZE {
         return Err(Rx11Error::Protocol(format!(
             "Frame payload too large: {} bytes (max {})",
@@ -187,7 +188,7 @@ pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
         return Ok(None);
     }
     let payload = &data[FRAME_HEADER_SIZE..total];
-    let msg_type = MessageType::try_from(msg_type_byte)?;
+    let msg_type = MessageType::try_from(msg_type)?;
     let frame = decode_payload(msg_type, payload)?;
     Ok(Some((frame, total)))
 }
@@ -429,7 +430,7 @@ mod tests {
 
     #[test]
     fn test_decode_invalid_magic() {
-        let data = [b'X', b'X', b'X', b'X', 0x01, 0, 0, 0, 0, 0];
+        let data = [b'X', b'X', b'X', b'X', 0x01, 0, 0, 0, 0, 0, 0];
         let result = decode_frame(&data);
         assert!(result.is_err());
     }
@@ -439,7 +440,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
         data.push(WIRE_VERSION);
-        data.push(0xFE);
+        data.extend_from_slice(&0xFEu16.to_be_bytes());
         data.extend_from_slice(&0u32.to_be_bytes());
         let result = decode_frame(&data);
         assert!(result.is_err());
@@ -455,7 +456,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
         data.push(WIRE_VERSION);
-        data.push(0x20);
+        data.extend_from_slice(&0x20u16.to_be_bytes());
         data.extend_from_slice(&4u32.to_be_bytes());
         data.extend_from_slice(&[0, 1, 2, 3, 4]);
         let result = decode_frame(&data);
@@ -467,7 +468,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
         data.push(WIRE_VERSION);
-        data.push(MessageType::Heartbeat as u8);
+        data.extend_from_slice(&(MessageType::Heartbeat as u16).to_be_bytes());
         data.extend_from_slice(&1u32.to_be_bytes());
         data.push(0xFF);
         let result = decode_frame(&data);
@@ -504,8 +505,11 @@ mod tests {
         let encoded = encode_frame(&frame).unwrap();
         assert_eq!(&encoded[0..4], &MAGIC_BYTES);
         assert_eq!(encoded[4], WIRE_VERSION);
-        assert_eq!(encoded[5], MessageType::Heartbeat as u8);
-        assert_eq!(&encoded[6..10], &0u32.to_be_bytes());
+        assert_eq!(
+            &encoded[5..7],
+            &(MessageType::Heartbeat as u16).to_be_bytes()
+        );
+        assert_eq!(&encoded[7..11], &0u32.to_be_bytes());
         assert_eq!(encoded.len(), frame_header_size());
     }
 
@@ -514,7 +518,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(&MAGIC_BYTES);
         data.push(WIRE_VERSION + 9);
-        data.push(MessageType::Heartbeat as u8);
+        data.extend_from_slice(&(MessageType::Heartbeat as u16).to_be_bytes());
         data.extend_from_slice(&0u32.to_be_bytes());
         let err = decode_frame(&data).unwrap_err();
         assert!(

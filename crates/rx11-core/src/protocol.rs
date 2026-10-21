@@ -37,5 +37,10 @@ pub const MAGIC_BYTES: [u8; 4] = *b"RX11";
 pub const DEFAULT_RELAY_PORT: u16 = 7000;
 pub const DEFAULT_X11_PORT: u16 = 6000;
 pub const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
-/// `MAGIC(4) | version(1) | type(1) | payload_len(4 BE)`
-pub const FRAME_HEADER_SIZE: usize = 10;
+/// `MAGIC(4) | version(1) | type(2 BE) | payload_len(4 BE)`
+///
+/// The 16-bit type field keeps the frame table unbounded for practical
+/// purposes (65536 slots; today's allocations all live in the low byte and
+/// the high byte is reserved for future major partitions, e.g. per-channel
+/// subtype ranges).
+pub const FRAME_HEADER_SIZE: usize = 11;

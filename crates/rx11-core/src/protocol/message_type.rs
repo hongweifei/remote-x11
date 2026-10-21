@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Result, Rx11Error};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[repr(u8)]
+#[repr(u16)]
 #[non_exhaustive]
 pub enum MessageType {
     Hello = 0x01,
@@ -61,10 +61,10 @@ impl MessageType {
     ];
 }
 
-impl TryFrom<u8> for MessageType {
+impl TryFrom<u16> for MessageType {
     type Error = Rx11Error;
 
-    fn try_from(value: u8) -> Result<Self> {
+    fn try_from(value: u16) -> Result<Self> {
         match value {
             0x01 => Ok(MessageType::Hello),
             0x02 => Ok(MessageType::HelloAck),
@@ -87,8 +87,7 @@ impl TryFrom<u8> for MessageType {
             0x40 => Ok(MessageType::FlowControl),
             0xFF => Ok(MessageType::Error),
             _ => Err(Rx11Error::Protocol(format!(
-                "Unknown message type: 0x{:02x}",
-                value
+                "Unknown message type: 0x{value:04x}"
             ))),
         }
     }
@@ -144,9 +143,9 @@ mod tests {
         // The 0x20-0x2F band is exclusively binary data-plane payloads;
         // every JSON control/keepalive/error frame lives outside it. This
         // locks the numbering convention for future frame minting.
-        const DATA_BAND: std::ops::RangeInclusive<u8> = 0x20..=0x2F;
+        const DATA_BAND: std::ops::RangeInclusive<u16> = 0x20..=0x2F;
         for mt in MessageType::ALL {
-            let byte = mt as u8;
+            let byte = mt as u16;
             let binary_payload = matches!(
                 mt,
                 MessageType::StreamData
@@ -172,7 +171,7 @@ mod tests {
     #[test]
     fn test_message_type_roundtrip_u8() {
         for mt in MessageType::ALL {
-            let byte = mt as u8;
+            let byte = mt as u16;
             assert_eq!(
                 MessageType::try_from(byte).unwrap(),
                 mt,
