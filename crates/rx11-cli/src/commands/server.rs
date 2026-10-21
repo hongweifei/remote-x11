@@ -1,7 +1,7 @@
 //! `rx11 server` — run the relay server.
 
 use rx11_core::auth::generate_token;
-use rx11_core::config::ServerDefaults;
+use rx11_core::config::{RuntimeConfig, ServerDefaults};
 use rx11_core::protocol::DEFAULT_X11_PORT;
 
 use crate::settings::load_config;
@@ -13,6 +13,10 @@ pub async fn server(
 ) -> anyhow::Result<()> {
     let config = load_config();
     let sc = config.server.unwrap_or_default();
+    let runtime = config
+        .runtime
+        .unwrap_or_default()
+        .to_runtime();
 
     let listen = listen
         .or(sc.listen)
@@ -25,7 +29,7 @@ pub async fn server(
         t
     });
 
-    rx11_server::relay::RelayServer::new(listen, token, x11_port)
+    rx11_server::relay::RelayServer::with_config(listen, token, x11_port, runtime)
         .run()
         .await
         .map_err(Into::into)

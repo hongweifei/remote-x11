@@ -74,7 +74,12 @@ pub async fn ssh(args: SshArgs) -> anyhow::Result<()> {
 
     detect_x11_server(&x11).await;
 
-    let connector = LocalConnector::new(local_addr, token, x11, display, auto_display);
+    let runtime = config
+        .runtime
+        .unwrap_or_default()
+        .to_runtime();
+    let connector = LocalConnector::new(local_addr, token, x11, display, auto_display)
+        .with_runtime(runtime);
 
     /// Which branch ended the session.
     enum SessionEnd {

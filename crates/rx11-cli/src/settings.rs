@@ -2,15 +2,57 @@
 //! template written by `rx11 config init`.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use serde::Deserialize;
 use tracing::{info, warn};
+
+use rx11_core::config::RuntimeConfig;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct Config {
     pub client: Option<ClientConfig>,
     pub server: Option<ServerConfig>,
     pub ssh: Option<SshConfig>,
+    pub runtime: Option<RuntimeFileConfig>,
+}
+
+/// `[runtime]` section: runtime-tunable knobs, seconds-based for readability.
+/// Omitted fields keep the built-in defaults from `rx11_core::config`.
+#[derive(Debug, Default, Deserialize)]
+pub struct RuntimeFileConfig {
+    pub heartbeat_interval_secs: Option<u64>,
+    pub heartbeat_timeout_secs: Option<u64>,
+    pub client_read_timeout_secs: Option<u64>,
+    pub compression_threshold: Option<usize>,
+    pub diff_chunk_size: Option<usize>,
+    pub diff_min_block_size: Option<usize>,
+    pub diff_min_savings_ratio: Option<f64>,
+}
+
+impl RuntimeFileConfig {
+    pub fn to_runtime(&self) -> RuntimeConfig {
+        let defaults = RuntimeConfig::default();
+        let secs = |v: Option<u64>, d: Duration| v.map(Duration::from_secs).unwrap_or(d);
+        RuntimeConfig {
+            heartbeat_interval: secs(self.heartbeat_interval_secs, defaults.heartbeat_interval),
+            heartbeat_timeout: secs(self.heartbeat_timeout_secs, defaults.heartbeat_timeout),
+            client_read_timeout: secs(
+                self.client_read_timeout_secs,
+                defaults.client_read_timeout,
+            ),
+            compression_threshold: self
+                .compression_threshold
+                .unwrap_or(defaults.compression_threshold),
+            diff_chunk_size: self.diff_chunk_size.unwrap_or(defaults.diff_chunk_size),
+            diff_min_block_size: self
+                .diff_min_block_size
+                .unwrap_or(defaults.diff_min_block_size),
+            diff_min_savings_ratio: self
+                .diff_min_savings_ratio
+                .unwrap_or(defaults.diff_min_savings_ratio),
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -60,6 +102,15 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # port = 22
 # user = "myuser"
 # identity = "~/.ssh/id_rsa"
+
+[runtime]
+# heartbeat_interval_secs = 30   # server heartbeat period
+# heartbeat_timeout_secs = 90    # server drops silent clients after this
+# client_read_timeout_secs = 100 # client treats relay silence as death
+# compression_threshold = 256    # payloads below this skip compression
+# diff_chunk_size = 4096         # incremental diff granularity
+# diff_min_block_size = 1024     # frames below this are never diffed
+# diff_min_savings_ratio = 0.1   # min saved fraction to send a diff
 "#;
 
 /// Test helper: serialize every test that touches HOME/USERPROFILE, since
@@ -122,6 +173,8 @@ pub fn load_config() -> Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rx11_core::config::RuntimeConfig;
+    use std::time::Duration;
 
     #[test]
     fn config_template_parses_with_all_sections() {
@@ -129,6 +182,20 @@ mod tests {
         assert!(cfg.client.is_some());
         assert!(cfg.server.is_some());
         assert!(cfg.ssh.is_some());
+        assert!(cfg.runtime.is_some());
+    }
+
+    #[test]
+    fn runtime_section_maps_over_defaults() {
+        let parsed: Config = toml::from_str(
+            "[runtime]\nheartbeat_interval_secs = 5\ncompression_threshold = 128\n",
+        )
+        .unwrap();
+        let rt = parsed.runtime.unwrap().to_runtime();
+        assert_eq!(rt.heartbeat_interval, Duration::from_secs(5));
+        assert_eq!(rt.compression_threshold, 128);
+        // untouched keys keep the built-in defaults
+        assert_eq!(rt.heartbeat_timeout, RuntimeConfig::default().heartbeat_timeout);
     }
 
     #[tokio::test]
