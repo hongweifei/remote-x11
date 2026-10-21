@@ -359,7 +359,9 @@ Frame types:
 
 The current protocol version is **1**, enforced twice: a frame-header version octet and `Hello.version`; any mismatch fails the handshake immediately.
 
-**Tag band convention**: `0x0x` handshake, `0x1x` JSON control frames (session/notify/request), `0x2x` binary data-plane frames (0x24+ reserved), `0x3x` keepalive, `0x4x` flow control, `0xFF` error. A unit test locks "only binary data frames may live in 0x2x", so new frames cannot be mis-banded. The Type field is **u16** (65536 slots): today's tags all live in the low byte and the high byte is reserved for future major partitions (e.g. per-channel subtype ranges) — the old "max 256 frame types" ceiling is gone.
+**Tag band convention**: `0x01-0x0F` handshake, `0x10-0x1F` JSON control (session/channel/resync), `0x20-0x2F` binary data-plane (0x24+ reserved for diff variants), `0x30-0x3F` keepalive, `0x40-0x4F` flow control, `0xF0-0xFF` errors. The Type field is **u16** (65536 slots): every tag allocated today sits in the low byte (pinned by test); `0x0100+` is held in reserve for future major partitions.
+
+Bands are not a gentlemen's agreement — a `TagBand` registry plus a per-band roster test enforce them: **minting a frame requires registering its band and updating that band's expected roster, or CI goes red**, and squatting a tag in no-man's-land (0x05, 0x2C, …) fails the same way.
 
 **Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
 feature names (`incremental`, `request_resync`, `flow_control`, …) and the server

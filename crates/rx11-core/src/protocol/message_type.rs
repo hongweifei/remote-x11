@@ -33,7 +33,49 @@ pub enum MessageType {
     Error = 0xFF,
 }
 
+/// Numbering bands. Every tag must fall into exactly one band, and the
+/// per-band roster test (`test_tag_bands_follow_layout_convention`)
+/// lists expected members, so minting a frame forces an explicit band
+/// decision + roster update instead of silent number squatting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TagBand {
+    /// 0x01-0x0F: connection establishment.
+    Handshake,
+    /// 0x10-0x1F: JSON session, channel and resync control frames.
+    SessionControl,
+    /// 0x20-0x2F: binary data-plane transport shapes (0x24+ reserved).
+    DataPlane,
+    /// 0x30-0x3F: keepalive.
+    Keepalive,
+    /// 0x40-0x4F: flow control (0x41+ reserved).
+    FlowControl,
+    /// 0xF0-0xFF: error and diagnostics.
+    Error,
+    /// Anything else — including the whole high byte, reserved for future
+    /// major partitions (see README band convention).
+    Unassigned,
+}
+
+impl TagBand {
+    pub const fn of(tag: u16) -> TagBand {
+        match tag {
+            0x01..=0x0F => TagBand::Handshake,
+            0x10..=0x1F => TagBand::SessionControl,
+            0x20..=0x2F => TagBand::DataPlane,
+            0x30..=0x3F => TagBand::Keepalive,
+            0x40..=0x4F => TagBand::FlowControl,
+            0xF0..=0xFF => TagBand::Error,
+            _ => TagBand::Unassigned,
+        }
+    }
+}
+
 impl MessageType {
+    pub const fn tag_band(self) -> TagBand {
+        TagBand::of(self as u16)
+    }
+
     /// Every defined tag. Kept in sync with the enum via the exhaustive
     /// `test_message_type_roundtrip_u8` test below.
     #[cfg(test)]
@@ -140,12 +182,59 @@ mod tests {
 
     #[test]
     fn test_tag_bands_follow_layout_convention() {
-        // The 0x20-0x2F band is exclusively binary data-plane payloads;
-        // every JSON control/keepalive/error frame lives outside it. This
-        // locks the numbering convention for future frame minting.
-        const DATA_BAND: std::ops::RangeInclusive<u16> = 0x20..=0x2F;
+        // 1) every tag lands in an assigned band, and each band's roster is
+        //    exactly what is expected here — adding a frame REQUIRES updating
+        //    this list (deliberate review point).
+        let expect: [(TagBand, &[MessageType]); 6] = [
+            (
+                TagBand::Handshake,
+                &[
+                    MessageType::Hello,
+                    MessageType::HelloAck,
+                    MessageType::AuthRequest,
+                    MessageType::AuthResponse,
+                ],
+            ),
+            (
+                TagBand::SessionControl,
+                &[
+                    MessageType::SessionCreate,
+                    MessageType::SessionAck,
+                    MessageType::SessionDestroy,
+                    MessageType::SessionResume,
+                    MessageType::SessionAutoCreate,
+                    MessageType::StreamResyncRequest,
+                    MessageType::ChannelOpen,
+                    MessageType::ChannelClose,
+                ],
+            ),
+            (
+                TagBand::DataPlane,
+                &[
+                    MessageType::StreamData,
+                    MessageType::CompressedStreamData,
+                    MessageType::IncrementalStreamData,
+                    MessageType::CompressedIncrementalStreamData,
+                ],
+            ),
+            (
+                TagBand::Keepalive,
+                &[MessageType::Heartbeat, MessageType::HeartbeatAck],
+            ),
+            (TagBand::FlowControl, &[MessageType::FlowControl]),
+            (TagBand::Error, &[MessageType::Error]),
+        ];
+        for (band, members) in expect {
+            let actual: Vec<MessageType> = MessageType::ALL
+                .into_iter()
+                .filter(|m| m.tag_band() == band)
+                .collect();
+            assert_eq!(actual, members.to_vec(), "roster drift in {band:?}");
+        }
+
+        // 2) the DataPlane band is exactly the binary-payload frames, and
+        //    conversely every binary frame lives there.
         for mt in MessageType::ALL {
-            let byte = mt as u16;
             let binary_payload = matches!(
                 mt,
                 MessageType::StreamData
@@ -153,10 +242,15 @@ mod tests {
                     | MessageType::IncrementalStreamData
                     | MessageType::CompressedIncrementalStreamData
             );
-            assert_eq!(
-                DATA_BAND.contains(&byte),
-                binary_payload,
-                "{mt} misplaced in band"
+            assert_eq!(mt.tag_band() == TagBand::DataPlane, binary_payload, "{mt}");
+        }
+
+        // 3) the high byte stays pristine: everything allocated today is a
+        //    low-byte tag, keeping 0x0100+ free for future major partitions.
+        for mt in MessageType::ALL {
+            assert!(
+                (mt as u16) <= 0xFF,
+                "{mt} leaked into the reserved high byte"
             );
         }
     }

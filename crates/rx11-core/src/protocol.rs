@@ -25,7 +25,7 @@ pub use binary::BinaryMessageCodec;
 pub use capability::{Capability, Features};
 pub use frame::{decode_frame, encode_frame, frame_header_size, Frame};
 pub use handshake::{client_handshake, server_handshake, HandshakeResult};
-pub use message_type::MessageType;
+pub use message_type::{MessageType, TagBand};
 pub use messages::*;
 
 pub const PROTOCOL_VERSION: u32 = 1;
