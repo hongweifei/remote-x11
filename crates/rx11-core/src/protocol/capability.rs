@@ -41,12 +41,18 @@ impl Capability {
     }
 
     pub fn parse(name: &str) -> Option<Capability> {
-        Capability::SUPPORTED.iter().copied().find(|c| c.name() == name)
+        Capability::SUPPORTED
+            .iter()
+            .copied()
+            .find(|c| c.name() == name)
     }
 
     /// Wire list advertised by this build.
     pub fn advertised() -> Vec<String> {
-        Capability::SUPPORTED.iter().map(|c| c.name().to_string()).collect()
+        Capability::SUPPORTED
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect()
     }
 }
 
@@ -68,9 +74,8 @@ pub struct Features {
 impl Features {
     /// Intersection of two advertised lists; unknown names are ignored.
     pub fn negotiate(client: &[String], server: &[String]) -> Features {
-        let declared = |list: &[String], cap: Capability| {
-            list.iter().any(|name| name == cap.name())
-        };
+        let declared =
+            |list: &[String], cap: Capability| list.iter().any(|name| name == cap.name());
         let both = |cap: Capability| declared(client, cap) && declared(server, cap);
         Features {
             request_resync: both(Capability::RequestResync),

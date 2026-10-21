@@ -29,7 +29,12 @@ pub struct RelayServer {
 impl RelayServer {
     /// Relay server with the default runtime profile.
     pub fn new(listen_addr: String, auth_token: String, x11_base_port: u16) -> Self {
-        Self::with_config(listen_addr, auth_token, x11_base_port, RuntimeConfig::default())
+        Self::with_config(
+            listen_addr,
+            auth_token,
+            x11_base_port,
+            RuntimeConfig::default(),
+        )
     }
 
     pub fn with_config(
@@ -105,7 +110,8 @@ impl RelayServer {
         let runtime = self.runtime.clone();
 
         tokio::spawn(async move {
-            let result = handle_client(stream, addr, session_mgr, stats, runtime, &auth_token).await;
+            let result =
+                handle_client(stream, addr, session_mgr, stats, runtime, &auth_token).await;
             conn_counter.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 warn!("Client handler error: {}", e);

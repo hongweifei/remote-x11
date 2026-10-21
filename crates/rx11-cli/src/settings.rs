@@ -37,10 +37,7 @@ impl RuntimeFileConfig {
         RuntimeConfig {
             heartbeat_interval: secs(self.heartbeat_interval_secs, defaults.heartbeat_interval),
             heartbeat_timeout: secs(self.heartbeat_timeout_secs, defaults.heartbeat_timeout),
-            client_read_timeout: secs(
-                self.client_read_timeout_secs,
-                defaults.client_read_timeout,
-            ),
+            client_read_timeout: secs(self.client_read_timeout_secs, defaults.client_read_timeout),
             compression_threshold: self
                 .compression_threshold
                 .unwrap_or(defaults.compression_threshold),
@@ -187,15 +184,17 @@ mod tests {
 
     #[test]
     fn runtime_section_maps_over_defaults() {
-        let parsed: Config = toml::from_str(
-            "[runtime]\nheartbeat_interval_secs = 5\ncompression_threshold = 128\n",
-        )
-        .unwrap();
+        let parsed: Config =
+            toml::from_str("[runtime]\nheartbeat_interval_secs = 5\ncompression_threshold = 128\n")
+                .unwrap();
         let rt = parsed.runtime.unwrap().to_runtime();
         assert_eq!(rt.heartbeat_interval, Duration::from_secs(5));
         assert_eq!(rt.compression_threshold, 128);
         // untouched keys keep the built-in defaults
-        assert_eq!(rt.heartbeat_timeout, RuntimeConfig::default().heartbeat_timeout);
+        assert_eq!(
+            rt.heartbeat_timeout,
+            RuntimeConfig::default().heartbeat_timeout
+        );
     }
 
     #[tokio::test]

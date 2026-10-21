@@ -29,10 +29,7 @@ pub async fn client(
 
     let auto_display = auto.unwrap_or(true) && display.is_none() && cc.display.is_none();
 
-    let runtime = config
-        .runtime
-        .unwrap_or_default()
-        .to_runtime();
+    let runtime = config.runtime.unwrap_or_default().to_runtime();
 
     detect_x11_server(&x11).await;
     LocalConnector::new(relay, token, x11, display, auto_display)

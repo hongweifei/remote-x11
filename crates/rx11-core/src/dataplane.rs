@@ -32,9 +32,7 @@ pub enum InboundOutcome {
     },
     /// A diff could not be applied against our cache: the peer should stop
     /// diffing this connection and resend full frames.
-    ResyncRequired {
-        connection_id: ConnectionId,
-    },
+    ResyncRequired { connection_id: ConnectionId },
     /// Frame unusable (e.g. compressed without a negotiated algorithm);
     /// already logged, nothing to deliver.
     Dropped,
@@ -49,7 +47,11 @@ pub struct DataPlane {
 }
 
 impl DataPlane {
-    pub fn new(features: Features, compression: Option<CompressionAlgo>, runtime: &RuntimeConfig) -> Self {
+    pub fn new(
+        features: Features,
+        compression: Option<CompressionAlgo>,
+        runtime: &RuntimeConfig,
+    ) -> Self {
         Self {
             features,
             compression,
@@ -62,7 +64,12 @@ impl DataPlane {
         algo.compress_with(data, self.compression_threshold)
     }
 
-    fn plain_or_compressed(&self, connection_id: ConnectionId, sequence_id: u32, data: Bytes) -> Frame {
+    fn plain_or_compressed(
+        &self,
+        connection_id: ConnectionId,
+        sequence_id: u32,
+        data: Bytes,
+    ) -> Frame {
         let original_len = data.len();
         if let Some(compressed) = self.compress(&data) {
             return Frame::CompressedDataX11(CompressedX11DataMessage {
@@ -179,7 +186,10 @@ impl DataPlane {
                 let original_len = msg.original_len;
                 let compressed_len = msg.data.len();
                 let Some(diff_bytes) = crate::compress::decompress_frame_data(&msg, algo) else {
-                    tracing::warn!("Incremental decompression failed for {}, dropping frame", conn);
+                    tracing::warn!(
+                        "Incremental decompression failed for {}, dropping frame",
+                        conn
+                    );
                     return InboundOutcome::ResyncRequired {
                         connection_id: conn,
                     };
@@ -191,7 +201,9 @@ impl DataPlane {
                     Ok(msg) => self.apply_diff(msg, cache, stats),
                     Err(e) => {
                         tracing::warn!("Incremental decode failed for {}: {}", conn, e);
-                        InboundOutcome::ResyncRequired { connection_id: conn }
+                        InboundOutcome::ResyncRequired {
+                            connection_id: conn,
+                        }
                     }
                 }
             }
@@ -215,9 +227,12 @@ impl DataPlane {
                 "Incremental data apply failed for {}, requesting full data",
                 conn
             );
-            return InboundOutcome::ResyncRequired { connection_id: conn };
+            return InboundOutcome::ResyncRequired {
+                connection_id: conn,
+            };
         };
-        let saved = total_len.saturating_sub(msg.chunks.iter().map(|c| c.data.len()).sum::<usize>());
+        let saved =
+            total_len.saturating_sub(msg.chunks.iter().map(|c| c.data.len()).sum::<usize>());
         stats.add_incremental_saved(saved as u64);
         let data = Bytes::from(data);
         stats.add_bytes_received(data.len() as u64);
@@ -247,8 +262,9 @@ pub fn record_outbound(stats: &ConnectionStats, frame: &Frame, original_len: usi
             stats.add_bytes_sent(m.data.len() as u64);
             // Two stacked layers: diff-vs-payload, then compression-vs-diff.
             stats.add_incremental_saved(original_len.saturating_sub(m.original_len) as u64);
-            stats
-                .add_incremental_compression_saved(m.original_len.saturating_sub(m.data.len()) as u64);
+            stats.add_incremental_compression_saved(
+                m.original_len.saturating_sub(m.data.len()) as u64
+            );
         }
         _ => {}
     }
@@ -393,7 +409,12 @@ mod tests {
             &mut cache,
             &stats,
         );
-        assert_eq!(outcome, InboundOutcome::ResyncRequired { connection_id: conn() });
+        assert_eq!(
+            outcome,
+            InboundOutcome::ResyncRequired {
+                connection_id: conn()
+            }
+        );
         stats.add_incremental_full_fallback();
         assert!(stats.summary().contains("1 fallbacks"));
     }

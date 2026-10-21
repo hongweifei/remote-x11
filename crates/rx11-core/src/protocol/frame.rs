@@ -495,6 +495,9 @@ mod tests {
         data.push(MessageType::Heartbeat as u8);
         data.extend_from_slice(&0u32.to_be_bytes());
         let err = decode_frame(&data).unwrap_err();
-        assert!(err.to_string().contains("Unsupported protocol version"), "{err}");
+        assert!(
+            err.to_string().contains("Unsupported protocol version"),
+            "{err}"
+        );
     }
 }

@@ -113,9 +113,11 @@ async fn request_full_resend(ctx: &mut ServeCtx<'_>, conn_id: ConnectionId) {
     let _ = ctx
         .proxy
         .outbound
-        .send(Frame::IncrementalRequestFull(IncrementalRequestFullMessage {
-            connection_id: conn_id,
-        }))
+        .send(Frame::IncrementalRequestFull(
+            IncrementalRequestFullMessage {
+                connection_id: conn_id,
+            },
+        ))
         .await;
 }
 
@@ -157,8 +159,8 @@ mod tests {
     use rx11_core::config::RuntimeConfig;
     use rx11_core::protocol::{
         BinaryMessageCodec, CompressedIncrementalX11DataMessage, CompressedX11DataMessage,
-        Features, HelloAckMessage, IncrementalChunk, IncrementalX11DataMessage, PROTOCOL_VERSION,
-        X11DataMessage, X11DisconnectMessage,
+        Features, HelloAckMessage, IncrementalChunk, IncrementalX11DataMessage, X11DataMessage,
+        X11DisconnectMessage, PROTOCOL_VERSION,
     };
     use rx11_core::stats::ConnectionStats;
     use rx11_core::transport::{Rx11Transport, Rx11TransportWriteHalf};
@@ -193,9 +195,11 @@ mod tests {
             let (_peer, _) = listener.accept().await.unwrap();
             let (read_half, write_half) = Rx11Transport::new(client).split();
             let (tx, rx) = mpsc::channel(16);
-            let mut features = Features::default();
-            features.incremental = true;
-            features.request_resync = true;
+            let features = Features {
+                incremental: true,
+                request_resync: true,
+                ..Default::default()
+            };
             Self {
                 read_half,
                 _write_half: write_half,
@@ -434,9 +438,10 @@ mod tests {
     async fn diff_disabled_ignores_incremental_frames() {
         // Peer sends diffs we never negotiated: dropped defensively.
         let mut h = Harness::new(None).await;
-        let mut dp_features = Features::default();
-        dp_features.request_resync = true; // no Incremental bit
-        h.dataplane.features = dp_features;
+        h.dataplane.features = Features {
+            request_resync: true, // intentionally no Incremental bit
+            ..Default::default()
+        };
         let _rx = h.register_local(conn(11)).await;
         {
             let mut ctx = h.ctx();

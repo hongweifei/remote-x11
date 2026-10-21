@@ -15,6 +15,7 @@ use crate::protocol::{
 use crate::transport::Rx11Transport;
 use crate::types::{SessionId, Token};
 
+#[derive(Debug)]
 pub struct HandshakeResult {
     pub session_id: SessionId,
     pub compression: Option<CompressionAlgo>,
@@ -39,6 +40,21 @@ fn failed_hello_ack(error_msg: String) -> Frame {
     })
 }
 
+/// One handshake read: a timeout reports the expected frame name, any other
+/// transport error (bad frame, closed connection) is surfaced verbatim.
+async fn recv_handshake_frame<S: AsyncRead + AsyncWrite + Unpin>(
+    transport: &mut Rx11Transport<S>,
+    timeout: Duration,
+    expecting: &str,
+) -> Result<Frame> {
+    match tokio::time::timeout(timeout, transport.recv_frame()).await {
+        Ok(result) => result,
+        Err(_) => Err(Rx11Error::Protocol(format!(
+            "Handshake timed out waiting for {expecting}"
+        ))),
+    }
+}
+
 /// Server side of the handshake: validate Hello, negotiate compression, then
 /// verify the client's auth token.
 pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
@@ -46,10 +62,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     auth_token: &str,
     timeout: Duration,
 ) -> Result<HandshakeResult> {
-    let hello_frame = tokio::time::timeout(timeout, transport.recv_frame())
-        .await
-        .map_err(|_| Rx11Error::Timeout)?
-        .map_err(|_| Rx11Error::Protocol("Handshake timed out waiting for Hello".into()))?;
+    let hello_frame = recv_handshake_frame(transport, timeout, "Hello").await?;
 
     let hello = match hello_frame {
         Frame::Hello(h) => h,
@@ -96,10 +109,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         }))
         .await?;
 
-    let auth_frame = tokio::time::timeout(timeout, transport.recv_frame())
-        .await
-        .map_err(|_| Rx11Error::Timeout)?
-        .map_err(|_| Rx11Error::Protocol("Handshake timed out waiting for AuthRequest".into()))?;
+    let auth_frame = recv_handshake_frame(transport, timeout, "AuthRequest").await?;
 
     match auth_frame {
         Frame::AuthRequest(auth_req) => {
@@ -155,10 +165,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         }))
         .await?;
 
-    let ack = tokio::time::timeout(timeout, transport.recv_frame())
-        .await
-        .map_err(|_| Rx11Error::Timeout)?
-        .map_err(|_| Rx11Error::Protocol("Handshake timed out waiting for HelloAck".into()))?;
+    let ack = recv_handshake_frame(transport, timeout, "HelloAck").await?;
 
     let hello_ack = match ack {
         Frame::HelloAck(h) => h,
@@ -185,10 +192,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         }))
         .await?;
 
-    let auth_resp = tokio::time::timeout(timeout, transport.recv_frame())
-        .await
-        .map_err(|_| Rx11Error::Timeout)?
-        .map_err(|_| Rx11Error::Protocol("Handshake timed out waiting for AuthResponse".into()))?;
+    let auth_resp = recv_handshake_frame(transport, timeout, "AuthResponse").await?;
 
     match auth_resp {
         Frame::AuthResponse(resp) => {

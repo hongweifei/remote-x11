@@ -139,9 +139,7 @@ fn decompress_zlib(compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{
-        CompressedIncrementalX11DataMessage, CompressedX11DataMessage,
-    };
+    use crate::protocol::{CompressedIncrementalX11DataMessage, CompressedX11DataMessage};
     use crate::types::ConnectionId;
 
     #[test]
