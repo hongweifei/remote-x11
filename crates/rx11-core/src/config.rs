@@ -8,6 +8,7 @@ pub struct ClientDefaults;
 pub struct SshDefaults;
 pub struct BufferDefaults;
 pub struct IncrementalDefaults;
+pub struct FlowDefaults;
 
 impl ServerDefaults {
     /// Default relay listen address (`IP:PORT`).
@@ -87,6 +88,26 @@ impl IncrementalDefaults {
     pub const MIN_SAVINGS_RATIO: f64 = 0.1;
 }
 
+impl FlowDefaults {
+    /// Pause the bulk pump once this many bytes sit accepted-but-not-consumed
+    /// on one channel. The byte-budgeted outbound queue already holds
+    /// `outbound_queue_bytes` ahead of this gauge, so the total display lag
+    /// stays bounded by (queue + this) / link rate — 2 MiB on top of 1 MiB
+    /// is ~8 s at 3 Mbit/s, past which waiting longer only replays stale
+    /// pixels while the producing app freezes anyway.
+    pub const PAUSE_BYTES: usize = 2 * 1024 * 1024;
+    /// Resume once the backlog drains below this. The band between the two
+    /// watermarks is the hysteresis that keeps a redraw burst from
+    /// oscillating the wire state.
+    pub const RESUME_BYTES: usize = 256 * 1024;
+    /// How often held flow state is re-advertised on the priority lane (see
+    /// [`crate::flow::Advertiser`]): the lane drops when full, and a lost
+    /// `Resume` must not strand a paused channel.
+    pub const ADVERTISE_TICK: Duration = Duration::from_secs(2);
+    /// How many ticks a `Resume` is repeated after its edge, then silence.
+    pub const RESUME_RETRANSMITS: u8 = 8;
+}
+
 /// Runtime-tunable knobs, threaded from the CLI config file (`[runtime]`
 /// section) into server and client. Defaults match the compile-time
 /// constants above; new tunables are added here rather than at call sites.
@@ -132,6 +153,19 @@ pub struct RuntimeConfig {
     /// Override the player argv (e.g. `["paplay", "--raw", ...]`). `None`
     /// auto-detects `paplay` (PulseAudio and PipeWire both ship it).
     pub audio_play_command: Option<Vec<String>>,
+    /// Per-channel bulk flow control (`FlowControl` capability). ON by
+    /// default: a stalled consumer advertises `Pause` and the producing
+    /// pump stops reading, freezing the application in `write()` instead of
+    /// parking stale pixels down the pipe. Control frames and the audio
+    /// real-time lane are never gated. Set `false` on either end to fall
+    /// back to pure transport-level backpressure (byte-budgeted queue).
+    pub flow_control: bool,
+    /// Pause watermark: accepted-but-not-consumed bytes on one channel at
+    /// which a `Pause` is advertised (see [`FlowDefaults::PAUSE_BYTES`]).
+    pub flow_pause_bytes: usize,
+    /// Resume watermark, the hysteresis floor below
+    /// [`flow_pause_bytes`][Self::flow_pause_bytes].
+    pub flow_resume_bytes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -154,6 +188,9 @@ impl Default for RuntimeConfig {
             audio_bitrate_kbps: crate::audio::DEFAULT_BITRATE_KBPS,
             audio_record_command: None,
             audio_play_command: None,
+            flow_control: true,
+            flow_pause_bytes: FlowDefaults::PAUSE_BYTES,
+            flow_resume_bytes: FlowDefaults::RESUME_BYTES,
         }
     }
 }

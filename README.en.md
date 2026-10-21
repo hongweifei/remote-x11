@@ -38,8 +38,9 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **WAN queue discipline** — the outbound queue towards the relay is capped by **in-flight bytes** (default 1 MB), not frame count, so a 3 Mbit/s link never accumulates minutes of bufferbloat; an optional `SO_SNDBUF` cap tames the kernel buffer too
 - **Image re-encoding (on by default)** — the `x11_recode` capability recognizes large core `PutImage` requests (ZPixmap, depth 24/32) and ships them as JPEG (lossy, 10–50× smaller) or lossless PNG on the wire; the client re-expands them into the original request bytes before the local X server sees anything. Non-image traffic passes byte-for-byte. On by default with the **lossless** PNG tier; either end setting `image_recode = false` forces byte-for-byte passthrough, and the lossy JPEG tier only exists as an explicit `image_recode_codec = "jpeg"` choice. Honest edge: GL-rendered video and Xv extension paths are out of recognition scope — that's framebuffer territory (Xpra/x2go), not a transparent forwarder's
 - **Desktop audio forwarding (on by default)** — the `audio` channel: the server captures its default output sink's monitor, encodes with Opus (**pure-Rust** port, 48 kHz stereo, no system library build requirements) and streams it on the **real-time priority lane**; the client decodes and feeds `paplay`. The capture is **shared process-wide** — one recorder and one encoder fanned out to every client: N clients never spawn N `parec`s, late joiners pick up at the next packet, and the recorder stops itself when the last listener leaves. 64 kbit/s ≈ 2% of a 3 Mbit/s link; the lane bypasses the outbound byte budget, so audio latency under an image flood is bounded by one write chunk. On by default; `audio_forward = false` on either end disables it, and endpoints without a capture/playback stack (parec/paplay) degrade to silence without touching the session. Honest edge: playback only — no microphone back-channel, no lip sync
+- **Per-channel flow control (on by default)** — the `flow_control` capability: when a receiver's accepted-but-unconsumed backlog crosses the watermark (default 2 MB), it advertises `Pause` for that channel (`connection_id` granularity, each leg gauged separately); the sender's bulk pump stops reading its source socket, so the stall retreats into kernel buffers and the producing application's own `write()` — lossless by construction, not one byte discarded. Draining below the low watermark (default 256 KB) advertises `Resume`. Flow-control frames ride the **real-time priority lane** and are re-advertised periodically: the signal never queues behind a redraw burst, and a lane drop self-heals by the next re-advertisement; control frames and the audio lane are never gated. A channel congested in both directions at once gates only the uplink — the downlink advertisement yields, because gating both legs freezes an X11 conversation while deferring fresh requests never does. Either end setting `flow_control = false` returns the chain to plain transport-level backpressure (the byte-budgeted queue)
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
-- **Capability negotiation** — incremental/resync/flow-control features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
+- **Capability negotiation** — incremental/resync/flow-control/recode/audio features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
 - **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11` and `audio`), kinds *are* capability names, and unknown kinds pass through without parse failures
 - **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
@@ -255,6 +256,9 @@ Priority: **CLI args > env vars > config file > defaults**
 # audio_bitrate_kbps = 64           Opus bitrate (32 = speech-grade, 64 ≈ transparent)
 # audio_record_command = []         override recorder argv (default parec; ships with PulseAudio AND PipeWire)
 # audio_play_command = []           override player argv (default paplay --raw)
+# flow_control = true               per-channel flow control switch (default on; false = transport backpressure only)
+# flow_pause_bytes = 2097152        high watermark: unconsumed backlog per channel that triggers Pause
+# flow_resume_bytes = 262144        low watermark: drain level that triggers Resume
 ```
 
 On slow links (a 3 Mbit/s VPS running Xfce, say) set the last two explicitly:
@@ -372,7 +376,7 @@ Frame types:
 | CompressedIncrementalStreamData | 0x23 | Compressed incremental diff frame |
 | Heartbeat | 0x30 | Heartbeat (server-initiated) |
 | HeartbeatAck | 0x31 | Heartbeat response |
-| FlowControl | 0x40 | Flow control (reserved; currently logged only) |
+| FlowControl | 0x40 | Per-channel bulk Pause/Resume (rides the real-time lane) |
 | Error | 0xFF | Error |
 
 The current protocol version is **1**, enforced twice: a frame-header version octet and `Hello.version`; any mismatch fails the handshake immediately.

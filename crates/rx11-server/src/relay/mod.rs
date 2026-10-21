@@ -54,6 +54,12 @@ impl RelayServer {
         }
     }
 
+    /// Handle to the process-wide connection stats (flow-control counters
+    /// and traffic totals) for tests and monitoring.
+    pub fn stats(&self) -> Arc<ConnectionStats> {
+        self.stats.clone()
+    }
+
     pub async fn run(&self) -> rx11_core::error::Result<()> {
         let listener = tokio::net::TcpListener::bind(&self.listen_addr).await?;
         info!("Relay server listening on {}", self.listen_addr);
@@ -61,6 +67,7 @@ impl RelayServer {
         let x11_listener = Arc::new(X11Listener::new(
             self.x11_base_port,
             self.session_mgr.clone(),
+            self.runtime.clone(),
         ));
         self.session_mgr.set_x11_listener(x11_listener).await;
 

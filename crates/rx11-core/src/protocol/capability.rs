@@ -21,8 +21,13 @@ pub enum Capability {
     RequestResync,
     /// Sender may emit `IncrementalStreamData` / `CompressedIncrementalStreamData`.
     Incremental,
-    /// Reserved: `FlowControl` semantics are not implemented yet; the bit
-    /// exists so enabling it later does not require a wire change.
+    /// Per-channel bulk pause/resume (`FlowControl` frames): a stalled
+    /// consumer asks the sender to stop delivering x11 data for one
+    /// `connection_id`, and the sender's pump stops reading the producing
+    /// socket. Control frames and the audio real-time lane are exempt.
+    /// Advertised by default; either peer opts OUT with
+    /// `[runtime] flow_control = false`, falling back to pure
+    /// transport-level backpressure.
     FlowControl,
     /// The `x11` channel kind may be opened via `ChannelOpen`. Channel kinds
     /// are capabilities: unknown names are ignored, so a future clipboard or
@@ -43,8 +48,9 @@ pub enum Capability {
 }
 
 impl Capability {
-    /// What this build can actually do. `FlowControl` is advertised but
-    /// both sides must ignore its effect until semantics are decided.
+    /// What this build can actually do. Every capability here is fully
+    /// implemented; the gated ones ride default-ON with per-end kill
+    /// switches in `advertised_for`.
     pub const SUPPORTED: [Capability; 6] = [
         Capability::RequestResync,
         Capability::Incremental,
@@ -80,16 +86,18 @@ impl Capability {
             .collect()
     }
 
-    /// Advertised list honoring the per-endpoint kill switches: recode and
-    /// audio ride by default (their default tiers are lossless / harmless),
-    /// and an explicit `false` in `[runtime]` removes the name from the
-    /// wire — a peer that disabled a capability can never be talked into it.
+    /// Advertised list honoring the per-endpoint kill switches: recode,
+    /// audio and flow control ride by default (their default tiers are
+    /// lossless / harmless), and an explicit `false` in `[runtime]` removes
+    /// the name from the wire — a peer that disabled a capability can never
+    /// be talked into it.
     pub fn advertised_for(runtime: &crate::config::RuntimeConfig) -> Vec<String> {
         Capability::SUPPORTED
             .iter()
             .filter(|c| match c {
                 Capability::X11Recode => runtime.image_recode,
                 Capability::AudioForward => runtime.audio_forward,
+                Capability::FlowControl => runtime.flow_control,
                 _ => true,
             })
             .map(|c| c.name().to_string())
@@ -180,6 +188,10 @@ mod tests {
         let def = Capability::advertised_for(&RuntimeConfig::default());
         assert!(def.iter().any(|c| c == "x11_recode"), "recode default-on");
         assert!(def.iter().any(|c| c == "audio_forward"), "audio default-on");
+        assert!(
+            def.iter().any(|c| c == "flow_control"),
+            "flow control default-on"
+        );
         // Kill switches are independent, and a peer that disabled a
         // capability can never be talked into it by the other side:
         let recode_off = Capability::advertised_for(&RuntimeConfig {
@@ -194,9 +206,18 @@ mod tests {
         });
         assert!(audio_off.iter().any(|c| c == "x11_recode"));
         assert!(!audio_off.iter().any(|c| c == "audio_forward"));
+        let flow_off = Capability::advertised_for(&RuntimeConfig {
+            flow_control: false,
+            ..RuntimeConfig::default()
+        });
+        assert!(!flow_off.iter().any(|c| c == "flow_control"));
+        assert!(flow_off.iter().any(|c| c == "x11_recode"));
         let f = Features::negotiate(&def, &recode_off);
         assert!(!f.supports(Capability::X11Recode));
         assert!(f.supports(Capability::AudioForward));
+        let f = Features::negotiate(&def, &flow_off);
+        assert!(!f.supports(Capability::FlowControl));
+        assert!(f.supports(Capability::X11Recode));
     }
 
     #[test]

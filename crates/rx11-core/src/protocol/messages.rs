@@ -199,6 +199,10 @@ pub struct ChannelCloseMessage {
     pub connection_id: ConnectionId,
 }
 
+/// Bulk flow-control edge. `Pause` means "stop delivering bulk X11 bytes to
+/// me": the receiver has accepted them but its final consumer (local X
+/// server, or the application socket on the other leg) is stalled. Control
+/// frames and the audio real-time lane are exempt from any pause.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum FlowControlAction {
@@ -206,6 +210,9 @@ pub enum FlowControlAction {
     Resume = 1,
 }
 
+/// One channel's flow state. `connection_id: None` is the bulk-scope form:
+/// receivers apply it to every x11 channel they currently hold (a sender
+/// never emits it — per-channel is the protocol).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowControlMessage {
     pub action: FlowControlAction,

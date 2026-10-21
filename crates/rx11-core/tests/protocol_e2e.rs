@@ -93,6 +93,8 @@ async fn handshake_negotiates_all_capabilities_and_compression() {
     // the stock RuntimeConfig — the kill switches are `= false`, not opt-in.
     assert!(features.supports(Capability::X11Recode));
     assert!(features.supports(Capability::AudioForward));
+    // Flow control went from reserved to real: default-on as well.
+    assert!(features.supports(Capability::FlowControl));
     // The best mutual algorithm wins — cross-frame streaming zstd since the
     // WAN round (it negotiates ahead of one-shot `zstd`).
     assert_eq!(compression, Some(CompressionAlgo::ZstdStream));

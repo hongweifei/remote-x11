@@ -7,10 +7,12 @@ use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 
-use rx11_core::config::{BufferDefaults, ServerDefaults};
+use rx11_core::config::{BufferDefaults, RuntimeConfig, ServerDefaults};
+use rx11_core::flow::{EgressGate, FlowMeter};
+use rx11_core::protocol::{FlowControlAction, FlowControlMessage, Frame};
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
-use crate::session::{SessionManager, X11ConnToRelay, X11DisplayBinder, X11RelayToConn};
+use crate::session::{ConnFlow, SessionManager, X11ConnToRelay, X11DisplayBinder, X11RelayToConn};
 
 /// Delay between polls waiting for the relay task to register a display.
 const RELAY_REGISTER_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
@@ -32,14 +34,16 @@ pub(crate) fn next_connection_id() -> ConnectionId {
 pub struct X11Listener {
     base_port: u16,
     session_mgr: Arc<SessionManager>,
+    runtime: RuntimeConfig,
     listeners: Arc<RwLock<HashMap<u16, JoinHandle<()>>>>,
 }
 
 impl X11Listener {
-    pub fn new(base_port: u16, session_mgr: Arc<SessionManager>) -> Self {
+    pub fn new(base_port: u16, session_mgr: Arc<SessionManager>, runtime: RuntimeConfig) -> Self {
         Self {
             base_port,
             session_mgr,
+            runtime,
             listeners: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -56,6 +60,7 @@ impl X11Listener {
         info!("X11 listening on port {} (display :{})", port, disp);
 
         let session_mgr = self.session_mgr.clone();
+        let runtime = self.runtime.clone();
         let disp_num = DisplayNumber::new(disp).unwrap_or(DisplayNumber::UNSPECIFIED);
 
         let handle = tokio::spawn(async move {
@@ -64,8 +69,11 @@ impl X11Listener {
                     Ok((stream, addr)) => {
                         info!("X11 connection on display {} from {}", disp_num, addr);
                         let mgr = session_mgr.clone();
+                        let runtime = runtime.clone();
                         tokio::spawn(async move {
-                            if let Err(e) = handle_x11_connection(stream, disp_num, mgr).await {
+                            if let Err(e) =
+                                handle_x11_connection(stream, disp_num, mgr, runtime).await
+                            {
                                 warn!("X11 connection error on display {}: {}", disp_num, e);
                             }
                         });
@@ -112,27 +120,43 @@ async fn handle_x11_connection(
     x11_stream: TcpStream,
     disp: DisplayNumber,
     session_mgr: Arc<SessionManager>,
+    runtime: RuntimeConfig,
 ) -> anyhow::Result<()> {
     x11_stream.set_nodelay(true)?;
 
     let connection_id = next_connection_id();
 
-    let (event_tx, recode) = tokio::time::timeout(ServerDefaults::HANDSHAKE_TIMEOUT, async {
-        loop {
-            if let Some(ingress) = session_mgr.get_x11_relay_ingress(disp).await {
-                return Ok::<_, std::convert::Infallible>(ingress);
+    let (event_tx, recode, relay_outbound) =
+        tokio::time::timeout(ServerDefaults::HANDSHAKE_TIMEOUT, async {
+            loop {
+                if let Some(ingress) = session_mgr.get_x11_relay_ingress(disp).await {
+                    return Ok::<_, std::convert::Infallible>(ingress);
+                }
+                tokio::time::sleep(RELAY_REGISTER_RETRY).await;
             }
-            tokio::time::sleep(RELAY_REGISTER_RETRY).await;
-        }
-    })
-    .await
-    .map_err(|_| anyhow::anyhow!("Timed out waiting for relay for display {}", disp))?
-    .unwrap();
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("Timed out waiting for relay for display {}", disp))?
+        .unwrap();
 
     let (relay_tx, mut relay_rx) =
         tokio::sync::mpsc::channel::<X11RelayToConn>(BufferDefaults::CHANNEL_BUFFER);
+    // Flow handles for this channel: the uplink gauge is charged by the
+    // relay at delivery and discharged here after the app write completes;
+    // the egress latch is flipped by the relay when the client advertises
+    // a downlink pause and stops us from reading the app socket below.
+    let egress = EgressGate::new();
+    let upmeter = FlowMeter::from_runtime(&runtime);
     session_mgr
-        .register_x11_connection(connection_id, disp, relay_tx)
+        .register_x11_connection(
+            connection_id,
+            disp,
+            relay_tx,
+            ConnFlow {
+                upmeter: Arc::clone(&upmeter),
+                egress: Arc::clone(&egress),
+            },
+        )
         .await?;
 
     if event_tx
@@ -149,7 +173,7 @@ async fn handle_x11_connection(
 
     let (mut read_half, write_half) = tokio::io::split(x11_stream);
     let event_tx_clone = event_tx.clone();
-
+    let flow_tx = event_tx.clone();
     let socket_to_relay = async move {
         // BytesMut accumulation: the kernel copy lands directly in the
         // buffer that becomes the frame payload (`split().freeze()` is a
@@ -161,6 +185,13 @@ async fn handle_x11_connection(
         let mut machine = recode.map(rx11_core::x11recode::DownstreamReencoder::new);
         let mut units: Vec<bytes::Bytes> = Vec::new();
         loop {
+            // Flow control enforcement (downlink): while the client has
+            // this channel paused, stop reading the application socket.
+            // Queued bytes keep flowing — a pause defers future reads only,
+            // it never discards — and the stall settles into kernel buffers
+            // and finally the app's own `write()`, the lossless place to
+            // wait. Overshoot is bounded by the one chunk already in flight.
+            egress.wait_open().await;
             let want = (buf.capacity() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
             if buf.capacity() < want {
                 buf.reserve(want - buf.capacity());
@@ -212,10 +243,32 @@ async fn handle_x11_connection(
         while let Some(cmd) = relay_rx.recv().await {
             match cmd {
                 X11RelayToConn::Data(data) => {
+                    let len = data.len();
                     if write_half.write_all(&data).await.is_err()
                         || write_half.flush().await.is_err()
                     {
                         break;
+                    }
+                    // The backlog handed fully to the app socket: release
+                    // the uplink gauge. A resume edge must NEVER await a
+                    // shared channel — this pump is the only drain for the
+                    // uplink backlog, and the relay task it reports to may
+                    // itself be blocked (that is how a naive design
+                    // deadlocks full-duplex bulk). So: fire the frame onto
+                    // the priority lane immediately, and the state-machine
+                    // bookkeeping rides a try_send whose loss the relay's
+                    // tick reconciles against the gauge itself.
+                    if upmeter.discharge(len) {
+                        let _ =
+                            relay_outbound.send_priority(Frame::FlowControl(FlowControlMessage {
+                                action: FlowControlAction::Resume,
+                                connection_id: Some(connection_id),
+                            }));
+                        let _ = flow_tx.try_send(X11ConnToRelay::Congested {
+                            display: disp,
+                            connection_id,
+                            action: FlowControlAction::Resume,
+                        });
                     }
                 }
                 X11RelayToConn::Close => break,

@@ -12,6 +12,7 @@ use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
 use rx11_core::config::ServerDefaults;
+use rx11_core::flow::{EgressGate, FlowMeter};
 use rx11_core::types::{ConnectionId, DisplayNumber, SessionId};
 use rx11_core::x11recode::RecodeSpec;
 
@@ -37,12 +38,31 @@ pub struct Session {
     pub client_id: String,
 }
 
-/// Sink + optional protocol-recode policy for one display's relay leg.
-type RelayIngress = (mpsc::Sender<X11ConnToRelay>, Option<RecodeSpec>);
+/// Sink + optional protocol-recode policy + the relay's outbound handle
+/// (the real-time lane is how pumps report resume edges without waiting
+/// for the data path to come unblocked) for one display's relay leg.
+type RelayIngress = (
+    mpsc::Sender<X11ConnToRelay>,
+    Option<RecodeSpec>,
+    rx11_core::queue::OutboundSender,
+);
+
+/// Per-channel flow-control handles, created by the X11 listener pump and
+/// shared with the relay task through the registry:
+/// - `upmeter` gauges bytes delivered into the app channel that the pump
+///   has not yet written to the application socket (receiver side of the
+///   uplink leg);
+/// - `egress` is the latch the app-reading pump awaits (enforcement side
+///   of the downlink leg, driven by the client's advertised pauses).
+pub struct ConnFlow {
+    pub upmeter: Arc<FlowMeter>,
+    pub egress: Arc<EgressGate>,
+}
 
 struct ConnState {
     display: DisplayNumber,
     sender: mpsc::Sender<X11RelayToConn>,
+    flow: Arc<ConnFlow>,
 }
 
 /// Lock ordering (always acquire in this order to prevent deadlock):
@@ -329,11 +349,12 @@ impl SessionManager {
         disp: DisplayNumber,
         sender: mpsc::Sender<X11ConnToRelay>,
         recode: Option<RecodeSpec>,
+        outbound: rx11_core::queue::OutboundSender,
     ) {
         self.conn_to_relay
             .write()
             .await
-            .insert(disp.get(), (sender, recode));
+            .insert(disp.get(), (sender, recode, outbound));
     }
 
     pub async fn unregister_x11_relay(&self, disp: DisplayNumber) {
@@ -349,6 +370,7 @@ impl SessionManager {
         conn_id: ConnectionId,
         disp: DisplayNumber,
         sender: mpsc::Sender<X11RelayToConn>,
+        flow: ConnFlow,
     ) -> rx11_core::error::Result<()> {
         let conn_val = conn_id.get();
         let disp_val = disp.get();
@@ -368,6 +390,7 @@ impl SessionManager {
             ConnState {
                 display: disp,
                 sender,
+                flow: Arc::new(flow),
             },
         );
         self.display_conns
@@ -388,46 +411,91 @@ impl SessionManager {
         }
     }
 
-    pub async fn send_to_x11_connection(&self, conn_id: ConnectionId, data: bytes::Bytes) {
-        if let Some(state) = self.connections.lock().await.get(&conn_id.get()) {
-            if state.sender.send(X11RelayToConn::Data(data)).await.is_err() {
-                warn!(
-                    "Failed to send data to x11 connection {}, channel full or closed",
-                    conn_id
-                );
-            }
-        }
-    }
-
-    /// Ownership-checked delivery in a single session-manager lookup: verify
-    /// `client_id` owns the connection's display, then hand the payload to
-    /// that X11 connection. Returns false for unknown or foreign-owned
-    /// connections (the caller logs).
-    pub async fn deliver_to_x11(
+    /// Route payload toward an X11 connection WITHOUT awaiting its channel:
+    /// the caller charges the uplink gauge and advertises any pause edge on
+    /// the real-time lane BEFORE awaiting the enqueue. Awaiting first would
+    /// hide exactly the congestion the advertisement exists to cure — and
+    /// can deadlock full-duplex bulk, because the only drain of this
+    /// channel is the very pump the advertisement is meant to unblock.
+    /// `None` for unknown or foreign-owned connections (the caller logs);
+    /// ownership is settled before anything is charged, so denied traffic
+    /// never touches the receiver's gauge.
+    pub async fn route_to_x11(
         &self,
         conn_id: ConnectionId,
         client_id: &str,
-        data: bytes::Bytes,
-    ) -> bool {
+    ) -> Option<(mpsc::Sender<X11RelayToConn>, Arc<ConnFlow>)> {
         let route = {
             let conns = self.connections.lock().await;
             conns
                 .get(&conn_id.get())
-                .map(|state| (state.display, state.sender.clone()))
+                .map(|state| (state.display, state.sender.clone(), state.flow.clone()))
         };
-        let Some((display, sender)) = route else {
-            return false;
-        };
+        let (display, sender, flow) = route?;
         if !self.owns_session(display, client_id).await {
-            return false;
+            return None;
         }
-        if sender.send(X11RelayToConn::Data(data)).await.is_err() {
-            warn!(
-                "Failed to send data to x11 connection {}, channel full or closed",
-                conn_id
-            );
+        Some((sender, flow))
+    }
+
+    /// The downlink enforcement latch for one channel (the app-reading pump
+    /// awaits it). `None` when the channel is unknown.
+    pub async fn egress_gate(&self, conn_id: ConnectionId) -> Option<Arc<EgressGate>> {
+        self.connections
+            .lock()
+            .await
+            .get(&conn_id.get())
+            .map(|s| s.flow.egress.clone())
+    }
+
+    /// Ground truth for the advertisement tick: is this channel's uplink
+    /// gauge still actually congested? A resume edge reported on the
+    /// priority lane can be dropped when that lane is full; the ticker
+    /// reconciles stale advertisements against this.
+    pub async fn upmeter_latched(&self, conn_id: ConnectionId) -> bool {
+        self.connections
+            .lock()
+            .await
+            .get(&conn_id.get())
+            .is_some_and(|s| s.flow.upmeter.latched())
+    }
+
+    /// Every channel currently multiplexed for `client_id` — the fan-out
+    /// surface for a scope-less (`connection_id: None`) pause.
+    pub async fn connection_ids_for_client(&self, client_id: &str) -> Vec<ConnectionId> {
+        let conns = self.connections.lock().await;
+        let sessions = self.sessions.read().await;
+        conns
+            .iter()
+            .filter(|(_, state)| {
+                sessions
+                    .get(&state.display.get())
+                    .map(|s| s.client_id == client_id)
+                    .unwrap_or(false)
+            })
+            .map(|(id, _)| ConnectionId::new(*id))
+            .collect()
+    }
+
+    /// Clear stale flow state on display (re-)attach: a fresh relay task
+    /// must not inherit gates from a dead transport, and a still-full
+    /// uplink gauge re-edges on its next charge. (Lock order: display_conns
+    /// before connections, per the table above.)
+    pub async fn reset_flow_for_display(&self, disp: DisplayNumber) {
+        let ids: Vec<u32> = {
+            let display_conns = self.display_conns.lock().await;
+            display_conns
+                .get(&disp.get())
+                .map(|s| s.iter().copied().collect())
+                .unwrap_or_default()
+        };
+        let conns = self.connections.lock().await;
+        for id in ids {
+            if let Some(state) = conns.get(&id) {
+                state.flow.egress.set(false);
+                state.flow.upmeter.reset();
+            }
         }
-        true
     }
 
     pub async fn destroy_all_sessions(&self) {
@@ -466,6 +534,15 @@ mod tests {
 
     fn test_manager() -> SessionManager {
         SessionManager::new()
+    }
+
+    /// Flow handles for registry tests: watermarks so large a functional
+    /// test can never trip the gauge (flow behavior has its own tests).
+    fn test_flow() -> ConnFlow {
+        ConnFlow {
+            upmeter: FlowMeter::new(1 << 30, 1 << 20),
+            egress: EgressGate::new(),
+        }
     }
 
     async fn seeded_manager(disp: u16, client: &str) -> (SessionManager, Session) {
@@ -567,7 +644,7 @@ mod tests {
         let conn_id = ConnectionId::new(42);
         let disp = DisplayNumber::new(1).unwrap();
 
-        mgr.register_x11_connection(conn_id, disp, tx)
+        mgr.register_x11_connection(conn_id, disp, tx, test_flow())
             .await
             .unwrap();
 
@@ -591,7 +668,7 @@ mod tests {
 
         for i in 0..ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY {
             let (tx, _rx) = tokio::sync::mpsc::channel(16);
-            mgr.register_x11_connection(ConnectionId::new(i as u32 + 1), disp, tx)
+            mgr.register_x11_connection(ConnectionId::new(i as u32 + 1), disp, tx, test_flow())
                 .await
                 .unwrap();
         }
@@ -602,6 +679,7 @@ mod tests {
                 ConnectionId::new(ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY as u32 + 1),
                 disp,
                 tx,
+                test_flow(),
             )
             .await;
         assert!(result.is_err());
@@ -612,11 +690,12 @@ mod tests {
         let mgr = test_manager();
 
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
+        let (out_tx, _out_rx) = rx11_core::queue::outbound_channel(4, 1024);
         let disp = DisplayNumber::new(7).unwrap();
 
         assert!(mgr.get_x11_relay_ingress(disp).await.is_none());
 
-        mgr.register_x11_relay(disp, tx, None).await;
+        mgr.register_x11_relay(disp, tx, None, out_tx).await;
         assert!(mgr.get_x11_relay_ingress(disp).await.is_some());
 
         mgr.unregister_x11_relay(disp).await;
@@ -668,5 +747,125 @@ mod tests {
                     .await
             );
         }
+    }
+
+    #[tokio::test]
+    async fn route_resolves_owned_channels_only_and_meter_is_shared_truth() {
+        let (mgr, session) = seeded_manager(21, "client-flow").await;
+        let disp = session.display;
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(8);
+        let flow = ConnFlow {
+            upmeter: FlowMeter::new(100, 40),
+            egress: EgressGate::new(),
+        };
+        let meter = Arc::clone(&flow.upmeter);
+        let conn = ConnectionId::new(77);
+        mgr.register_x11_connection(conn, disp, tx, flow)
+            .await
+            .unwrap();
+
+        // The relay's deliver path: route, charge, advertise, then await.
+        let (sender, flow) = mgr
+            .route_to_x11(conn, "client-flow")
+            .await
+            .expect("owned channel routes");
+        assert!(sender
+            .send(X11RelayToConn::Data(bytes::Bytes::from(vec![9u8; 60])))
+            .await
+            .is_ok());
+        assert!(!flow.upmeter.charge(60), "below high: no pause edge");
+        assert!(flow.upmeter.charge(60), "crossing high reports the edge");
+        assert!(!flow.upmeter.charge(10), "latched: exactly one edge");
+        assert!(matches!(rx.recv().await, Some(X11RelayToConn::Data(_))));
+        assert_eq!(meter.pending(), 130);
+        // Reconcile ground truth sees the latch through the registry:
+        assert!(mgr.upmeter_latched(conn).await);
+
+        // Foreign/unknown clients are denied before anything is touched.
+        assert!(mgr.route_to_x11(conn, "intruder").await.is_none());
+        assert!(mgr
+            .route_to_x11(ConnectionId::new(999), "client-flow")
+            .await
+            .is_none());
+        assert_eq!(meter.pending(), 130, "denied routes never charge");
+    }
+
+    #[tokio::test]
+    async fn re_attach_resets_stale_gates_and_latches() {
+        let (mgr, session) = seeded_manager(22, "client-flow").await;
+        let disp = session.display;
+        let (tx, _rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(8);
+        let flow = ConnFlow {
+            upmeter: FlowMeter::new(10, 2),
+            egress: EgressGate::new(),
+        };
+        let gate = Arc::clone(&flow.egress);
+        let meter = Arc::clone(&flow.upmeter);
+        let conn = ConnectionId::new(78);
+        mgr.register_x11_connection(conn, disp, tx, flow)
+            .await
+            .unwrap();
+
+        gate.set(true);
+        meter.charge(50);
+        assert!(meter.latched());
+        assert!(mgr.upmeter_latched(conn).await, "registry sees the latch");
+
+        mgr.reset_flow_for_display(disp).await;
+        assert!(
+            !gate.paused(),
+            "stale peer pause must not survive re-attach"
+        );
+        assert!(!meter.latched(), "stale latch cleared");
+        assert!(!mgr.upmeter_latched(conn).await);
+        assert_eq!(meter.pending(), 50, "real backlog accounting survives");
+        // A still-full gauge re-edges when new traffic arrives.
+        let (_sender, flow) = mgr
+            .route_to_x11(conn, "client-flow")
+            .await
+            .expect("owned after re-attach");
+        assert!(
+            flow.upmeter.charge(3),
+            "congested receiver re-advertises on next charge"
+        );
+    }
+
+    #[tokio::test]
+    async fn scopeless_fan_out_lists_only_owned_channels() {
+        let (mgr, _) = seeded_manager(23, "mine").await;
+        // Second display owned by another client.
+        mgr.create_session(
+            DisplayNumber::new(24).unwrap(),
+            "a".into(),
+            vec![1],
+            "theirs".into(),
+        )
+        .await
+        .unwrap();
+        for id in 1..=2u32 {
+            let (tx, _rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(4);
+            mgr.register_x11_connection(
+                ConnectionId::new(id),
+                DisplayNumber::new(23).unwrap(),
+                tx,
+                test_flow(),
+            )
+            .await
+            .unwrap();
+        }
+        let (tx, _rx) = tokio::sync::mpsc::channel::<X11RelayToConn>(4);
+        mgr.register_x11_connection(
+            ConnectionId::new(3),
+            DisplayNumber::new(24).unwrap(),
+            tx,
+            test_flow(),
+        )
+        .await
+        .unwrap();
+
+        let ids = mgr.connection_ids_for_client("mine").await;
+        assert_eq!(ids.len(), 2, "only own-display channels");
+        assert!(ids.iter().all(|c| c.get() <= 2));
+        assert!(mgr.egress_gate(ConnectionId::new(99)).await.is_none());
     }
 }

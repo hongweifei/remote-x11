@@ -1,15 +1,24 @@
 //! Per-client connection task: after the handshake, multiplexes frames
 //! between the relay socket, the X11 listener events and the heartbeat.
+//!
+//! This task also owns the session's **flow-control brain**: it advertises
+//! uplink pauses from the app-write gauges, enforces the client's downlink
+//! pauses on the app-reading gates (with the yield rule that never lets
+//! both legs of one channel gate at once), and keeps every advertisement
+//! alive on the priority lane against that lane's drop surface.
 
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
+use tokio::time::Interval;
 use tracing::{info, warn};
 
-use rx11_core::config::{BufferDefaults, RuntimeConfig, ServerDefaults};
+use rx11_core::config::{BufferDefaults, FlowDefaults, RuntimeConfig, ServerDefaults};
 use rx11_core::dataplane::DataPlane;
+use rx11_core::flow::{Advertiser, FlowEdge};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
 use rx11_core::queue::{outbound_channel, OutboundSender};
@@ -68,6 +77,12 @@ pub(super) async fn handle_client(
 
     let mut incremental_cache = ConnectionDataCache::from_runtime(&runtime);
     let mut audio_attached = false;
+    let mut flow = FlowState {
+        negotiated: dataplane.features.supports(Capability::FlowControl),
+        ..FlowState::default()
+    };
+    let mut flow_ticker = tokio::time::interval(FlowDefaults::ADVERTISE_TICK);
+    flow_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let mut ctx = RelayContext {
         read_half: &mut read_half,
@@ -83,6 +98,8 @@ pub(super) async fn handle_client(
         stats: &stats,
         audio: &audio,
         audio_attached: &mut audio_attached,
+        flow: &mut flow,
+        flow_ticker: &mut flow_ticker,
     };
 
     let result = relay_loop(&mut ctx).await;
@@ -132,6 +149,23 @@ struct RelayContext<'a> {
     /// ack, so its ChannelOpen can never interleave before SessionAck).
     audio: &'a crate::audio::AudioHub,
     audio_attached: &'a mut bool,
+    /// Flow-control brain of this session (see the module header).
+    flow: &'a mut FlowState,
+    /// Re-advertisement period for held flow state on the priority lane.
+    flow_ticker: &'a mut Interval,
+}
+
+/// Per-session flow-control state, owned by the relay task (the only frame
+/// sender); pumps see the effects through shared [`rx11_core::flow`] handles.
+#[derive(Debug, Default)]
+struct FlowState {
+    /// `FlowControl` capability negotiated with this client.
+    negotiated: bool,
+    /// Our uplink pauses (advertised to the client, enforced there).
+    advertiser: Advertiser,
+    /// Downlink pauses the client advertised at us, enforced on the
+    /// listener pumps' egress gates (subject to the yield rule).
+    peer_paused: HashSet<ConnectionId>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +199,9 @@ async fn relay_loop(ctx: &mut RelayContext<'_>) -> rx11_core::error::Result<()> 
                     break;
                 }
             }
+            _ = ctx.flow_ticker.tick() => {
+                re_advertise(ctx).await;
+            }
             _ = tokio::time::sleep_until(ctx.heartbeat_deadline) => {
                 warn!("Client {} heartbeat timeout, disconnecting", ctx.transport_id);
                 break;
@@ -182,6 +219,101 @@ async fn send_outbound(outbound: &OutboundSender, frame: Frame) -> RelayAction {
     } else {
         RelayAction::Continue
     }
+}
+
+/// The flow-control frame for one edge, kept small on purpose (control
+/// frames must stay cheap enough for the priority lane's 512-slot drop
+/// surface alongside audio).
+fn flow_frame(edge: FlowEdge) -> Frame {
+    Frame::FlowControl(FlowControlMessage {
+        action: edge.action,
+        connection_id: Some(edge.connection_id),
+    })
+}
+
+/// Record a locally-detected uplink edge and, on a real transition, put the
+/// frame on the priority lane (never queued behind a redraw burst). Then
+/// re-derive the downlink gate for the channel: the yield rule keys on our
+/// own advertisement state.
+async fn advertise_edge(ctx: &mut RelayContext<'_>, edge: FlowEdge) {
+    if !ctx.flow.negotiated {
+        return;
+    }
+    if ctx.flow.advertiser.record(edge) {
+        let _ = ctx.outbound.send_priority(flow_frame(edge));
+        if edge.action == FlowControlAction::Pause {
+            ctx.stats.add_flow_advertised();
+        }
+        info!("flow: {:?} uplink for {}", edge.action, edge.connection_id);
+    }
+    sync_egress(ctx, edge.connection_id).await;
+}
+
+/// Yield rule, as a pure decision (unit-testable): enforce the peer's
+/// downlink `Pause` only while we do NOT hold the same channel paused on
+/// the uplink. Gating both legs of one X11 conversation at once is the
+/// classic stop-and-wait deadlock — the uplink gate starves the reply path
+/// that would unstick every buffer, while the downlink gate only defers
+/// fresh requests. When they conflict, the downlink gate yields and lets
+/// the application finish the blocking request.
+fn egress_desired(peer_paused: bool, we_pause_up_advertised: bool) -> bool {
+    peer_paused && !we_pause_up_advertised
+}
+
+/// Re-evaluate what the client's advertised pauses mean for one channel's
+/// egress gate.
+async fn sync_egress(ctx: &mut RelayContext<'_>, connection_id: ConnectionId) {
+    let gated = egress_desired(
+        ctx.flow.peer_paused.contains(&connection_id),
+        ctx.flow.advertiser.is_paused(connection_id),
+    );
+    if let Some(gate) = ctx.session_mgr.egress_gate(connection_id).await {
+        if gate.set(gated) {
+            if gated {
+                ctx.stats.add_flow_enforced();
+                info!(
+                    "flow: downlink paused for {} (client congestion)",
+                    connection_id
+                );
+            } else {
+                info!("flow: downlink resumed for {}", connection_id);
+            }
+        }
+    }
+}
+
+/// Keep-alive of our advertised state: the priority lane drops when full,
+/// and a lost `Resume` would strand a paused channel forever, so every
+/// held state is re-stated each tick — first reconciled against the
+/// gauges themselves: the pumps' state-machine reports ride a `try_send`
+/// (they must never await the shared ingress, they ARE its drain), so a
+/// dropped report must not leave us re-advertising a `Pause` the meter
+/// has long since drained away. The meter is the ground truth.
+async fn re_advertise(ctx: &mut RelayContext<'_>) {
+    if !ctx.flow.negotiated {
+        return;
+    }
+    let paused: Vec<ConnectionId> = ctx.flow.advertiser.paused_ids().collect();
+    for id in paused {
+        if !ctx.session_mgr.upmeter_latched(id).await {
+            advertise_edge(ctx, FlowEdge::resume(id)).await;
+        }
+    }
+    for edge in ctx.flow.advertiser.due() {
+        let _ = ctx.outbound.send_priority(flow_frame(edge));
+        sync_egress(ctx, edge.connection_id).await;
+    }
+}
+
+/// Apply a peer pause/resume to one channel: membership already decided by
+/// the caller; this records it and updates the enforcement gate.
+async fn set_peer_pause(ctx: &mut RelayContext<'_>, connection_id: ConnectionId, paused: bool) {
+    if paused {
+        ctx.flow.peer_paused.insert(connection_id);
+    } else {
+        ctx.flow.peer_paused.remove(&connection_id);
+    }
+    sync_egress(ctx, connection_id).await;
 }
 async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> RelayAction {
     match frame {
@@ -274,9 +406,26 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 .decompress_payload(&msg.data, msg.original_len)
             {
                 Some(decompressed) => {
-                    ctx.session_mgr
-                        .send_to_x11_connection(msg.connection_id, bytes::Bytes::from(decompressed))
-                        .await;
+                    match ctx
+                        .session_mgr
+                        .route_to_x11(msg.connection_id, ctx.transport_id)
+                        .await
+                    {
+                        Some((sender, flow)) => {
+                            deliver_charged(
+                                ctx,
+                                sender,
+                                flow,
+                                msg.connection_id,
+                                bytes::Bytes::from(decompressed),
+                            )
+                            .await
+                        }
+                        None => warn!(
+                            "Client {} routed compressed data for unowned {}",
+                            ctx.transport_id, msg.connection_id
+                        ),
+                    }
                 }
                 None => {
                     // Those bytes are gone and the X server stream is
@@ -297,10 +446,37 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             RelayAction::Continue
         }
         Frame::FlowControl(msg) => {
-            warn!(
-                "Client {} FlowControl {:?} for {:?} (capability registered, behavior not implemented)",
-                ctx.transport_id, msg.action, msg.connection_id
-            );
+            if !ctx.flow.negotiated {
+                warn!(
+                    "Client {} sent FlowControl without negotiated capability; ignoring",
+                    ctx.transport_id
+                );
+                return RelayAction::Continue;
+            }
+            // Scope resolution: per-channel must be ours; a scope-less form
+            // (never emitted by this build, accepted defensively) fans out
+            // to every channel the client currently owns.
+            let ids: Vec<ConnectionId> = match msg.connection_id {
+                Some(id) => {
+                    if !ctx.session_mgr.owns_connection(id, ctx.transport_id).await {
+                        warn!(
+                            "Client {} sent FlowControl for unowned {}",
+                            ctx.transport_id, id
+                        );
+                        return RelayAction::Continue;
+                    }
+                    vec![id]
+                }
+                None => {
+                    ctx.session_mgr
+                        .connection_ids_for_client(ctx.transport_id)
+                        .await
+                }
+            };
+            let paused = matches!(msg.action, FlowControlAction::Pause);
+            for id in ids {
+                set_peer_pause(ctx, id, paused).await;
+            }
             RelayAction::Continue
         }
         frame => {
@@ -314,24 +490,60 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
     }
 }
 
-/// Ownership-checked plain-data forwarding for the StreamData path: one
-/// session-manager lookup performs ownership and delivery together.
+/// Ownership-checked plain-data forwarding for the StreamData path.
 async fn forward_to_x11(
     ctx: &mut RelayContext<'_>,
     connection_id: ConnectionId,
     data: bytes::Bytes,
 ) -> RelayAction {
-    if !ctx
+    match ctx
         .session_mgr
-        .deliver_to_x11(connection_id, ctx.transport_id, data)
+        .route_to_x11(connection_id, ctx.transport_id)
         .await
     {
-        warn!(
-            "Client {} sent data for unowned {}",
-            ctx.transport_id, connection_id
-        );
+        Some((sender, flow)) => deliver_charged(ctx, sender, flow, connection_id, data).await,
+        None => {
+            warn!(
+                "Client {} sent data for unowned {}",
+                ctx.transport_id, connection_id
+            );
+        }
     }
     RelayAction::Continue
+}
+
+/// Charge the uplink gauge, advertise any pause edge on the real-time
+/// lane, and only THEN await the channel enqueue — the order is
+/// load-bearing. When the gauge crosses, the congestion must be announced
+/// before this task parks on the very channel that is full: the
+/// advertisement is what triggers the client to stop feeding us, and the
+/// app-write pump drains that channel — parking first means the frame
+/// that would relieve the stall is the one never sent (full-duplex bulk
+/// deadlock, caught by the perf suite). A gone channel retracts the
+/// charge.
+async fn deliver_charged(
+    ctx: &mut RelayContext<'_>,
+    sender: mpsc::Sender<crate::session::X11RelayToConn>,
+    flow: Arc<crate::session::ConnFlow>,
+    connection_id: ConnectionId,
+    data: bytes::Bytes,
+) {
+    let len = data.len();
+    let edge = flow.upmeter.charge(len);
+    if edge {
+        advertise_edge(ctx, FlowEdge::pause(connection_id)).await;
+    }
+    if sender
+        .send(crate::session::X11RelayToConn::Data(data))
+        .await
+        .is_err()
+    {
+        flow.upmeter.discharge(len);
+        warn!(
+            "Failed to send data to x11 connection {}, channel gone",
+            connection_id
+        );
+    }
 }
 
 async fn send_session_ack(
@@ -355,8 +567,13 @@ async fn send_session_ack(
                 None
             };
             ctx.session_mgr
-                .register_x11_relay(disp, ctx.x11_event_tx.clone(), recode)
+                .register_x11_relay(disp, ctx.x11_event_tx.clone(), recode, ctx.outbound.clone())
                 .await;
+            // Flow state is per-transport: gates and latches inherited from
+            // a dead relay task must not strand the re-attached one (an
+            // app still connected across the reconnect keeps pumping into
+            // the gates this task alone will evaluate from now on).
+            ctx.session_mgr.reset_flow_for_display(disp).await;
             // Audio rides the connection, not the display: attach with the
             // first successful ack. Capture/encode are shared process-wide;
             // attaching only registers this client's real-time lane.
@@ -417,11 +634,30 @@ async fn handle_x11_event(
             );
             send_outbound(ctx.outbound, frame).await
         }
+        Some(X11ConnToRelay::Congested {
+            connection_id,
+            action,
+            ..
+        }) => {
+            // The app-write pump drained the uplink backlog across its
+            // resume edge: re-state our advertisement to the client.
+            advertise_edge(
+                ctx,
+                FlowEdge {
+                    connection_id,
+                    action,
+                },
+            )
+            .await;
+            RelayAction::Continue
+        }
         Some(X11ConnToRelay::Disconnected { connection_id, .. }) => {
             ctx.session_mgr
                 .unregister_x11_connection(connection_id)
                 .await;
             ctx.incremental_cache.clear_connection(connection_id);
+            ctx.flow.advertiser.forget(connection_id);
+            ctx.flow.peer_paused.remove(&connection_id);
             ctx.stats.dec_x11_connections();
             send_outbound(
                 ctx.outbound,
@@ -430,5 +666,24 @@ async fn handle_x11_event(
             .await
         }
         None => RelayAction::Disconnect,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::egress_desired;
+
+    #[test]
+    fn yield_rule_never_gates_both_legs_of_one_channel() {
+        // No advertisement, no enforcement: normal flow.
+        assert!(!egress_desired(false, false));
+        // Client congested, our uplink free: enforce the pause.
+        assert!(egress_desired(true, false));
+        // Our uplink held paused, client says nothing: stay open.
+        assert!(!egress_desired(false, true));
+        // CONFLICT: both sides want the channel frozen — the downlink
+        // gate yields; the uplink starvation would deadlock the whole
+        // X11 conversation, a deferred request never does.
+        assert!(!egress_desired(true, true));
     }
 }

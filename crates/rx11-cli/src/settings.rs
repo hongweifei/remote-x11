@@ -38,6 +38,9 @@ pub struct RuntimeFileConfig {
     pub audio_bitrate_kbps: Option<u32>,
     pub audio_record_command: Option<Vec<String>>,
     pub audio_play_command: Option<Vec<String>>,
+    pub flow_control: Option<bool>,
+    pub flow_pause_bytes: Option<usize>,
+    pub flow_resume_bytes: Option<usize>,
 }
 
 impl RuntimeFileConfig {
@@ -92,6 +95,9 @@ impl RuntimeFileConfig {
                 .audio_play_command
                 .clone()
                 .or(defaults.audio_play_command),
+            flow_control: self.flow_control.unwrap_or(defaults.flow_control),
+            flow_pause_bytes: self.flow_pause_bytes.unwrap_or(defaults.flow_pause_bytes),
+            flow_resume_bytes: self.flow_resume_bytes.unwrap_or(defaults.flow_resume_bytes),
         }
     }
 }
@@ -179,6 +185,18 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # # Only when auto-detection misses your stack — full argv, verbatim:
 # # audio_record_command = ["parec", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--device=@DEFAULT_SINK@.monitor"]
 # # audio_play_command = ["paplay", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "/dev/stdin"]
+#
+# Per-channel bulk flow control — ON by default: when a consumer stalls
+# (local X server busy, application not reading), the receiver advertises
+# a pause and the producing pump stops reading its socket. The stall
+# settles in kernel buffers and the application's own write() instead of
+# parking stale pixels in the pipe. Lossless: a pause defers future reads,
+# never discards queued bytes. Control frames and the audio lane are never
+# gated. Disable on either end with flow_control = false to fall back to
+# pure transport backpressure (the outbound byte budget above).
+# flow_control = true          # the switch (default on)
+# flow_pause_bytes = 2097152   # accepted-but-unconsumed bytes that trigger Pause
+# flow_resume_bytes = 262144   # hysteresis floor for Resume (must be <= pause)
 "#;
 
 /// Test helper: serialize every test that touches HOME/USERPROFILE, since

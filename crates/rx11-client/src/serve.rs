@@ -2,20 +2,56 @@
 //! relay server to the local X server proxy and housekeeping handlers.
 //!
 //! All four data-frame shapes share the [`DataPlane`] inbound chain (decode,
-//! diff-apply, stats); this module owns routing and the resync handshake.
+//! diff-apply, stats); this module owns routing, the resync handshake and
+//! the client side of flow control: downlink gauge edges are advertised on
+//! the priority lane, and the relay's uplink pauses flip the per-channel
+//! egress gates the proxy pumps await.
 
 use std::time::Duration;
 
+use tokio::sync::mpsc;
+use tokio::time::Interval;
 use tracing::{debug, error, info, warn};
 
+use rx11_core::config::FlowDefaults;
 use rx11_core::dataplane::{DataPlane, InboundOutcome};
+use rx11_core::flow::{Advertiser, FlowEdge};
 use rx11_core::incremental::ConnectionDataCache;
-use rx11_core::protocol::{Capability, Frame, SessionDestroyMessage, StreamResyncRequestMessage};
+use rx11_core::protocol::{
+    Capability, FlowControlAction, Frame, SessionDestroyMessage, StreamResyncRequestMessage,
+};
 use rx11_core::transport::Rx11TransportReadHalf;
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
 use crate::audioout::{start_audio_outlet, AudioOutlet};
 use crate::proxy::{send_data_to_local, spawn_local_connection, ProxyDeps};
+
+/// Client side of the flow-control brain. The serve loop is its only owner;
+/// the proxy pump reports resume edges through `edges` instead of claiming
+/// the advertiser itself, and the ticker reconciles everything the priority
+/// lane may have dropped.
+pub(crate) struct ServeFlow {
+    negotiated: bool,
+    advertiser: Advertiser,
+    edges: mpsc::Receiver<FlowEdge>,
+    ticker: Interval,
+}
+
+impl ServeFlow {
+    pub(crate) fn new(
+        features: &rx11_core::protocol::Features,
+        edges: mpsc::Receiver<FlowEdge>,
+    ) -> Self {
+        let mut ticker = tokio::time::interval(FlowDefaults::ADVERTISE_TICK);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            negotiated: features.supports(Capability::FlowControl),
+            advertiser: Advertiser::default(),
+            edges,
+            ticker,
+        }
+    }
+}
 
 /// Everything the receive loop touches, borrowed from the connector scope.
 pub(crate) struct ServeCtx<'a> {
@@ -27,6 +63,7 @@ pub(crate) struct ServeCtx<'a> {
     /// The one open audio channel, if any (the server opens at most one
     /// per connection). Data for its id bypasses the dataplane entirely.
     pub audio: &'a mut Option<AudioOutlet>,
+    pub flow: &'a mut ServeFlow,
 }
 
 impl ServeCtx<'_> {
@@ -54,6 +91,17 @@ pub(crate) async fn serve(ctx: &mut ServeCtx<'_>) -> anyhow::Result<()> {
                     }
                 }
             }
+            edge = ctx.flow.edges.recv() => {
+                // Edge senders live as long as the pumps; a closed
+                // channel means teardown, nothing to drain.
+                let Some(edge) = edge else { continue };
+                if ctx.flow.negotiated {
+                    advertise_edge(ctx, edge).await;
+                }
+            }
+            _ = ctx.flow.ticker.tick() => {
+                re_advertise(ctx).await;
+            }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received shutdown signal, sending SessionDestroy...");
                 let _ = ctx
@@ -68,6 +116,58 @@ pub(crate) async fn serve(ctx: &mut ServeCtx<'_>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Put one flow edge on the wire via the real-time lane: pauses must not
+/// queue behind a redraw burst (the bulk budget would defeat the purpose
+/// of pausing at all), and the lane's drop surface is covered by the
+/// ticker's keep-alive.
+fn send_flow_frame(ctx: &ServeCtx<'_>, edge: FlowEdge) {
+    let frame = Frame::FlowControl(rx11_core::protocol::FlowControlMessage {
+        action: edge.action,
+        connection_id: Some(edge.connection_id),
+    });
+    let _ = ctx.proxy.outbound.send_priority(frame);
+}
+
+async fn advertise_edge(ctx: &mut ServeCtx<'_>, edge: FlowEdge) {
+    if ctx.flow.advertiser.record(edge) {
+        if edge.action == FlowControlAction::Pause {
+            ctx.proxy.stats.add_flow_advertised();
+        }
+        info!(
+            "flow: advertising {:?} for {}",
+            edge.action, edge.connection_id
+        );
+        send_flow_frame(ctx, edge);
+    }
+}
+
+/// Re-state held advertisements (drops are survivable) and reconcile: a
+/// resume edge reported by the pump can be lost on the (bounded, small)
+/// report channel; the gauge itself is ground truth.
+async fn re_advertise(ctx: &mut ServeCtx<'_>) {
+    if !ctx.flow.negotiated {
+        return;
+    }
+    let stale: Vec<ConnectionId> = {
+        let conns = ctx.proxy.x11_connections.lock().await;
+        ctx.flow
+            .advertiser
+            .paused_ids()
+            .filter(|id| {
+                conns
+                    .get(&id.get())
+                    .is_some_and(|(_, _, meter, _)| !meter.latched())
+            })
+            .collect()
+    };
+    for id in stale {
+        advertise_edge(ctx, FlowEdge::resume(id)).await;
+    }
+    for edge in ctx.flow.advertiser.due() {
+        send_flow_frame(ctx, edge);
+    }
 }
 
 async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<()> {
@@ -144,7 +244,17 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
                     connection_id,
                     data,
                 } => {
-                    send_data_to_local(ctx.proxy.x11_connections, connection_id, data).await;
+                    // The local write-back gauge charges on acceptance; the
+                    // pause edge goes to the relay immediately on the
+                    // priority lane. Enforcement (stopping the app-reading
+                    // pump) happens there, losslessly.
+                    if let Some((_, pause_edge)) =
+                        send_data_to_local(ctx.proxy.x11_connections, connection_id, data).await
+                    {
+                        if pause_edge && ctx.flow.negotiated {
+                            advertise_edge(ctx, FlowEdge::pause(connection_id)).await;
+                        }
+                    }
                 }
                 InboundOutcome::ResyncRequired { connection_id } => {
                     request_full_resend(ctx, connection_id).await;
@@ -210,16 +320,56 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
                 let mut conns = ctx.proxy.x11_connections.lock().await;
                 conns.remove(&msg.connection_id.get());
                 ctx.incremental_cache.clear_connection(msg.connection_id);
+                ctx.flow.advertiser.forget(msg.connection_id);
             }
         }
         Frame::Error(msg) => {
             error!("Error from relay (code={}): {}", msg.code, msg.message);
         }
         Frame::FlowControl(msg) => {
-            debug!(
-                "FlowControl from relay: action={:?} conn={:?}",
-                msg.action, msg.connection_id
-            );
+            if !ctx.flow.negotiated {
+                warn!("FlowControl from relay without negotiated capability; ignoring");
+                return;
+            }
+            let paused = matches!(msg.action, FlowControlAction::Pause);
+            let ids: Vec<ConnectionId> = match msg.connection_id {
+                Some(id) => vec![id],
+                None => {
+                    // Scope-less form: every live x11 channel. Audio is
+                    // exempt by design — it rides the real-time lane.
+                    ctx.proxy
+                        .x11_connections
+                        .lock()
+                        .await
+                        .keys()
+                        .copied()
+                        .map(ConnectionId::new)
+                        .collect()
+                }
+            };
+            for id in ids {
+                let gate = {
+                    let conns = ctx.proxy.x11_connections.lock().await;
+                    conns.get(&id.get()).map(|(_, _, _, gate)| gate.clone())
+                };
+                match gate {
+                    Some(gate) => {
+                        if gate.set(paused) {
+                            if paused {
+                                ctx.proxy.stats.add_flow_enforced();
+                            }
+                            info!("flow: relay {:?} uplink for {}", msg.action, id);
+                        }
+                        // A `Pause` racing ahead of its `ChannelOpen` (the
+                        // priority lane overtakes bulk) is not lost: our
+                        // advertiser keeps re-stating held pauses every
+                        // tick, so the gate flips once the channel exists.
+                    }
+                    None => {
+                        debug!("FlowControl for unknown channel {}; ignored", id);
+                    }
+                }
+            }
         }
         _ => {
             warn!("Unexpected frame from relay: {:?}", frame.msg_type());
@@ -264,6 +414,10 @@ mod tests {
         dataplane: DataPlane,
         rt: RuntimeConfig,
         audio: Option<crate::audioout::AudioOutlet>,
+        flow: ServeFlow,
+        // Kept alive so `flow.edges` never sees a close; tests may also
+        // report edges through it like the pump does.
+        flow_edge_tx: mpsc::Sender<FlowEdge>,
     }
 
     impl Harness {
@@ -275,6 +429,7 @@ mod tests {
             let (read_half, write_half) = Rx11Transport::new(client).split();
             let (tx, rx) = rx11_core::queue::outbound_channel(16, rx11_core::queue::UNLIMITED);
             let features = Features::from_list(&["incremental".into(), "request_resync".into()]);
+            let (flow_edge_tx, flow_edge_rx) = mpsc::channel(64);
             Self {
                 read_half,
                 _write_half: write_half,
@@ -284,10 +439,17 @@ mod tests {
                 stats: Arc::new(ConnectionStats::new()),
                 seq: Arc::new(AtomicU32::new(1)),
                 cache: ConnectionDataCache::new(),
-                dataplane: DataPlane::new(features, compression, &RuntimeConfig::default()),
+                dataplane: DataPlane::new(features.clone(), compression, &RuntimeConfig::default()),
                 rt: RuntimeConfig::default(),
                 audio: None,
+                flow: ServeFlow::new(&features, flow_edge_rx),
+                flow_edge_tx,
             }
+        }
+
+        /// Negotiate `flow_control` for tests that exercise it.
+        fn enable_flow(&mut self) {
+            self.flow.negotiated = true;
         }
 
         fn ctx(&mut self) -> ServeCtx<'_> {
@@ -301,18 +463,37 @@ mod tests {
                     seq: &self.seq,
                     local_x11_addr: "127.0.0.1:0",
                     runtime: &self.rt,
+                    flow_edges: &self.flow_edge_tx,
                 },
                 incremental_cache: &mut self.cache,
                 display: DisplayNumber::new(0).unwrap(),
                 read_timeout: Duration::from_secs(1),
                 audio: &mut self.audio,
+                flow: &mut self.flow,
             }
         }
 
         async fn register_local(&mut self, conn: ConnectionId) -> mpsc::Receiver<Bytes> {
+            self.register_local_with(
+                conn,
+                rx11_core::flow::FlowMeter::new(1 << 30, 1 << 20),
+                rx11_core::flow::EgressGate::new(),
+            )
+            .await
+        }
+
+        async fn register_local_with(
+            &mut self,
+            conn: ConnectionId,
+            meter: Arc<rx11_core::flow::FlowMeter>,
+            gate: Arc<rx11_core::flow::EgressGate>,
+        ) -> mpsc::Receiver<Bytes> {
             let (tx, rx) = mpsc::channel(16);
             let handle = tokio::spawn(future::pending::<()>());
-            self.conns.lock().await.insert(conn.get(), (tx, handle));
+            self.conns
+                .lock()
+                .await
+                .insert(conn.get(), (tx, handle, meter, gate));
             rx
         }
 
@@ -321,6 +502,10 @@ mod tests {
                 self.outbound_rx.try_recv().unwrap_err(),
                 TryRecvError::Empty
             ));
+        }
+
+        fn take_priority_frame(&mut self) -> Option<Frame> {
+            self.outbound_rx.try_recv_priority()
         }
     }
 
@@ -731,5 +916,260 @@ mod tests {
             .unwrap();
         }
         assert!(h.conns.lock().await.is_empty());
+    }
+
+    fn flow_frame(action: FlowControlAction, id: ConnectionId) -> Frame {
+        Frame::FlowControl(rx11_core::protocol::FlowControlMessage {
+            action,
+            connection_id: Some(id),
+        })
+    }
+
+    fn data_frame(id: ConnectionId, len: usize) -> Frame {
+        Frame::StreamData(StreamDataMessage {
+            connection_id: id,
+            sequence_id: 1,
+            data: Bytes::from(vec![3u8; len]),
+        })
+    }
+
+    #[tokio::test]
+    async fn downlink_gauge_edge_advertises_pause_on_the_priority_lane() {
+        let mut h = Harness::new(None).await;
+        h.enable_flow();
+        let meter = rx11_core::flow::FlowMeter::new(10, 4);
+        let _rx = h
+            .register_local_with(conn(30), Arc::clone(&meter), Default::default())
+            .await;
+
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, data_frame(conn(30), 6))
+                .await
+                .unwrap();
+        }
+        assert!(h.take_priority_frame().is_none(), "below high: silent");
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, data_frame(conn(30), 6))
+                .await
+                .unwrap();
+        }
+        match h.take_priority_frame() {
+            Some(Frame::FlowControl(m)) => {
+                assert_eq!(m.action, FlowControlAction::Pause);
+                assert_eq!(m.connection_id, Some(conn(30)));
+            }
+            other => panic!("expected priority FlowControl(Pause), got {other:?}"),
+        }
+        // Third push while latched: no second advertisement.
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, data_frame(conn(30), 6))
+                .await
+                .unwrap();
+        }
+        assert!(h.take_priority_frame().is_none());
+        // The advertisement skipped the byte budget entirely — it went out
+        // on the real-time lane, never as a bulk frame.
+        assert!(h.outbound_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn pump_reported_resume_edge_is_re_advertised() {
+        let mut h = Harness::new(None).await;
+        h.enable_flow();
+        let meter = rx11_core::flow::FlowMeter::new(10, 4);
+        let _rx = h
+            .register_local_with(conn(31), Arc::clone(&meter), Default::default())
+            .await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, data_frame(conn(31), 12))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            h.take_priority_frame(),
+            Some(Frame::FlowControl(_))
+        ));
+        // The pump drains fully and reports the edge on the report channel.
+        meter.discharge(12);
+        h.flow_edge_tx
+            .try_send(FlowEdge::resume(conn(31)))
+            .expect("report channel live");
+        {
+            let mut ctx = h.ctx();
+            // Drive the same path the serve loop's arm uses.
+            advertise_edge(&mut ctx, FlowEdge::resume(conn(31))).await;
+        }
+        match h.take_priority_frame() {
+            Some(Frame::FlowControl(m)) => {
+                assert_eq!(m.action, FlowControlAction::Resume);
+                assert_eq!(m.connection_id, Some(conn(31)));
+            }
+            other => panic!("expected priority FlowControl(Resume), got {other:?}"),
+        }
+        assert!(!h.flow.advertiser.is_paused(conn(31)));
+    }
+
+    #[tokio::test]
+    async fn relay_pause_flips_the_uplink_gate_and_resume_opens_it() {
+        let mut h = Harness::new(None).await;
+        h.enable_flow();
+        let gate: Arc<rx11_core::flow::EgressGate> = Default::default();
+        let _rx = h
+            .register_local_with(
+                conn(32),
+                rx11_core::flow::FlowMeter::new(1 << 30, 1 << 20),
+                Arc::clone(&gate),
+            )
+            .await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, flow_frame(FlowControlAction::Pause, conn(32)))
+                .await
+                .unwrap();
+            assert!(gate.paused(), "relay pause enforced locally");
+            dispatch_frame(&mut ctx, flow_frame(FlowControlAction::Resume, conn(32)))
+                .await
+                .unwrap();
+            assert!(!gate.paused(), "relay resume releases the gate");
+        }
+        // Enforcement never advertises back: the lane stays quiet.
+        h.assert_nothing_emitted().await;
+        assert!(h.take_priority_frame().is_none());
+    }
+
+    #[tokio::test]
+    async fn ungate_and_unknown_channel_flow_frames_are_inert() {
+        // Not negotiated: nothing is enforced or advertised.
+        let mut h = Harness::new(None).await;
+        let gate: Arc<rx11_core::flow::EgressGate> = Default::default();
+        let _rx = h
+            .register_local_with(
+                conn(33),
+                rx11_core::flow::FlowMeter::new(1 << 30, 1 << 20),
+                Arc::clone(&gate),
+            )
+            .await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, flow_frame(FlowControlAction::Pause, conn(33)))
+                .await
+                .unwrap();
+            assert!(!gate.paused(), "ungated flow control ignored");
+        }
+        // Negotiated, but for a channel this side does not have.
+        h.flow.negotiated = true;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, flow_frame(FlowControlAction::Pause, conn(999)))
+                .await
+                .unwrap();
+        }
+        assert!(!gate.paused(), "unknown id must not disturb live gates");
+    }
+
+    #[tokio::test]
+    async fn scope_less_pause_fans_out_to_every_live_channel() {
+        let mut h = Harness::new(None).await;
+        h.enable_flow();
+        let g1: Arc<rx11_core::flow::EgressGate> = Default::default();
+        let g2: Arc<rx11_core::flow::EgressGate> = Default::default();
+        let big = || rx11_core::flow::FlowMeter::new(1 << 30, 1 << 20);
+        let _a = h
+            .register_local_with(conn(34), big(), Arc::clone(&g1))
+            .await;
+        let _b = h
+            .register_local_with(conn(35), big(), Arc::clone(&g2))
+            .await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(
+                &mut ctx,
+                Frame::FlowControl(rx11_core::protocol::FlowControlMessage {
+                    action: FlowControlAction::Pause,
+                    connection_id: None,
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(g1.paused() && g2.paused(), "both gates closed");
+    }
+
+    #[tokio::test]
+    async fn tick_reconciles_a_lost_resume_report() {
+        let mut h = Harness::new(None).await;
+        h.enable_flow();
+        let meter = rx11_core::flow::FlowMeter::new(10, 4);
+        let _rx = h
+            .register_local_with(conn(36), Arc::clone(&meter), Default::default())
+            .await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, data_frame(conn(36), 12))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            h.take_priority_frame(),
+            Some(Frame::FlowControl(_))
+        ));
+        // The pump drained everything but its report channel DROPPED the
+        // edge (simulated by never sending it): the gauge is the ground
+        // truth, so the next tick must resume on its own.
+        meter.discharge(12);
+        {
+            let mut ctx = h.ctx();
+            re_advertise(&mut ctx).await;
+        }
+        let mut saw_resume = false;
+        while let Some(frame) = h.take_priority_frame() {
+            if let Frame::FlowControl(m) = frame {
+                if m.action == FlowControlAction::Resume {
+                    saw_resume = true;
+                }
+            }
+        }
+        assert!(saw_resume, "tick re-advertises a lost resume edge");
+        assert!(!h.flow.advertiser.is_paused(conn(36)));
+    }
+
+    #[tokio::test]
+    async fn channel_close_forgets_advertisement_state() {
+        let mut h = Harness::new(None).await;
+        h.enable_flow();
+        let meter = rx11_core::flow::FlowMeter::new(10, 4);
+        let _rx = h
+            .register_local_with(conn(37), Arc::clone(&meter), Default::default())
+            .await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, data_frame(conn(37), 12))
+                .await
+                .unwrap();
+        }
+        assert!(h.flow.advertiser.is_paused(conn(37)));
+        assert!(matches!(
+            h.take_priority_frame(),
+            Some(Frame::FlowControl(_))
+        ));
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(
+                &mut ctx,
+                Frame::ChannelClose(ChannelCloseMessage {
+                    connection_id: conn(37),
+                }),
+            )
+            .await
+            .unwrap();
+            re_advertise(&mut ctx).await;
+        }
+        assert!(!h.flow.advertiser.is_paused(conn(37)));
+        // Forget means the keepalive tick goes silent for it.
+        assert!(h.take_priority_frame().is_none());
     }
 }

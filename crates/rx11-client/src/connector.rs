@@ -24,7 +24,7 @@ use rx11_core::transport::Rx11Transport;
 use rx11_core::types::{DisplayNumber, SessionId, Token};
 
 use crate::proxy::{cleanup_connections, new_shared_conns, ProxyDeps};
-use crate::serve::{serve, ServeCtx};
+use crate::serve::{serve, ServeCtx, ServeFlow};
 
 /// X11 authorization protocol the client always requests.
 const X11_AUTH_NAME: &str = "MIT-MAGIC-COOKIE-1";
@@ -238,6 +238,11 @@ impl LocalConnector {
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
         let mut audio_outlet: Option<crate::audioout::AudioOutlet> = None;
+        // Pump → serve resume-edge reports: small and rare (hysteresis
+        // bounded); drops are reconciled from the meters by the tick.
+        let (flow_edge_tx, flow_edge_rx) =
+            tokio::sync::mpsc::channel::<rx11_core::flow::FlowEdge>(64);
+        let mut flow = ServeFlow::new(&dataplane.features, flow_edge_rx);
 
         let (outbound_tx, outbound_rx) = rx11_core::queue::outbound_channel(
             BufferDefaults::OUTBOUND_CHANNEL,
@@ -275,11 +280,13 @@ impl LocalConnector {
                     seq: &seq_counter,
                     local_x11_addr: &self.local_x11_addr,
                     runtime: &self.runtime,
+                    flow_edges: &flow_edge_tx,
                 },
                 incremental_cache: &mut incremental_cache,
                 display: actual_display,
                 read_timeout: self.runtime.client_read_timeout,
                 audio: &mut audio_outlet,
+                flow: &mut flow,
             };
             serve(&mut ctx).await
         };

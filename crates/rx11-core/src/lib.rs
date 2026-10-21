@@ -5,6 +5,7 @@
 //! - [`compress`] — zstd/lz4/zlib algorithm negotiation
 //! - [`dataplane`] — capability-gated frame build/apply policy chain
 //! - [`incremental`] — chunked diff encoding for repeated payloads
+//! - [`flow`] — per-channel bulk flow control (meter / gate / advertiser)
 //! - [`auth`] — token and X cookie generation, constant-time verification
 //! - [`types`] — validated newtypes (`SessionId`, `Token`, `DisplayNumber`, …)
 //! - [`stats`] — lock-free connection statistics
@@ -20,6 +21,7 @@ pub mod compress;
 pub mod config;
 pub mod dataplane;
 pub mod error;
+pub mod flow;
 pub mod incremental;
 pub mod protocol;
 pub mod queue;

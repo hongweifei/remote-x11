@@ -61,6 +61,16 @@ pub struct ConnectionStats {
     incremental_fallback: Counter,
     incremental_compression: Savings,
 
+    /// Flow-control `Pause` events WE put on the wire (advertised upward
+    /// from a full gauge on the server, or downward from a stalled
+    /// write-back on the client).
+    flow_advertised: Counter,
+    /// Flow-control `Pause` events WE enforced locally (gate closed at the
+    /// bulk pump on the peer's advertisement). Resumes are not counted: a
+    /// matched pair shows as one enforcement cycle, and the interesting
+    /// operator question is how often bulk got gated at all.
+    flow_enforced: Counter,
+
     start_time: Instant,
 }
 
@@ -74,6 +84,8 @@ impl ConnectionStats {
             incremental: Savings::default(),
             incremental_fallback: Counter::default(),
             incremental_compression: Savings::default(),
+            flow_advertised: Counter::default(),
+            flow_enforced: Counter::default(),
             start_time: Instant::now(),
         }
     }
@@ -100,6 +112,23 @@ impl ConnectionStats {
 
     pub fn add_incremental_compression_saved(&self, saved: u64) {
         self.incremental_compression.record(saved);
+    }
+
+    pub fn add_flow_advertised(&self) {
+        self.flow_advertised.incr();
+    }
+
+    pub fn add_flow_enforced(&self) {
+        self.flow_enforced.incr();
+    }
+
+    /// Lifetime totals, exposed for tests and monitoring (the human
+    /// summary logs flow transitions at `info` directly).
+    pub fn flow_totals(&self) -> (u64, u64) {
+        (
+            self.flow_advertised.load_total(),
+            self.flow_enforced.load_total(),
+        )
     }
 
     pub fn inc_x11_connections(&self) {
