@@ -15,6 +15,7 @@ const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 const ZLIB_COMPRESSION_LEVEL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
+#[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum CompressionAlgo {
     Zstd = 0,
@@ -235,6 +236,19 @@ mod tests {
         let client: Vec<CompressionAlgo> = vec![];
         let server = vec![CompressionAlgo::Zstd];
         assert_eq!(CompressionAlgo::negotiate(&client, &server), None);
+    }
+
+    #[test]
+    fn test_algo_wire_names_match_log_names() {
+        // One canonical spelling: serde wire form must equal as_str(), and
+        // must be lowercase to match capability-name style.
+        for algo in CompressionAlgo::ALL {
+            let wire = serde_json::to_string(&algo).unwrap();
+            assert_eq!(wire, format!("\"{}\"", algo.as_str()), "wire/as_str drift");
+            assert_eq!(algo.as_str().to_lowercase(), algo.as_str());
+        }
+        let back: CompressionAlgo = serde_json::from_str("\"zstd\"").unwrap();
+        assert_eq!(back, CompressionAlgo::Zstd);
     }
 
     #[test]
