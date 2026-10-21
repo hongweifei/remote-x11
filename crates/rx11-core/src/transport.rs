@@ -198,42 +198,91 @@ impl<S: AsyncWrite + Unpin> Rx11TransportWriteHalf<S> {
 /// returns immediately); a saturated queue gets batch syscalls instead of
 /// one write(2) per frame. Popping a frame releases its share of the byte
 /// budget, unblocking gated producers.
+///
+/// The real-time (priority) lane preempts bulk traffic at every scheduling
+/// point: between batches (`recv_any` polls it first), mid-batch (the
+/// coalescer stops growing when a packet is parked) and between socket
+/// commit chunks inside one batch write. A real-time packet's queueing delay
+/// is therefore bounded by one [`BufferDefaults::OUTBOUND_WRITE_CHUNK`] of
+/// committed bulk bytes — whatever the kernel socket buffer already holds
+/// is a physical ordering limit no queue layout can preempt. At ~50
+/// packets/s the lane never starves bulk either.
 pub async fn drain_frames<S: AsyncWrite + Unpin>(
     mut rx: crate::queue::OutboundReceiver,
     mut write_half: Rx11TransportWriteHalf<S>,
 ) {
+    use crate::queue::LaneItem;
     let mut batch = BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF);
     loop {
-        let Some((first, _)) = rx.recv().await else {
-            break;
+        let first = match rx.recv_any().await {
+            LaneItem::Priority(frame) => {
+                batch.clear();
+                let failed = frame.encode_into(&mut batch).is_err();
+                if write_half.send_raw(&batch).await.is_err() || failed {
+                    break;
+                }
+                continue;
+            }
+            LaneItem::Bulk(frame) => frame,
+            LaneItem::BulkClosed => break,
         };
-        batch.clear();
-        let mut failed = first.encode_into(&mut batch).is_err();
-        let mut queued = 1usize;
-        while !failed
-            && queued < BufferDefaults::OUTBOUND_BATCH_FRAMES
-            && batch.len() < BufferDefaults::OUTBOUND_BATCH_BYTES
         {
-            match rx.try_recv() {
-                Ok((next, _)) => {
-                    if next.encode_into(&mut batch).is_err() {
+            batch.clear();
+            let mut failed = first.encode_into(&mut batch).is_err();
+            let mut queued = 1usize;
+            while !failed
+                && queued < BufferDefaults::OUTBOUND_BATCH_FRAMES
+                && batch.len() < BufferDefaults::OUTBOUND_BATCH_BYTES
+            {
+                if rx.priority_pending() {
+                    break;
+                }
+                match rx.try_recv() {
+                    Ok((next, _)) => {
+                        if next.encode_into(&mut batch).is_err() {
+                            failed = true;
+                            break;
+                        }
+                        queued += 1;
+                    }
+                    Err(_) => break,
+                }
+            }
+            // Freeze the coalesced bytes; `batch` becomes scratch for
+            // priority frames interleaved between commit chunks.
+            let committed = batch.split().freeze();
+            // Flush whatever was coalesced before reacting to an encode
+            // failure: bytes already accepted downstream must not be
+            // withheld.
+            let mut write_result = Ok(());
+            for chunk in committed.chunks(BufferDefaults::OUTBOUND_WRITE_CHUNK) {
+                while let Some(p) = rx.try_recv_priority() {
+                    batch.clear();
+                    if p.encode_into(&mut batch).is_err() {
                         failed = true;
                         break;
                     }
-                    queued += 1;
+                    if write_half.send_raw(&batch).await.is_err() {
+                        write_result = Err(Rx11Error::ConnectionClosed);
+                        break;
+                    }
                 }
-                Err(_) => break,
+                if failed || write_result.is_err() {
+                    break;
+                }
+                write_result = write_half.send_raw(chunk).await;
+                if write_result.is_err() {
+                    break;
+                }
             }
-        }
-        // Flush whatever the batch holds before reacting to an encode
-        // failure: bytes already accepted downstream must not be withheld.
-        let write_result = write_half.send_raw(&batch).await;
-        if write_result.is_err() || failed {
-            // A frame that cannot be encoded is a protocol bug on OUR side;
-            // dropping it would silently corrupt the strict X11 byte stream,
-            // so tear the connection instead — resume/rebuild is the
-            // established recovery path.
-            break;
+            if write_result.is_err() || failed {
+                // A frame that cannot be encoded is a protocol bug on
+                // OUR side; dropping it would silently corrupt the
+                // strict X11 byte stream, so tear the connection
+                // instead — resume/rebuild is the established recovery
+                // path.
+                break;
+            }
         }
     }
     let _ = write_half.flush().await;

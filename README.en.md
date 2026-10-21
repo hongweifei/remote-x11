@@ -37,9 +37,10 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Data compression** — `zstd_stream` by default: one continuous compression stream flushed per frame, so later frames reference the history of everything already sent (redraw-heavy traffic collapses on slow links); negotiates down to one-shot zstd/lz4/zlib. Payloads over 256 bytes are compressed
 - **WAN queue discipline** — the outbound queue towards the relay is capped by **in-flight bytes** (default 1 MB), not frame count, so a 3 Mbit/s link never accumulates minutes of bufferbloat; an optional `SO_SNDBUF` cap tames the kernel buffer too
 - **Image re-encoding (opt-in)** — the `x11_recode` capability recognizes large core `PutImage` requests (ZPixmap, depth 24/32) and ships them as JPEG (lossy, 10–50× smaller) or lossless PNG on the wire; the client re-expands them into the original request bytes before the local X server sees anything. Non-image traffic passes byte-for-byte. Off by default; both ends must set `image_recode = true`. Honest edge: GL-rendered video and Xv extension paths are out of recognition scope — that's framebuffer territory (Xpra/x2go), not a transparent forwarder's
+- **Desktop audio forwarding (opt-in)** — the `audio` channel: the server captures its default output sink's monitor, encodes with Opus (**pure-Rust** port, 48 kHz stereo, no system library build requirements) and streams it on the **real-time priority lane**; the client decodes and feeds `paplay`. 64 kbit/s ≈ 2% of a 3 Mbit/s link; the lane bypasses the outbound byte budget, so audio latency under an image flood is bounded by one write chunk. Off by default; both ends must set `audio_forward = true`. Honest edge: playback only — no microphone back-channel, no lip sync
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
 - **Capability negotiation** — incremental/resync/flow-control features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
-- **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11`), kinds *are* capability names, and unknown kinds pass through without parse failures
+- **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11` and `audio`), kinds *are* capability names, and unknown kinds pass through without parse failures
 - **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
 - **Multiple displays** — Run multiple independent GUI sessions simultaneously with the `-d` flag
@@ -250,6 +251,10 @@ Priority: **CLI args > env vars > config file > defaults**
 # image_recode_codec = "jpeg"       jpeg (lossy, bandwidth) | png (lossless)
 # image_recode_quality = 80         JPEG quality
 # image_recode_min_bytes = 16384    pixel blocks below this pass through untouched
+# audio_forward = false             desktop audio forwarding switch (both ends must enable)
+# audio_bitrate_kbps = 64           Opus bitrate (32 = speech-grade, 64 ≈ transparent)
+# audio_record_command = []         override recorder argv (default parec; ships with PulseAudio AND PipeWire)
+# audio_play_command = []           override player argv (default paplay --raw)
 ```
 
 On slow links (a 3 Mbit/s VPS running Xfce, say) set the last two explicitly:

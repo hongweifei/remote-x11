@@ -34,6 +34,10 @@ pub struct RuntimeFileConfig {
     pub image_recode_codec: Option<String>,
     pub image_recode_quality: Option<u8>,
     pub image_recode_min_bytes: Option<usize>,
+    pub audio_forward: Option<bool>,
+    pub audio_bitrate_kbps: Option<u32>,
+    pub audio_record_command: Option<Vec<String>>,
+    pub audio_play_command: Option<Vec<String>>,
 }
 
 impl RuntimeFileConfig {
@@ -76,6 +80,18 @@ impl RuntimeFileConfig {
             image_recode_min_bytes: self
                 .image_recode_min_bytes
                 .unwrap_or(defaults.image_recode_min_bytes),
+            audio_forward: self.audio_forward.unwrap_or(defaults.audio_forward),
+            audio_bitrate_kbps: self
+                .audio_bitrate_kbps
+                .unwrap_or(defaults.audio_bitrate_kbps),
+            audio_record_command: self
+                .audio_record_command
+                .clone()
+                .or(defaults.audio_record_command),
+            audio_play_command: self
+                .audio_play_command
+                .clone()
+                .or(defaults.audio_play_command),
         }
     }
 }
@@ -144,6 +160,25 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 #                                # latency ≈ this / link rate (1 MB ≈ 2.8 s at 3 Mbps)
 # tcp_send_buffer_bytes = 262144 # cap kernel SO_SNDBUF too, or the kernel
 #                                # buffer re-adds its own seconds of backlog
+#
+# Image/video pixel re-encoding on the x11 channel (opt-in; JPEG tier is
+# lossy, so BOTH ends must enable it explicitly):
+# image_recode = true            # recognize large PutImage requests
+# image_recode_codec = "jpeg"    # "jpeg" | "png" ("png" = lossless tier)
+# image_recode_quality = 80      # JPEG quality
+# image_recode_min_bytes = 16384 # smaller images stay pixel-exact
+#
+# Desktop audio over the same link: the server records its output sink and
+# streams Opus (~2% of a 3 Mbit/s line) on a real-time lane; the client
+# plays locally. Set audio_forward = true on BOTH ends. Needs parec on the
+# server and paplay on the client (both ship with PulseAudio AND PipeWire).
+# No lip-sync with GL-rendered video; system sounds, music and alerts are
+# the use case.
+# audio_forward = false          # the switch itself (opt-in)
+# audio_bitrate_kbps = 64        # 32 = speech-grade, 64 = near-transparent
+# # Only when auto-detection misses your stack — full argv, verbatim:
+# # audio_record_command = ["parec", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--device=@DEFAULT_SINK@.monitor"]
+# # audio_play_command = ["paplay", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "/dev/stdin"]
 "#;
 
 /// Test helper: serialize every test that touches HOME/USERPROFILE, since

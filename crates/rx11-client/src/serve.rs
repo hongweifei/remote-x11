@@ -14,6 +14,7 @@ use rx11_core::protocol::{Capability, Frame, SessionDestroyMessage, StreamResync
 use rx11_core::transport::Rx11TransportReadHalf;
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
+use crate::audioout::{start_audio_outlet, AudioOutlet};
 use crate::proxy::{send_data_to_local, spawn_local_connection, ProxyDeps};
 
 /// Everything the receive loop touches, borrowed from the connector scope.
@@ -23,6 +24,9 @@ pub(crate) struct ServeCtx<'a> {
     pub incremental_cache: &'a mut ConnectionDataCache,
     pub display: DisplayNumber,
     pub read_timeout: Duration,
+    /// The one open audio channel, if any (the server opens at most one
+    /// per connection). Data for its id bypasses the dataplane entirely.
+    pub audio: &'a mut Option<AudioOutlet>,
 }
 
 impl ServeCtx<'_> {
@@ -79,6 +83,30 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
                 );
                 ctx.proxy.stats.inc_x11_connections();
                 spawn_local_connection(msg.connection_id, &ctx.proxy).await?;
+            } else if msg.kind.is_audio() {
+                // Audio channel: gated by the negotiated capability, one
+                // outlet per connection. Starting the player is best-effort;
+                // audio failures never touch the X11 session.
+                if !ctx
+                    .proxy
+                    .dataplane
+                    .features
+                    .supports(Capability::AudioForward)
+                {
+                    warn!("Relay opened audio without negotiated capability; ignoring");
+                } else if ctx.audio.is_some() {
+                    warn!("Duplicate audio channel ({}); ignoring", msg.connection_id);
+                } else {
+                    match start_audio_outlet(msg.connection_id, ctx.proxy.runtime) {
+                        Some(outlet) => {
+                            info!("audio: playing to local sink ({})", msg.connection_id);
+                            *ctx.audio = Some(outlet);
+                        }
+                        None => {
+                            warn!("audio: no local player available; channel ignored")
+                        }
+                    }
+                }
             } else {
                 warn!(
                     "Relay opened unsupported channel kind '{}' ({}); ignoring",
@@ -90,6 +118,23 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
         | Frame::CompressedStreamData(_)
         | Frame::IncrementalStreamData(_)
         | Frame::CompressedIncrementalStreamData(_)) => {
+            // Real-time bypass: frames on the open audio channel go
+            // straight to the local player — the diff cache, compression
+            // chain and X connection routing never see them.
+            if let Frame::StreamData(msg) = &frame {
+                if ctx
+                    .audio
+                    .as_ref()
+                    .is_some_and(|a| a.conn_id == msg.connection_id)
+                {
+                    let alive = ctx.audio.as_ref().unwrap().deliver(msg.data.clone());
+                    if !alive {
+                        warn!("audio: player gone; outlet removed");
+                        *ctx.audio = None;
+                    }
+                    return Ok(());
+                }
+            }
             // Copy the (small, Copy) policy so the cache borrow below stays
             // disjoint from the dataplane read.
             let dataplane = ctx.proxy.dataplane.clone();
@@ -151,10 +196,21 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
             info!("Session destroyed for display {}", msg.display);
         }
         Frame::ChannelClose(msg) => {
-            debug!("Remote X11 client disconnected ({})", msg.connection_id);
-            let mut conns = ctx.proxy.x11_connections.lock().await;
-            conns.remove(&msg.connection_id.get());
-            ctx.incremental_cache.clear_connection(msg.connection_id);
+            if ctx
+                .audio
+                .as_ref()
+                .is_some_and(|a| a.conn_id == msg.connection_id)
+            {
+                info!("audio channel ({}) closed by relay", msg.connection_id);
+                // Dropping the outlet closes its buffer: the player task
+                // sees EOF, flushes and reaps the child (kill_on_drop).
+                *ctx.audio = None;
+            } else {
+                debug!("Remote X11 client disconnected ({})", msg.connection_id);
+                let mut conns = ctx.proxy.x11_connections.lock().await;
+                conns.remove(&msg.connection_id.get());
+                ctx.incremental_cache.clear_connection(msg.connection_id);
+            }
         }
         Frame::Error(msg) => {
             error!("Error from relay (code={}): {}", msg.code, msg.message);
@@ -206,6 +262,8 @@ mod tests {
         seq: Arc<AtomicU32>,
         cache: ConnectionDataCache,
         dataplane: DataPlane,
+        rt: RuntimeConfig,
+        audio: Option<crate::audioout::AudioOutlet>,
     }
 
     impl Harness {
@@ -227,6 +285,8 @@ mod tests {
                 seq: Arc::new(AtomicU32::new(1)),
                 cache: ConnectionDataCache::new(),
                 dataplane: DataPlane::new(features, compression, &RuntimeConfig::default()),
+                rt: RuntimeConfig::default(),
+                audio: None,
             }
         }
 
@@ -240,10 +300,12 @@ mod tests {
                     dataplane: &self.dataplane,
                     seq: &self.seq,
                     local_x11_addr: "127.0.0.1:0",
+                    runtime: &self.rt,
                 },
                 incremental_cache: &mut self.cache,
                 display: DisplayNumber::new(0).unwrap(),
                 read_timeout: Duration::from_secs(1),
+                audio: &mut self.audio,
             }
         }
 
@@ -536,5 +598,138 @@ mod tests {
             .unwrap();
         }
         h.assert_nothing_emitted().await;
+    }
+
+    fn audio_open(conn: ConnectionId) -> Frame {
+        Frame::ChannelOpen(rx11_core::protocol::ChannelOpenMessage {
+            connection_id: conn,
+            kind: rx11_core::protocol::ChannelKind::audio(),
+            display: None,
+        })
+    }
+
+    #[tokio::test]
+    async fn audio_channel_open_ignored_without_capability() {
+        let mut h = Harness::new(None).await;
+        h.dataplane.features = Features::default();
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, audio_open(conn(20)))
+                .await
+                .unwrap();
+            assert!(ctx.audio.is_none(), "ungated audio channel must not start");
+        }
+        h.assert_nothing_emitted().await;
+    }
+
+    #[tokio::test]
+    async fn audio_channel_open_spawns_outlet_when_gated() {
+        let mut h = Harness::new(None).await;
+        h.dataplane.features = Features::from_list(&["audio_forward".to_string()]);
+        // A real player child we never wait on: cat drains stdin to null.
+        h.rt.audio_play_command = Some(vec!["cat".to_string()]);
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, audio_open(conn(21)))
+                .await
+                .unwrap();
+            assert!(ctx.audio.is_some(), "gated audio channel starts player");
+            assert_eq!(ctx.audio.as_ref().unwrap().conn_id, conn(21));
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_frames_bypass_the_dataplane_entirely() {
+        let mut h = Harness::new(Some(CompressionAlgo::Zstd)).await;
+        let (outlet, mut packets) = crate::audioout::AudioOutlet::for_test(conn(22));
+        h.audio = Some(outlet);
+        let mut local_rx = h.register_local(conn(22)).await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(
+                &mut ctx,
+                Frame::StreamData(StreamDataMessage {
+                    connection_id: conn(22),
+                    sequence_id: 5,
+                    data: Bytes::from_static(&[0xDE, 0xAD]),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(&packets.recv().await.unwrap()[..], &[0xDE, 0xAD]);
+        assert!(local_rx
+            .try_recv()
+            .unwrap_err()
+            .to_string()
+            .contains("empty"));
+        assert!(
+            h.cache.get_cached(conn(22)).is_none(),
+            "no diff-cache touch"
+        );
+        assert!(
+            !h.stats.summary().contains("Recv:"),
+            "no dataplane byte accounting: {}",
+            h.stats.summary()
+        );
+    }
+
+    #[tokio::test]
+    async fn dead_player_clears_the_outlet() {
+        let mut h = Harness::new(None).await;
+        let (outlet, rx) = crate::audioout::AudioOutlet::for_test(conn(23));
+        drop(rx); // player task gone
+        h.audio = Some(outlet);
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(
+                &mut ctx,
+                Frame::StreamData(StreamDataMessage {
+                    connection_id: conn(23),
+                    sequence_id: 1,
+                    data: Bytes::from_static(&[1]),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(
+                ctx.audio.is_none(),
+                "closed outlet is removed after delivery"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_close_clears_audio_but_keeps_x11_routed() {
+        let mut h = Harness::new(None).await;
+        h.cache.update_cache(conn(24), 1, &[0u8; 64]);
+        let (outlet, _rx) = crate::audioout::AudioOutlet::for_test(conn(24));
+        h.audio = Some(outlet);
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(
+                &mut ctx,
+                Frame::ChannelClose(ChannelCloseMessage {
+                    connection_id: conn(24),
+                }),
+            )
+            .await
+            .unwrap();
+            assert!(ctx.audio.is_none());
+        }
+        // An x11 conn close still uses the registry path untouched.
+        let _rx2 = h.register_local(conn(25)).await;
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(
+                &mut ctx,
+                Frame::ChannelClose(ChannelCloseMessage {
+                    connection_id: conn(25),
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        assert!(h.conns.lock().await.is_empty());
     }
 }

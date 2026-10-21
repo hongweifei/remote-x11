@@ -237,6 +237,7 @@ impl LocalConnector {
         let stats = Arc::new(ConnectionStats::new());
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
+        let mut audio_outlet: Option<crate::audioout::AudioOutlet> = None;
 
         let (outbound_tx, outbound_rx) = rx11_core::queue::outbound_channel(
             BufferDefaults::OUTBOUND_CHANNEL,
@@ -273,10 +274,12 @@ impl LocalConnector {
                     dataplane: &dataplane,
                     seq: &seq_counter,
                     local_x11_addr: &self.local_x11_addr,
+                    runtime: &self.runtime,
                 },
                 incremental_cache: &mut incremental_cache,
                 display: actual_display,
                 read_timeout: self.runtime.client_read_timeout,
+                audio: &mut audio_outlet,
             };
             serve(&mut ctx).await
         };

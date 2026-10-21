@@ -8,11 +8,13 @@
 //! - [`auth`] — token and X cookie generation, constant-time verification
 //! - [`types`] — validated newtypes (`SessionId`, `Token`, `DisplayNumber`, …)
 //! - [`stats`] — lock-free connection statistics
-//! - [`queue`] — byte-budgeted outbound frame queue (WAN latency bound)
+//! - [`queue`] — byte-budgeted outbound frame queue + real-time priority lane
 //! - [`config`] — centralized default constants
 //! - [`error`] — [`error::Rx11Error`] with retry classification
 //! - [`x11recode`] — protocol-aware PutImage re-encoding (x11 channel tier)
+//! - [`audio`] — audio channel primitives (Opus wire contract, channel tier)
 
+pub mod audio;
 pub mod auth;
 pub mod compress;
 pub mod config;

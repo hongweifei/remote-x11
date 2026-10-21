@@ -1,4 +1,4 @@
-//! Byte-budgeted outbound frame queue.
+//! Byte-budgeted outbound frame queue with a real-time priority lane.
 //!
 //! The WAN writer runs ahead of the link: while a frame is being written,
 //! everything produced afterwards piles up. Count-bounded mpsc channels
@@ -12,6 +12,13 @@
 //! drains. A zero-inflight escape hatch guarantees progress for a frame
 //! larger than the budget itself. Latency is now bounded by
 //! `budget / link_rate` regardless of frame sizes.
+//!
+//! The **priority lane** exists for real-time traffic (audio): small,
+//! short-lived packets that must not queue behind a redraw burst. It is a
+//! bounded, NON-blocking channel outside the byte budget — when it is full
+//! new packets are dropped (stale audio is worthless), and the writer task
+//! takes from it between bulk frames and between socket commit chunks, so
+//! real-time latency is bounded by one commit chunk, never one batch.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -19,6 +26,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::error::{TryRecvError, TrySendError};
 use tokio::sync::{mpsc, Notify};
 
+use crate::config::BufferDefaults;
 use crate::protocol::Frame;
 
 /// Budget value meaning "no byte limit" (still capped by frame capacity).
@@ -29,10 +37,15 @@ struct QueueState {
     inflight: AtomicUsize,
     budget: usize,
     gate: Notify,
+    /// Packets parked in the priority lane (maintained by both sides of the
+    /// pair; a cheap peek so the coalescer can yield mid-batch without
+    /// consuming a frame).
+    priority_backlog: AtomicUsize,
 }
 
 pub struct OutboundSender {
     tx: mpsc::Sender<(Frame, usize)>,
+    ptx: mpsc::Sender<Frame>,
     state: Arc<QueueState>,
 }
 
@@ -40,6 +53,7 @@ impl Clone for OutboundSender {
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            ptx: self.ptx.clone(),
             state: Arc::clone(&self.state),
         }
     }
@@ -47,7 +61,11 @@ impl Clone for OutboundSender {
 
 pub struct OutboundReceiver {
     rx: mpsc::Receiver<(Frame, usize)>,
+    prx: mpsc::Receiver<Frame>,
     state: Arc<QueueState>,
+    /// Sticky once the priority lane reports closed: the fused waiter then
+    /// stops polling it and never spins on a permanently-ready `None`.
+    priority_done: bool,
 }
 
 /// Create the (sender, receiver) pair. `frame_capacity` bounds queued frame
@@ -57,24 +75,33 @@ pub fn outbound_channel(
     budget_bytes: usize,
 ) -> (OutboundSender, OutboundReceiver) {
     let (tx, rx) = mpsc::channel(frame_capacity);
+    let (ptx, prx) = mpsc::channel(BufferDefaults::PRIORITY_LANE_CAPACITY);
     let state = Arc::new(QueueState {
         inflight: AtomicUsize::new(0),
         budget: budget_bytes.max(1),
         gate: Notify::new(),
+        priority_backlog: AtomicUsize::new(0),
     });
     (
         OutboundSender {
             tx,
+            ptx,
             state: Arc::clone(&state),
         },
-        OutboundReceiver { rx, state },
+        OutboundReceiver {
+            rx,
+            prx,
+            state,
+            priority_done: false,
+        },
     )
 }
 
 impl OutboundSender {
-    /// Queue a frame, awaiting byte budget AND channel capacity. Returns the
-    /// frame back on a closed queue (matching `mpsc::Sender::send` ergonomics
-    /// at our call sites, which only check `is_err()`).
+    /// Queue a frame on the bulk lane, awaiting byte budget AND channel
+    /// capacity. Returns the frame back on a closed queue (matching
+    /// `mpsc::Sender::send` ergonomics at our call sites, which only check
+    /// `is_err()`).
     pub async fn send(&self, frame: Frame) -> Result<(), Frame> {
         let size = frame.encoded_size();
         let mut pending = Some(frame);
@@ -104,10 +131,45 @@ impl OutboundSender {
         }
     }
 
+    /// Queue a frame on the real-time lane: never blocks, never charges the
+    /// byte budget. `Err` means closed (connection gone) or full — the
+    /// caller should drop the frame (stale real-time data is worthless;
+    /// blocking here would defeat the lane's purpose).
+    pub fn send_priority(&self, frame: Frame) -> Result<(), PrioritySendError> {
+        match self.ptx.try_send(frame) {
+            Ok(()) => {
+                self.state.priority_backlog.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+            Err(TrySendError::Full(_)) => Err(PrioritySendError::Full),
+            Err(TrySendError::Closed(_)) => Err(PrioritySendError::Closed),
+        }
+    }
+
     /// Current queued bytes (monitoring/tests).
     pub fn inflight_bytes(&self) -> usize {
         self.state.inflight.load(Ordering::Relaxed)
     }
+}
+
+/// Rejection reason for [`OutboundSender::send_priority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrioritySendError {
+    /// Lane is full: the packet was too late to matter.
+    Full,
+    /// Writer is gone: the connection is ending.
+    Closed,
+}
+
+/// Outcome of [`OutboundReceiver::recv_any`], the fused two-lane wait.
+#[derive(Debug)]
+pub enum LaneItem {
+    /// Real-time frame; always wins when both lanes are ready.
+    Priority(Frame),
+    /// Bulk frame; its share of the byte budget was already released.
+    Bulk(Frame),
+    /// Bulk lane closed: every sender clone is gone, the writer may finish.
+    BulkClosed,
 }
 
 impl OutboundReceiver {
@@ -121,6 +183,67 @@ impl OutboundReceiver {
         let item = self.rx.try_recv()?;
         self.release(item.1);
         Ok(item)
+    }
+
+    /// Next real-time frame, waiting if the lane is empty. `None` once all
+    /// priority senders are gone.
+    pub async fn recv_priority(&mut self) -> Option<Frame> {
+        let frame = self.prx.recv().await?;
+        self.release_priority();
+        Some(frame)
+    }
+
+    pub fn try_recv_priority(&mut self) -> Option<Frame> {
+        let frame = self.prx.try_recv().ok()?;
+        self.release_priority();
+        Some(frame)
+    }
+
+    /// Whether a real-time frame is parked without consuming it: the
+    /// coalescer breaks its batch on `true`, the writer drains the lane
+    /// between commit chunks.
+    pub fn priority_pending(&self) -> bool {
+        self.state.priority_backlog.load(Ordering::Relaxed) > 0
+    }
+
+    /// Fused wait across both lanes: one poll site, so a writer never has to
+    /// hold two mutable borrows of this receiver (which `tokio::select!`
+    /// over `recv()` + `recv_priority()` would require). The priority lane
+    /// is polled first, so a ready real-time packet always wins the wakeup.
+    pub async fn recv_any(&mut self) -> LaneItem {
+        use std::task::Poll;
+        std::future::poll_fn(|cx| {
+            if !self.priority_done {
+                match self.prx.poll_recv(cx) {
+                    Poll::Ready(Some(frame)) => {
+                        self.release_priority();
+                        return Poll::Ready(LaneItem::Priority(frame));
+                    }
+                    Poll::Ready(None) => self.priority_done = true,
+                    Poll::Pending => {}
+                }
+            }
+            match self.rx.poll_recv(cx) {
+                Poll::Ready(Some((frame, size))) => {
+                    self.release(size);
+                    Poll::Ready(LaneItem::Bulk(frame))
+                }
+                Poll::Ready(None) => Poll::Ready(LaneItem::BulkClosed),
+                Poll::Pending => Poll::Pending,
+            }
+        })
+        .await
+    }
+
+    fn release_priority(&self) {
+        // See `release` for the deprecated-spelling note.
+        #[allow(deprecated)]
+        self.state
+            .priority_backlog
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            })
+            .ok();
     }
 
     fn release(&self, size: usize) {
@@ -223,5 +346,48 @@ mod tests {
         drop(rx);
         let err = tx.send(frame(10)).await.unwrap_err();
         assert!(matches!(err, Frame::StreamData(_)));
+    }
+
+    #[tokio::test]
+    async fn priority_lane_bypasses_the_byte_gate() {
+        // Bulk budget fully saturated by an oversize frame; a real-time
+        // packet must still be accepted instantly.
+        let (tx, _rx) = outbound_channel(4, 100);
+        tx.send(frame(500)).await.unwrap(); // uses the zero-inflight hatch
+        assert!(tx.inflight_bytes() > 100, "budget is over");
+        let gated =
+            tokio::time::timeout(std::time::Duration::from_millis(50), tx.send(frame(10))).await;
+        assert!(gated.is_err(), "bulk lane must still be gated");
+        tx.send_priority(frame(80)).expect("priority must not gate");
+    }
+
+    #[tokio::test]
+    async fn priority_full_is_reported_not_blocked() {
+        let (tx, _rx) = outbound_channel(4, 100);
+        // Fill the lane to capacity, then one past it: Err(Full), never park.
+        for _ in 0..BufferDefaults::PRIORITY_LANE_CAPACITY {
+            tx.send_priority(frame(8)).unwrap();
+        }
+        let err = tx.send_priority(frame(8)).unwrap_err();
+        assert!(matches!(err, PrioritySendError::Full));
+    }
+
+    #[tokio::test]
+    async fn priority_pending_tracks_backlog() {
+        let (tx, mut rx) = outbound_channel(4, 1000);
+        assert!(!rx.priority_pending());
+        tx.send_priority(frame(8)).unwrap();
+        assert!(rx.priority_pending());
+        let f = rx.try_recv_priority().expect("frame");
+        assert!(matches!(f, Frame::StreamData(_)));
+        assert!(!rx.priority_pending());
+    }
+
+    #[tokio::test]
+    async fn closed_priority_lane_reports_closed() {
+        let (tx, rx) = outbound_channel(4, 100);
+        drop(rx);
+        let err = tx.send_priority(frame(8)).unwrap_err();
+        assert_eq!(err, PrioritySendError::Closed);
     }
 }

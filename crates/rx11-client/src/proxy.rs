@@ -35,6 +35,9 @@ pub(crate) struct ProxyDeps<'a> {
     pub dataplane: &'a DataPlane,
     pub seq: &'a Arc<AtomicU32>,
     pub local_x11_addr: &'a str,
+    /// Runtime profile: frame dispatch consults it when opening the audio
+    /// outlet (player resolution), everything else rides the dataplane.
+    pub runtime: &'a rx11_core::config::RuntimeConfig,
 }
 
 /// Open the local X server socket for a relayed `ChannelOpen` and spawn the

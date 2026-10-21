@@ -67,6 +67,16 @@ impl BufferDefaults {
     pub const OUTBOUND_BATCH_FRAMES: usize = 64;
     /// Max bytes one coalesced outbound write may carry.
     pub const OUTBOUND_BATCH_BYTES: usize = 256 * 1024;
+    /// Capacity of the real-time outbound lane (audio packets at 50/s ≈
+    /// 10 s of buffering). The lane is a DROP-OLDEST-VALUE surface: a full
+    /// lane sheds NEW packets, because stale real-time audio is worthless
+    /// — unlike the X11 byte stream, losing a late audio frame is a click,
+    /// not corruption.
+    pub const PRIORITY_LANE_CAPACITY: usize = 512;
+    /// Max bytes one blocking socket commit may carry while the priority
+    /// lane is live. Real-time latency is bounded by this chunk (64 KiB ≈
+    /// 0.17 s on a 3 Mbit/s link), never by a whole coalesced batch.
+    pub const OUTBOUND_WRITE_CHUNK: usize = 64 * 1024;
 }
 
 impl IncrementalDefaults {
@@ -105,6 +115,21 @@ pub struct RuntimeConfig {
     pub image_recode_codec: crate::x11recode::RecodeCodec,
     pub image_recode_quality: u8,
     pub image_recode_min_bytes: usize,
+    /// Opt in to the `audio_forward` capability: the server records its
+    /// default output sink (monitor), ships Opus packets down a real-time
+    /// lane, and the client plays them locally. Off by default — it
+    /// captures desktop audio, which must be a deliberate choice on both
+    /// ends.
+    pub audio_forward: bool,
+    /// Opus target bitrate in kbit/s (VBR). 64 ≈ transparent stereo music;
+    /// 32 is fine for speech-heavy desktop sound.
+    pub audio_bitrate_kbps: u32,
+    /// Override the recorder argv (e.g. `["parec", "--raw", ...]`). `None`
+    /// auto-detects `parec` (PulseAudio and PipeWire both ship it).
+    pub audio_record_command: Option<Vec<String>>,
+    /// Override the player argv (e.g. `["paplay", "--raw", ...]`). `None`
+    /// auto-detects `paplay` (PulseAudio and PipeWire both ship it).
+    pub audio_play_command: Option<Vec<String>>,
 }
 
 impl Default for RuntimeConfig {
@@ -123,6 +148,10 @@ impl Default for RuntimeConfig {
             image_recode_codec: crate::x11recode::RecodeCodec::Jpeg,
             image_recode_quality: 80,
             image_recode_min_bytes: 16 * 1024,
+            audio_forward: false,
+            audio_bitrate_kbps: crate::audio::DEFAULT_BITRATE_KBPS,
+            audio_record_command: None,
+            audio_play_command: None,
         }
     }
 }

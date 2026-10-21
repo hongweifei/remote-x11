@@ -149,6 +149,7 @@ pub struct ChannelKind(String);
 
 impl ChannelKind {
     pub const X11_NAME: &'static str = "x11";
+    pub const AUDIO_NAME: &'static str = "audio";
 
     pub fn new(name: impl Into<String>) -> Self {
         Self(name.into())
@@ -160,6 +161,14 @@ impl ChannelKind {
 
     pub fn is_x11(&self) -> bool {
         self.0 == Self::X11_NAME
+    }
+
+    pub fn audio() -> Self {
+        Self(Self::AUDIO_NAME.to_string())
+    }
+
+    pub fn is_audio(&self) -> bool {
+        self.0 == Self::AUDIO_NAME
     }
 
     pub fn name(&self) -> &str {

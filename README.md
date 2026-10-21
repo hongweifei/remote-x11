@@ -41,9 +41,10 @@
 - **数据压缩** — 默认 zstd **跨帧流式**（`zstd_stream`：一条持续压缩流按帧 flush，后续帧复用历史；窗口重绘类流量在慢速链路上字节量大幅下降），可协商回退 zstd/lz4/zlib 单帧模式；超 256 字节自动压缩
 - **公网排队治理** — 发往中继的出站队列按**字节预算**封顶（默认 1 MB），慢链路不会积累分钟级积压；配合可选 `SO_SNDBUF` 上限，交互延迟预算 ≈ 队列+内核缓冲 ÷ 链路速率
 - **图像流量重编码（可选）** — `x11_recode` 能力：识别 X 协议里的大块 `PutImage` 请求（ZPixmap 24/32 位），在线路上换成 JPEG（有损，省 10~50 倍）或无损 PNG，收端展开后以原始请求字节写回本地 X server；非图像请求逐字节透传。默认关闭，两端 `[runtime] image_recode = true` 同时打开才协商成功。边界：GL 渲染的视频、Xv 扩展路径不在识别范围——那是帧缓冲模式（Xpra/x2go 的领域），不是透明转发器该假装的
+- **桌面音频转发（可选）** — `audio` 通道：服务端采集默认输出 sink 的 monitor，Opus（**纯 Rust** 移植，48 kHz 立体声，构建零系统库要求）编码后走**实时优先道**下推，收端解码交给 `paplay` 播放。64 kbit/s 约占 3 Mbps 链路 2%；优先道不受出站字节预算排队，图像洪峰下音频延迟以单个写块为界。默认关闭，两端 `audio_forward = true` 才协商。边界：只放声音，不做麦克风反向输入，不做唇音同步
 - **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
 - **能力协商** — 增量/重同步/流控等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
-- **通道类型可扩展** — 数据面帧族与载荷类型解耦：`ChannelOpen.kind` 声明类型（当前 `x11`），kind 即能力名，未知 kind 安全穿透不解析错
+- **通道类型可扩展** — 数据面帧族与载荷类型解耦：`ChannelOpen.kind` 声明类型（现为 `x11` 与 `audio`），kind 即能力名，未知 kind 安全穿透不解析错
 - **双向统计** — 客户端与服务端各自每 30 秒输出收发字节、压缩/增量节省量与活跃连接数
 - **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
 - **SSH 端口冲突检测** — 启动 SSH 隧道前自动检测本地端口是否被占用
@@ -251,6 +252,10 @@ rx11 config show   # 显示配置文件路径与当前内容
 # image_recode_codec = "jpeg"      jpeg（有损省带宽）| png（无损）
 # image_recode_quality = 80        JPEG 质量
 # image_recode_min_bytes = 16384   像素块小于此值不动
+# audio_forward = false            桌面音频转发总开关（两端同开才生效）
+# audio_bitrate_kbps = 64          Opus 码率（32=语音级，64≈接近透明）
+# audio_record_command = []        覆盖采集 argv（默认 parec；Pulse/PipeWire 都自带）
+# audio_play_command = []          覆盖播放 argv（默认 paplay --raw）
 ```
 
 低带宽链路（如 3 Mbps VPS 跑 Xfce）建议显式设置最后两项：排队延迟 ≈

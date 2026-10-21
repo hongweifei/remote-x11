@@ -3,10 +3,12 @@
 //! - [`connector`] — connect, handshake, session create/resume, auto-reconnect
 //! - [`serve`] — relay receive loop and frame dispatch
 //! - [`proxy`] — per-application X11 socket pumps
+//! - `audioout` — audio channel decoder/player (private)
 //! - [`ssh`] — SSH tunnel creation with health monitoring
 
 pub mod connector;
 pub mod ssh;
 
+mod audioout;
 mod proxy;
 mod serve;

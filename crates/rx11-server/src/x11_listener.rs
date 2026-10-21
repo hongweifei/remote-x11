@@ -17,7 +17,9 @@ const RELAY_REGISTER_RETRY: std::time::Duration = std::time::Duration::from_mill
 
 static NEXT_CONNECTION_ID: AtomicU64 = AtomicU64::new(1);
 
-fn next_connection_id() -> ConnectionId {
+/// Allocate the process-wide unique connection id. The audio pump uses it
+/// too, so channel ids can never collide with X11 listener connections.
+pub(crate) fn next_connection_id() -> ConnectionId {
     loop {
         let raw = NEXT_CONNECTION_ID.fetch_add(1, Ordering::Relaxed);
         let id = (raw & 0xFFFFFFFF) as u32;
