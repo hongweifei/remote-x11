@@ -3,6 +3,10 @@ name = "rx11-server"
 version.workspace = true
 edition.workspace = true
 
+[dev-dependencies]
+rx11-client = { path = "../rx11-client" }
+tracing-subscriber = { workspace = true }
+
 [dependencies]
 rx11-core = { path = "../rx11-core" }
 tokio = { workspace = true }
