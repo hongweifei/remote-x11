@@ -212,6 +212,9 @@ impl DownstreamReencoder {
                 None => return false,
             },
         };
+        if blob.is_empty() {
+            return false; // encoder declined: stay raw, never ship a dead container
+        }
         // Unit overhead: kind(1) + fixed container header(32) + prefix.
         let overhead = 1 + 32 + f.data_off;
         if blob.len() + overhead >= f.data_len {

@@ -1,124 +1,77 @@
-//! Lossless "opaque bytes" PNG codec: the pixel block is carried as a 1px
-//! tall grayscale image, so nothing in this path ever interprets pixel
-//! values — decode returns exactly what encode received. This is the
-//! lossless tier of the recoder (and the round-trip proof for the layout
-//! math in `frame.rs`).
+//! Lossless "opaque bytes" PNG codec on the `png` crate: the pixel block is
+//! carried as a 1px tall grayscale image, so nothing in this path ever
+//! interprets pixel values — decode returns exactly what encode received.
+//! This is the lossless tier of the recoder (and the round-trip proof for
+//! the layout math in `frame.rs`).
+//!
+//! Chunk assembly, CRC-32 and filter selection (the crate's default
+//! `Adaptive`) are the library's job; the hand-rolled predecessor this
+//! replaced always emitted filter 0 and left the filter stage on the table.
+//!
+//! Why `png` and not `zune-png` (evaluated 2026-10-21, v0.5.2): zune-png's
+//! decoder is the fastest in the ecosystem, but its encoder runs on
+//! zune-inflate's deflate, whose `DeflateEncodingStrategy` has exactly one
+//! variant — `NoCompression` ("Not yet complete"). A PNG tier that cannot
+//! shrink IDAT is not a PNG tier: the gradient round-trip came out LARGER
+//! than the input (4165 B for 4096 B of pixels), which would silently
+//! degrade every container to raw. Re-evaluate when the encoder grows real
+//! strategies.
 
-use flate2::write::ZlibEncoder;
-use std::io::Write;
+use std::io::Cursor;
 
-fn crc32(data: &[u8]) -> u32 {
-    // Standard IEEE CRC-32, table-driven once per process.
-    static TABLE: std::sync::OnceLock<[u32; 256]> = std::sync::OnceLock::new();
-    let table = TABLE.get_or_init(|| {
-        let mut t = [0u32; 256];
-        for (i, v) in t.iter_mut().enumerate() {
-            let mut c = i as u32;
-            for _ in 0..8 {
-                c = if c & 1 != 0 {
-                    0xEDB8_8320 ^ (c >> 1)
-                } else {
-                    c >> 1
-                };
-            }
-            *v = c;
-        }
-        t
-    });
-    let mut crc = 0xFFFF_FFFFu32;
-    for b in data {
-        crc = table[((crc ^ *b as u32) & 0xFF) as usize] ^ (crc >> 8);
-    }
-    crc ^ 0xFFFF_FFFF
-}
-
-fn chunk(out: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
-    out.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    out.extend_from_slice(kind);
-    out.extend_from_slice(body);
-    let mut crc_input = Vec::with_capacity(4 + body.len());
-    crc_input.extend_from_slice(kind);
-    crc_input.extend_from_slice(body);
-    out.extend_from_slice(&crc32(&crc_input).to_be_bytes());
-}
+use super::frame::MAX_RECODE_REQUEST;
 
 /// Encode arbitrary bytes as an 8-bit grayscale PNG (width = data len,
-/// height 1, filter 0 per scanline).
+/// height 1). Failure (empty input, absurd width, encoder errors) surfaces
+/// as an EMPTY return: the caller's container-size check degrades that unit
+/// to raw passthrough — encoding never fails upward and never corrupts.
 pub(crate) fn encode_raw_png(data: &[u8]) -> Vec<u8> {
+    let Ok(width) = u32::try_from(data.len()) else {
+        return Vec::new();
+    };
+    if width == 0 {
+        return Vec::new();
+    }
     let mut out = Vec::with_capacity(data.len() / 2 + 128);
-    out.extend_from_slice(b"\x89PNG\r\n\x1a\n");
-    let mut ihdr = Vec::with_capacity(13);
-    ihdr.extend_from_slice(&(data.len() as u32).to_be_bytes()); // width
-    ihdr.extend_from_slice(&1u32.to_be_bytes()); // height
-    ihdr.push(8); // bit depth
-    ihdr.push(0); // color type: grayscale
-    ihdr.extend_from_slice(&[0, 0, 0]); // compression, filter, interlace
-    chunk(&mut out, b"IHDR", &ihdr);
-    // Scanline data: one filter byte (0 = None) then the raw bytes.
-    let mut raw = Vec::with_capacity(data.len() + 1);
-    raw.push(0);
-    raw.extend_from_slice(data);
-    let mut enc = ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
-    // Compression failure here is impossible in practice (in-memory write);
-    // an empty IDAT would be caught by the reader, so propagate as empty.
-    let _ = enc.write_all(&raw);
-    let idat = enc.finish().unwrap_or_default();
-    chunk(&mut out, b"IDAT", &idat);
-    chunk(&mut out, b"IEND", b"");
+    let result = (|| -> Result<(), png::EncodingError> {
+        let mut encoder = png::Encoder::new(&mut out, width, 1);
+        encoder.set_color(png::ColorType::Grayscale);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.write_header()?.write_image_data(data)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        return Vec::new();
+    }
     out
 }
 
 /// Decode the exact output of [`encode_raw_png`]; rejects anything else
-/// shaped like a PNG we did not produce.
-pub(crate) fn decode_raw_png(png: &[u8]) -> Option<Vec<u8>> {
-    if png.len() < 8 + 12 + 12 + 12 || png[0..8] != *b"\x89PNG\r\n\x1a\n" {
-        return None;
-    }
-    let mut pos = 8usize;
-    let mut width = 0u32;
-    let mut idat: Vec<u8> = Vec::new();
-    while pos + 8 <= png.len() {
-        let len = u32::from_be_bytes([png[pos], png[pos + 1], png[pos + 2], png[pos + 3]]) as usize;
-        let kind = &png[pos + 4..pos + 8];
-        let body_start = pos + 8;
-        if body_start + len + 4 > png.len() {
+/// shaped like a PNG we did not produce. Shape checks mirror the encoder
+/// (gray8, single row, not interlaced); corruption is rejected by the
+/// library's chunk CRC and inflate checksums.
+pub(crate) fn decode_raw_png(png_data: &[u8]) -> Option<Vec<u8>> {
+    let mut reader = png::Decoder::new(Cursor::new(png_data)).read_info().ok()?;
+    {
+        let info = reader.info();
+        if info.width == 0
+            || info.height != 1
+            || info.color_type != png::ColorType::Grayscale
+            || info.bit_depth != png::BitDepth::Eight
+            || info.interlaced
+        {
             return None;
         }
-        let body = &png[body_start..body_start + len];
-        let crc = u32::from_be_bytes([
-            png[body_start + len],
-            png[body_start + len + 1],
-            png[body_start + len + 2],
-            png[body_start + len + 3],
-        ]);
-        let mut crc_input = Vec::with_capacity(4 + len);
-        crc_input.extend_from_slice(kind);
-        crc_input.extend_from_slice(body);
-        if crc32(&crc_input) != crc {
-            return None;
-        }
-        match kind {
-            b"IHDR" => {
-                // gray8, height 1, no interlace — only what we encode.
-                let height = u32::from_be_bytes([body[4], body[5], body[6], body[7]]);
-                if len != 13 || body[8] != 8 || body[9] != 0 || body[12] != 0 || height != 1 {
-                    return None;
-                }
-                width = u32::from_be_bytes([body[0], body[1], body[2], body[3]]);
-            }
-            b"IDAT" => idat.extend_from_slice(body),
-            b"IEND" => break,
-            _ => {}
-        }
-        pos = body_start + len + 4;
     }
-    use flate2::read::ZlibDecoder;
-    let mut raw = Vec::with_capacity(width as usize + 1);
-    std::io::Read::read_to_end(&mut ZlibDecoder::new(&idat[..]), &mut raw).ok()?;
-    if raw.len() != width as usize + 1 || raw[0] != 0 {
-        return None;
+    let size = reader.output_buffer_size()?;
+    if size as u64 > MAX_RECODE_REQUEST {
+        return None; // hand-built giant IHDR: our machine never made one
     }
-    Some(raw.split_off(1)) // drop the scanline filter byte, O(1)
+    let mut buf = vec![0u8; size];
+    let out = reader.next_frame(&mut buf).ok()?;
+    let len = (out.line_size * out.height as usize).min(buf.len());
+    buf.truncate(len);
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -133,6 +86,7 @@ mod tests {
             &(0..9000u32).map(|i| (i % 256) as u8).collect::<Vec<u8>>(),
         ] {
             let png = encode_raw_png(case);
+            assert!(!png.is_empty());
             assert_eq!(decode_raw_png(&png).unwrap(), case);
         }
     }
@@ -143,5 +97,51 @@ mod tests {
         let last = png.len() - 30;
         png[last] ^= 0xFF;
         assert!(decode_raw_png(&png).is_none());
+    }
+
+    #[test]
+    fn raw_png_rejects_foreign_shapes() {
+        // Not gray8: an RGB single-row image is a different contract.
+        let mut rgb = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut rgb, 4, 1);
+            enc.set_color(png::ColorType::Rgb);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()
+                .unwrap()
+                .write_image_data(&[7u8; 12])
+                .unwrap();
+        }
+        assert!(decode_raw_png(&rgb).is_none());
+        // Not one row: gray but height 2.
+        let mut tall = Vec::new();
+        {
+            let mut enc = png::Encoder::new(&mut tall, 4, 2);
+            enc.set_color(png::ColorType::Grayscale);
+            enc.set_depth(png::BitDepth::Eight);
+            enc.write_header()
+                .unwrap()
+                .write_image_data(&[7u8; 8])
+                .unwrap();
+        }
+        assert!(decode_raw_png(&tall).is_none());
+        // Empty never encodes: the caller degrades to raw.
+        assert!(encode_raw_png(&[]).is_empty());
+    }
+
+    #[test]
+    fn adaptive_filters_compress_gradients() {
+        // The property the hand-rolled encoder could not have: per-row
+        // filter choice (Adaptive) shrinks gradient-ish pixel spans hard
+        // even before deflate, and the round trip stays byte-exact.
+        let data: Vec<u8> = (0..4096).map(|i| (i / 16) as u8).collect();
+        let png = encode_raw_png(&data);
+        assert!(
+            png.len() < data.len() / 2,
+            "{} vs {}",
+            png.len(),
+            data.len()
+        );
+        assert_eq!(decode_raw_png(&png).unwrap(), data);
     }
 }

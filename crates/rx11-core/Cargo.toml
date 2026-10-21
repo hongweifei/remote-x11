@@ -20,3 +20,4 @@ uuid = { workspace = true }
 jpeg-encoder = "0.7.1"
 zune-jpeg = "0.5.15"
 opus-rs = "0.1.39"
+png = "0.18.1"
