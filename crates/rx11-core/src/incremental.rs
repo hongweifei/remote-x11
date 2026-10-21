@@ -175,9 +175,13 @@ impl ConnectionDataCache {
 
         for chunk in &msg.chunks {
             let end = chunk.offset + chunk.length;
-            if end <= msg.total_len {
-                result[chunk.offset..end].copy_from_slice(&chunk.data);
+            // A malformed chunk must fail the WHOLE frame (caller then
+            // triggers resync) — silently skipping it would deliver subtly
+            // corrupt payload and keep the cache poisoned.
+            if end > msg.total_len || chunk.data.len() != chunk.length {
+                return None;
             }
+            result[chunk.offset..end].copy_from_slice(&chunk.data);
         }
 
         self.update_cache(msg.connection_id, msg.sequence_id, &result);
@@ -216,6 +220,45 @@ mod tests {
 
         assert_eq!(seq, 1);
         assert_eq!(cached, &data[..]);
+    }
+
+    #[test]
+    fn test_apply_rejects_out_of_bounds_chunk() {
+        let mut cache = ConnectionDataCache::with_chunk_size(1024);
+        cache.update_cache(ConnectionId::new(1), 1, &[0u8; 2048]);
+        let msg = IncrementalX11DataMessage {
+            connection_id: ConnectionId::new(1),
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: 2048,
+            chunks: vec![IncrementalChunk {
+                offset: 2000,
+                length: 100, // past total_len
+                data: Bytes::from(vec![1u8; 100]),
+            }],
+        };
+        // Whole frame must be refused, cache left untouched, so the caller
+        // can request a full-frame resync instead of eating corrupt bytes.
+        assert_eq!(cache.apply_incremental(&msg), None);
+        assert_eq!(cache.get_cached(ConnectionId::new(1)).unwrap().0, 1);
+    }
+
+    #[test]
+    fn test_apply_rejects_declared_length_mismatch() {
+        let mut cache = ConnectionDataCache::new();
+        cache.update_cache(ConnectionId::new(1), 1, &[0u8; 2048]);
+        let msg = IncrementalX11DataMessage {
+            connection_id: ConnectionId::new(1),
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: 2048,
+            chunks: vec![IncrementalChunk {
+                offset: 0,
+                length: 8,
+                data: Bytes::from(vec![1u8; 4]), // length lies
+            }],
+        };
+        assert_eq!(cache.apply_incremental(&msg), None);
     }
 
     #[test]
