@@ -76,7 +76,10 @@ impl LocalConnector {
         let mut attempt: u32 = 0;
         let mut last_session_id: Option<String> = None;
         loop {
-            let sid = last_session_id.take();
+            // Clone, not take: a failed establish (transport never came up)
+            // must not consume the id — every later attempt keeps trying to
+            // resume the same session until one succeeds and overwrites it.
+            let sid = last_session_id.clone();
             let result = self
                 .connect_and_serve_once(sid.as_deref(), &mut last_session_id)
                 .await;
