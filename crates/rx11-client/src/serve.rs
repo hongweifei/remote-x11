@@ -104,6 +104,16 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
                 InboundOutcome::ResyncRequired { connection_id } => {
                     request_full_resend(ctx, connection_id).await;
                 }
+                InboundOutcome::StreamBroken => {
+                    // Bytes were lost on the way in (or the compression
+                    // stream desynced): the local X server would receive a
+                    // corrupted byte stream. Fail the session so the
+                    // reconnect-with-resume path rebuilds clean state.
+                    return Err(rx11_core::error::Rx11Error::Protocol(
+                        "compression stream broken; forcing reconnect".into(),
+                    )
+                    .into());
+                }
                 InboundOutcome::Dropped => {}
             }
         }
@@ -189,8 +199,8 @@ mod tests {
     struct Harness {
         read_half: Rx11TransportReadHalf,
         _write_half: Rx11TransportWriteHalf,
-        outbound_tx: mpsc::Sender<Frame>,
-        outbound_rx: mpsc::Receiver<Frame>,
+        outbound_tx: rx11_core::queue::OutboundSender,
+        outbound_rx: rx11_core::queue::OutboundReceiver,
         conns: SharedX11Conns,
         stats: Arc<ConnectionStats>,
         seq: Arc<AtomicU32>,
@@ -205,7 +215,7 @@ mod tests {
             let client = tokio::net::TcpStream::connect(addr).await.unwrap();
             let (_peer, _) = listener.accept().await.unwrap();
             let (read_half, write_half) = Rx11Transport::new(client).split();
-            let (tx, rx) = mpsc::channel(16);
+            let (tx, rx) = rx11_core::queue::outbound_channel(16, rx11_core::queue::UNLIMITED);
             let features = Features::from_list(&["incremental".into(), "request_resync".into()]);
             Self {
                 read_half,
@@ -385,7 +395,7 @@ mod tests {
         }
 
         match h.outbound_rx.recv().await {
-            Some(Frame::StreamResyncRequest(m)) => assert_eq!(m.connection_id, conn(7)),
+            Some((Frame::StreamResyncRequest(m), _)) => assert_eq!(m.connection_id, conn(7)),
             other => panic!("expected StreamResyncRequest, got {other:?}"),
         }
         let summary = h.stats.summary();
@@ -467,7 +477,7 @@ mod tests {
         // and one request frame is emitted.
         assert!(matches!(
             h.outbound_rx.recv().await,
-            Some(Frame::StreamResyncRequest(_))
+            Some((Frame::StreamResyncRequest(_), _))
         ));
     }
 
@@ -480,7 +490,7 @@ mod tests {
         }
         assert!(matches!(
             h.outbound_rx.recv().await,
-            Some(Frame::HeartbeatAck)
+            Some((Frame::HeartbeatAck, _))
         ));
     }
 

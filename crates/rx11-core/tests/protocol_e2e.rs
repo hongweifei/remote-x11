@@ -83,8 +83,9 @@ async fn handshake_negotiates_all_capabilities_and_compression() {
     assert!(features.supports(Capability::Incremental));
     assert!(features.supports(Capability::RequestResync));
     assert!(features.supports(Capability::X11));
-    // The best mutual algorithm wins.
-    assert_eq!(compression, Some(CompressionAlgo::Zstd));
+    // The best mutual algorithm wins — cross-frame streaming zstd since the
+    // WAN round (it negotiates ahead of one-shot `zstd`).
+    assert_eq!(compression, Some(CompressionAlgo::ZstdStream));
 }
 
 #[tokio::test]
@@ -388,11 +389,10 @@ async fn valid_header_with_corrupt_payload_fails_the_connection() {
 /// batch optimization is that the wire stays identical).
 #[tokio::test]
 async fn drain_frames_batches_without_changing_the_wire() {
-    use tokio::sync::mpsc;
     let (a, b) = duplex(64 * 1024);
     let transport_a = Rx11Transport::new(a);
     let mut reader = Rx11Transport::new(b);
-    let (tx, rx) = mpsc::channel::<Frame>(64);
+    let (tx, rx) = rx11_core::queue::outbound_channel(64, rx11_core::queue::UNLIMITED);
     let (_, write_half) = transport_a.split();
 
     let frames: Vec<Frame> = (1..=20u32)

@@ -14,6 +14,7 @@ use tracing::{debug, error};
 use rx11_core::config::BufferDefaults;
 use rx11_core::dataplane::DataPlane;
 use rx11_core::protocol::{ChannelCloseMessage, Frame};
+use rx11_core::queue::OutboundSender;
 use rx11_core::stats::ConnectionStats;
 use rx11_core::types::ConnectionId;
 
@@ -27,7 +28,7 @@ pub(crate) fn new_shared_conns() -> SharedX11Conns {
 
 /// Shared dependencies for proxying relay frames to local X connections.
 pub(crate) struct ProxyDeps<'a> {
-    pub outbound: &'a mpsc::Sender<Frame>,
+    pub outbound: &'a OutboundSender,
     pub x11_connections: &'a SharedX11Conns,
     pub stats: &'a Arc<ConnectionStats>,
     pub dataplane: &'a DataPlane,
@@ -101,7 +102,7 @@ struct ProxyContext<'a> {
     local_read: &'a mut tokio::io::ReadHalf<TcpStream>,
     local_write: &'a mut tokio::io::WriteHalf<TcpStream>,
     relay_rx: &'a mut mpsc::Receiver<bytes::Bytes>,
-    outbound: &'a mpsc::Sender<Frame>,
+    outbound: &'a OutboundSender,
     stats: &'a ConnectionStats,
     dataplane: &'a DataPlane,
     seq: &'a Arc<AtomicU32>,

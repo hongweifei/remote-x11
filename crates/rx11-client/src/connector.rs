@@ -8,7 +8,6 @@ use std::time::Duration;
 
 use rand::RngExt;
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
@@ -128,7 +127,7 @@ impl LocalConnector {
         )
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
-        let mut transport = Rx11Transport::connect_tcp(stream)?;
+        let mut transport = Rx11Transport::connect_tcp(stream, self.runtime.tcp_send_buffer_bytes)?;
 
         let resume_sid = resume_session_id
             .map(|s| SessionId::new(s.to_string()))
@@ -238,7 +237,10 @@ impl LocalConnector {
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
 
-        let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
+        let (outbound_tx, outbound_rx) = rx11_core::queue::outbound_channel(
+            BufferDefaults::OUTBOUND_CHANNEL,
+            self.runtime.outbound_queue_bytes,
+        );
 
         let stats_logger = {
             let stats = stats.clone();

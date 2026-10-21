@@ -28,6 +28,8 @@ pub struct RuntimeFileConfig {
     pub diff_chunk_size: Option<usize>,
     pub diff_min_block_size: Option<usize>,
     pub diff_min_savings_ratio: Option<f64>,
+    pub outbound_queue_bytes: Option<usize>,
+    pub tcp_send_buffer_bytes: Option<usize>,
 }
 
 impl RuntimeFileConfig {
@@ -48,6 +50,12 @@ impl RuntimeFileConfig {
             diff_min_savings_ratio: self
                 .diff_min_savings_ratio
                 .unwrap_or(defaults.diff_min_savings_ratio),
+            outbound_queue_bytes: self
+                .outbound_queue_bytes
+                .unwrap_or(defaults.outbound_queue_bytes),
+            tcp_send_buffer_bytes: self
+                .tcp_send_buffer_bytes
+                .or(defaults.tcp_send_buffer_bytes),
         }
     }
 }
@@ -108,6 +116,14 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # diff_chunk_size = 4096         # incremental diff granularity
 # diff_min_block_size = 1024     # frames below this are never diffed
 # diff_min_savings_ratio = 0.1   # min saved fraction to send a diff
+#
+# Slow-WAN tuning (e.g. a 3 Mbit/s VPS). Compression is zstd-stream by
+# default: cross-frame history, flushed per frame so nothing waits for a
+# frame boundary. These two bound the QUEUEING delay on top of that:
+# outbound_queue_bytes = 1048576 # in-flight bytes towards the WAN socket;
+#                                # latency ≈ this / link rate (1 MB ≈ 2.8 s at 3 Mbps)
+# tcp_send_buffer_bytes = 262144 # cap kernel SO_SNDBUF too, or the kernel
+#                                # buffer re-adds its own seconds of backlog
 "#;
 
 /// Test helper: serialize every test that touches HOME/USERPROFILE, since

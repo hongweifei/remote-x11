@@ -13,6 +13,7 @@
 use std::sync::Mutex;
 
 use bytes::Bytes;
+use zstd::stream::raw::{Decoder, Encoder, InBuffer, Operation, OutBuffer};
 
 use crate::compress::CompressionAlgo;
 use crate::config::RuntimeConfig;
@@ -38,6 +39,12 @@ pub enum InboundOutcome {
     /// Frame unusable (e.g. compressed without a negotiated algorithm);
     /// already logged, nothing to deliver.
     Dropped,
+    /// A negotiated compressed frame failed to decompress: those application
+    /// bytes are gone, and X11 is a positional byte stream — skipping them
+    /// would silently corrupt the session forever (in cross-frame stream
+    /// mode the decoder context is desynchronized too). The caller MUST
+    /// fail the connection; reconnect-with-resume is the recovery path.
+    StreamBroken,
 }
 
 /// Reusable zstd contexts. `zstd::encode_all`/`decode_all` allocate and
@@ -51,6 +58,11 @@ pub enum InboundOutcome {
 struct ZstdContexts {
     compressor: Mutex<Option<zstd::bulk::Compressor<'static>>>,
     decompressor: Mutex<Option<zstd::bulk::Decompressor<'static>>>,
+    /// Cross-frame streaming contexts (`zstd_stream` mode): one continuous
+    /// compression stream per direction, flushed after every frame so the
+    /// peer can decode incrementally while history survives across frames.
+    stream_encoder: Mutex<Option<Encoder<'static>>>,
+    stream_decoder: Mutex<Option<Decoder<'static>>>,
 }
 
 impl std::fmt::Debug for ZstdContexts {
@@ -87,18 +99,27 @@ impl DataPlane {
     fn compress(&self, data: &[u8]) -> Option<Bytes> {
         let algo = self.compression?;
         if data.len() < self.compression_threshold {
+            // Encoder untouched; the plain frame crosses the wire identically
+            // on both ends — stream stays in lockstep.
             return None;
         }
-        // zstd runs through the pooled context; other algorithms use the
-        // stateless codec (their setup cost is negligible).
-        let compressed = match algo {
-            CompressionAlgo::Zstd => self.zstd_compress(data)?,
-            other => other.compress_with(data, 0)?,
-        };
-        if compressed.len() >= data.len() {
-            return None;
+        match algo {
+            // Stream mode NEVER rejects: the encoder has already consumed
+            // this payload into the shared history, so the fragment must go
+            // on the wire even when it is slightly larger than the input —
+            // the peer must feed its decoder the same bytes or the contexts
+            // desynchronize and every later frame corrupts.
+            CompressionAlgo::ZstdStream => self.zstd_stream_compress(data),
+            CompressionAlgo::Zstd => {
+                let c = self.zstd_compress(data)?;
+                if c.len() >= data.len() {
+                    None
+                } else {
+                    Some(c)
+                }
+            }
+            other => other.compress_with(data, 0),
         }
-        Some(compressed)
     }
 
     fn zstd_compress(&self, data: &[u8]) -> Option<Bytes> {
@@ -120,6 +141,7 @@ impl DataPlane {
         let algo = self.compression?;
         match algo {
             CompressionAlgo::Zstd => self.zstd_decompress(compressed, original_len),
+            CompressionAlgo::ZstdStream => self.zstd_stream_decompress(compressed, original_len),
             other => other.decompress(compressed, original_len),
         }
     }
@@ -135,6 +157,87 @@ impl DataPlane {
         let out = guard.as_mut()?.decompress(compressed, original_len).ok()?;
         if out.len() != original_len {
             return None;
+        }
+        Some(out)
+    }
+
+    /// `zstd_stream` encode: feed the payload into the continuous stream,
+    /// then flush so the peer can decode *this* frame immediately. The
+    /// internal window/history survives across frames — that is the whole
+    /// point: repeated X11 content compresses against everything sent so
+    /// far, not just against itself.
+    fn zstd_stream_compress(&self, data: &[u8]) -> Option<Bytes> {
+        let mut guard = self.zstd.stream_encoder.lock().ok()?;
+        if guard.is_none() {
+            *guard = Some(Encoder::new(crate::compress::ZSTD_COMPRESSION_LEVEL).ok()?);
+        }
+        let enc = guard.as_mut()?;
+
+        let mut out: Vec<u8> =
+            Vec::with_capacity(zstd::zstd_safe::compress_bound(data.len()) + 128);
+        let mut consumed = 0usize;
+        let mut cursor = 0usize;
+        while consumed < data.len() {
+            let mut ib = InBuffer::around(&data[consumed..]);
+            let mut ob = OutBuffer::around_pos(&mut out, cursor);
+            enc.run(&mut ib, &mut ob).ok()?;
+            let read = ib.pos();
+            cursor = ob.pos();
+            if read == 0 {
+                // No input consumed: either the output filled up (grow and
+                // retry) or we are genuinely stuck (context malfunction).
+                if cursor >= out.capacity() {
+                    out.reserve(out.capacity().max(4096));
+                    continue;
+                }
+                return None;
+            }
+            consumed += read;
+        }
+        // Drain the internal buffer; flush keeps history, finish would not.
+        loop {
+            let mut ob = OutBuffer::around_pos(&mut out, cursor);
+            let remaining = enc.flush(&mut ob).ok()?;
+            cursor = ob.pos();
+            if remaining == 0 {
+                break;
+            }
+            if cursor >= out.capacity() {
+                out.reserve(out.capacity().max(4096));
+            }
+        }
+        Some(Bytes::from(out))
+    }
+
+    /// `zstd_stream` decode: feed the fragment until exactly `original_len`
+    /// bytes have been produced and the fragment is fully consumed. Any
+    /// stall or leftover is a hard stream violation (`None` → the caller
+    /// fails the connection — a desynced context cannot recover per frame).
+    fn zstd_stream_decompress(&self, compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
+        if original_len == 0 {
+            return Some(Vec::new());
+        }
+        let mut guard = self.zstd.stream_decoder.lock().ok()?;
+        if guard.is_none() {
+            *guard = Some(Decoder::new().ok()?);
+        }
+        let dec = guard.as_mut()?;
+
+        let mut out = vec![0u8; original_len];
+        let mut consumed = 0usize;
+        let mut produced = 0usize;
+        while produced < original_len {
+            let mut ib = InBuffer::around(&compressed[consumed..]);
+            let mut ob = OutBuffer::around(&mut out[produced..]);
+            dec.run(&mut ib, &mut ob).ok()?;
+            consumed += ib.pos();
+            produced += ob.pos();
+            if ib.pos() == 0 && ob.pos() == 0 {
+                return None; // needs more input than the frame carries
+            }
+        }
+        if consumed != compressed.len() {
+            return None; // trailing bytes belong to no payload
         }
         Some(out)
     }
@@ -237,8 +340,11 @@ impl DataPlane {
                 let conn = msg.connection_id;
                 let seq = msg.sequence_id;
                 let Some(decompressed) = self.decompress_payload(&msg.data, original_len) else {
-                    tracing::warn!("Decompression failed for {}, dropping frame", conn);
-                    return InboundOutcome::Dropped;
+                    tracing::warn!(
+                        "Decompression failed for {conn} — data bytes lost, failing the \
+                         connection (strict byte stream; resume will rebuild)"
+                    );
+                    return InboundOutcome::StreamBroken;
                 };
                 stats.add_compression_saved(original_len.saturating_sub(compressed_len) as u64);
                 let data = Bytes::from(decompressed);
@@ -262,12 +368,11 @@ impl DataPlane {
                 let compressed_len = msg.data.len();
                 let Some(diff_bytes) = self.decompress_payload(&msg.data, original_len) else {
                     tracing::warn!(
-                        "Incremental decompression failed for {}, dropping frame",
+                        "Incremental decompression failed for {} — compression stream \
+                         desynchronized, failing the connection",
                         conn
                     );
-                    return InboundOutcome::ResyncRequired {
-                        connection_id: conn,
-                    };
+                    return InboundOutcome::StreamBroken;
                 };
                 stats.add_incremental_compression_saved(
                     original_len.saturating_sub(compressed_len) as u64,
@@ -510,5 +615,135 @@ mod tests {
             &stats,
         );
         assert_eq!(outcome, InboundOutcome::Dropped);
+    }
+
+    /// Streaming pair helper: sender and receiver DataPlanes that live for
+    /// the whole "connection" — the same lifetime relationship the halves
+    /// have in the real topology (one DataPlane per direction, per session).
+    fn stream_pair() -> (DataPlane, DataPlane) {
+        let rt = runtime();
+        (
+            DataPlane::new(Features::default(), Some(CompressionAlgo::ZstdStream), &rt),
+            DataPlane::new(all_features(), Some(CompressionAlgo::ZstdStream), &rt),
+        )
+    }
+
+    fn push_one(sender: &DataPlane, receiver: &DataPlane, payload: &[u8]) {
+        let frame = sender.build_frame(conn(), 1, Bytes::from(payload.to_vec()), None, None);
+        let compressed = match frame {
+            Frame::CompressedStreamData(m) => m,
+            other => panic!("expected compressed frame, got {other:?}"),
+        };
+        let mut cache = ConnectionDataCache::new();
+        let stats = ConnectionStats::new();
+        match receiver.apply_inbound(
+            Frame::CompressedStreamData(compressed.clone()),
+            &mut cache,
+            &stats,
+        ) {
+            InboundOutcome::Payload { data, .. } => assert_eq!(&data[..], payload),
+            other => panic!("unexpected outcome {other:?}"),
+        }
+    }
+
+    #[test]
+    fn zstd_stream_round_trips_many_frames() {
+        let (sender, receiver) = stream_pair();
+        // Vary sizes and content; each frame must decode to itself through
+        // the continuous stream (per-frame flush semantics).
+        for i in 0..50u8 {
+            let payload: Vec<u8> = (0..500 + i as usize * 137)
+                .map(|j| (j % 251) as u8 ^ i)
+                .collect();
+            push_one(&sender, &receiver, &payload);
+        }
+        // A below-threshold payload rides plain, then bigger ones resume
+        // streaming on the same contexts.
+        let frame = sender.build_frame(conn(), 1, Bytes::from(vec![7u8; 8]), None, None);
+        assert!(matches!(frame, Frame::StreamData(_)));
+        push_one(&sender, &receiver, &[42u8; 4096]);
+    }
+
+    #[test]
+    fn zstd_stream_beats_per_frame_compression_on_repeats() {
+        // X11 redraw pattern: a mostly-unchanged high-entropy region
+        // (photo/desktop pixels) with a small changed stripe per frame.
+        // One-shot compression must re-encode the whole region every time;
+        // the stream finds it in its window history and ships the delta.
+        fn mix(mut s: u64) -> u8 {
+            s = s
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (s >> 40) as u8
+        }
+        let base: Vec<u8> = (0..8192u64).map(mix).collect();
+        let frames: Vec<Vec<u8>> = (0..32)
+            .map(|i| {
+                let mut v = base.clone();
+                let off = (i * 256) % (base.len() - 256);
+                v[off..off + 256].fill(i as u8);
+                v
+            })
+            .collect();
+        // Direct wire-byte comparison: sum the payload each mode emits.
+        let rt = runtime();
+        let sum = |algo: CompressionAlgo| -> usize {
+            let dp = DataPlane::new(Features::default(), Some(algo), &rt);
+            frames
+                .iter()
+                .map(
+                    |f| match dp.build_frame(conn(), 1, Bytes::from(f.clone()), None, None) {
+                        Frame::CompressedStreamData(m) => m.data.len(),
+                        Frame::StreamData(m) => m.data.len(),
+                        other => panic!("{other:?}"),
+                    },
+                )
+                .sum()
+        };
+        let one_shot = sum(CompressionAlgo::Zstd);
+        let stream = sum(CompressionAlgo::ZstdStream);
+        assert!(
+            stream < one_shot / 4,
+            "stream {stream} should beat one-shot {one_shot} decisively on redraw-like repeats"
+        );
+    }
+
+    #[test]
+    fn zstd_stream_corruption_reports_stream_broken() {
+        let (_sender, receiver) = stream_pair();
+        let mut cache = ConnectionDataCache::new();
+        let stats = ConnectionStats::new();
+        let outcome = receiver.apply_inbound(
+            Frame::CompressedStreamData(CompressedStreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 1,
+                original_len: 4096,
+                // Not a zstd frame fragment at all.
+                data: Bytes::from_static(b"garbage-bytes-that-are-not-zstd"),
+            }),
+            &mut cache,
+            &stats,
+        );
+        assert_eq!(outcome, InboundOutcome::StreamBroken);
+    }
+
+    #[test]
+    fn one_shot_decompression_failure_also_breaks_the_stream() {
+        // Byte-stream truth does not care which mode: lost bytes are lost.
+        let rt = runtime();
+        let dp = DataPlane::new(all_features(), Some(CompressionAlgo::Zstd), &rt);
+        let mut cache = ConnectionDataCache::new();
+        let stats = ConnectionStats::new();
+        let outcome = dp.apply_inbound(
+            Frame::CompressedStreamData(CompressedStreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 1,
+                original_len: 100,
+                data: Bytes::from_static(&[0xFF; 32]),
+            }),
+            &mut cache,
+            &stats,
+        );
+        assert_eq!(outcome, InboundOutcome::StreamBroken);
     }
 }

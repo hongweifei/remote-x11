@@ -4,7 +4,6 @@
 use bytes::{Buf, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::config::BufferDefaults;
@@ -130,9 +129,20 @@ impl<S: AsyncRead + AsyncWrite + Unpin> Rx11Transport<S> {
 
 impl Rx11Transport<TcpStream> {
     /// Wrap an accepted/connected TCP stream with the socket options the
-    /// relay depends on (no Nagle).
-    pub fn connect_tcp(stream: TcpStream) -> Result<Self> {
+    /// relay depends on: no Nagle, plus an optional send-buffer cap (a
+    /// kernel-side queue the size of the link's patience is the last
+    /// bufferbloat lever on slow WANs; `None` keeps the OS default).
+    pub fn connect_tcp(stream: TcpStream, send_buffer_bytes: Option<usize>) -> Result<Self> {
         stream.set_nodelay(true)?;
+        if let Some(size) = send_buffer_bytes {
+            // tokio only exposes buffer sizing on pre-connect TcpSocket;
+            // socket2's SockRef borrows the live fd without taking it.
+            let sock = socket2::SockRef::from(&stream);
+            if let Err(e) = sock.set_send_buffer_size(size) {
+                // Tuning nicety, never fatal: keep the connection going.
+                warn!("set_send_buffer_size({size}) failed: {e}");
+            }
+        }
         Ok(Self::new(stream))
     }
 }
@@ -181,19 +191,22 @@ impl<S: AsyncWrite + Unpin> Rx11TransportWriteHalf<S> {
     }
 }
 
-/// Drive a writer half from an outbound frame queue, COALESCING frames:
-/// when a frame arrives, drain whatever is already pending (bounded by
-/// frame count and byte budget) into one buffer and emit with a single
-/// write. A quiescent queue keeps per-frame latency (the blocking
-/// `recv()` returns immediately); a saturated queue gets batch syscalls
-/// instead of one write(2) per frame.
+/// Drive a writer half from the byte-budgeted outbound queue, COALESCING
+/// frames: when a frame arrives, drain whatever is already pending (bounded
+/// by frame count and batch bytes) into one buffer and emit with a single
+/// write. A quiescent queue keeps per-frame latency (the blocking `recv()`
+/// returns immediately); a saturated queue gets batch syscalls instead of
+/// one write(2) per frame. Popping a frame releases its share of the byte
+/// budget, unblocking gated producers.
 pub async fn drain_frames<S: AsyncWrite + Unpin>(
-    mut rx: mpsc::Receiver<Frame>,
+    mut rx: crate::queue::OutboundReceiver,
     mut write_half: Rx11TransportWriteHalf<S>,
 ) {
     let mut batch = BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF);
     loop {
-        let Some(first) = rx.recv().await else { break };
+        let Some((first, _)) = rx.recv().await else {
+            break;
+        };
         batch.clear();
         let mut failed = first.encode_into(&mut batch).is_err();
         let mut queued = 1usize;
@@ -202,7 +215,7 @@ pub async fn drain_frames<S: AsyncWrite + Unpin>(
             && batch.len() < BufferDefaults::OUTBOUND_BATCH_BYTES
         {
             match rx.try_recv() {
-                Ok(next) => {
+                Ok((next, _)) => {
                     if next.encode_into(&mut batch).is_err() {
                         failed = true;
                         break;

@@ -18,17 +18,25 @@ pub(crate) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 const ZLIB_COMPRESSION_LEVEL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum CompressionAlgo {
+    /// Cross-frame streaming zstd: one continuous compression stream per
+    /// direction, flushed after every frame. Later frames reference the
+    /// history of earlier ones — on real X11 traffic (repeated window
+    /// chrome, redrawn UI) this is what collapses bandwidth on slow links.
+    /// The stateful codec lives in `DataPlane`; this enum's stateless
+    /// methods fall back to a single-shot stream (equivalent to `Zstd`).
+    ZstdStream = 3,
     Zstd = 0,
     Lz4 = 1,
     Zlib = 2,
 }
 
 impl CompressionAlgo {
-    /// Preferred order used for negotiation and advertised by both peers.
-    pub const ALL: [CompressionAlgo; 3] = [
+    /// Preference order used for negotiation and advertised by both peers.
+    pub const ALL: [CompressionAlgo; 4] = [
+        CompressionAlgo::ZstdStream,
         CompressionAlgo::Zstd,
         CompressionAlgo::Lz4,
         CompressionAlgo::Zlib,
@@ -36,6 +44,7 @@ impl CompressionAlgo {
 
     pub fn as_str(&self) -> &'static str {
         match self {
+            CompressionAlgo::ZstdStream => "zstd_stream",
             CompressionAlgo::Zstd => "zstd",
             CompressionAlgo::Lz4 => "lz4",
             CompressionAlgo::Zlib => "zlib",
@@ -60,6 +69,10 @@ impl CompressionAlgo {
         }
         let compressed = match self {
             CompressionAlgo::Zstd => compress_zstd(data)?,
+            // Stateless fallback only: `DataPlane` performs the actual
+            // cross-frame streaming with pooled contexts. A single-shot
+            // stream equals a standalone zstd frame.
+            CompressionAlgo::ZstdStream => compress_zstd(data)?,
             CompressionAlgo::Lz4 => compress_lz4(data)?,
             CompressionAlgo::Zlib => compress_zlib(data)?,
         };
@@ -72,6 +85,7 @@ impl CompressionAlgo {
     pub fn decompress(&self, compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
         let result = match self {
             CompressionAlgo::Zstd => decompress_zstd(compressed)?,
+            CompressionAlgo::ZstdStream => decompress_zstd(compressed)?,
             CompressionAlgo::Lz4 => decompress_lz4(compressed)?,
             CompressionAlgo::Zlib => decompress_zlib(compressed, original_len)?,
         };

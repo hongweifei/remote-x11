@@ -8,6 +8,7 @@
 //! - [`auth`] — token and X cookie generation, constant-time verification
 //! - [`types`] — validated newtypes (`SessionId`, `Token`, `DisplayNumber`, …)
 //! - [`stats`] — lock-free connection statistics
+//! - [`queue`] — byte-budgeted outbound frame queue (WAN latency bound)
 //! - [`config`] — centralized default constants
 //! - [`error`] — [`error::Rx11Error`] with retry classification
 
@@ -18,6 +19,7 @@ pub mod dataplane;
 pub mod error;
 pub mod incremental;
 pub mod protocol;
+pub mod queue;
 pub mod stats;
 pub mod transport;
 pub mod types;

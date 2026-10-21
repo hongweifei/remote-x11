@@ -12,6 +12,7 @@ use rx11_core::config::{BufferDefaults, RuntimeConfig, ServerDefaults};
 use rx11_core::dataplane::DataPlane;
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
+use rx11_core::queue::{outbound_channel, OutboundSender};
 use rx11_core::stats::ConnectionStats;
 use rx11_core::transport::{drain_frames, Rx11Transport, Rx11TransportReadHalf};
 use rx11_core::types::{ConnectionId, DisplayNumber};
@@ -27,7 +28,7 @@ pub(super) async fn handle_client(
     auth_token: &str,
 ) -> rx11_core::error::Result<()> {
     info!("Client connected from {}", addr);
-    let mut transport = Rx11Transport::connect_tcp(stream)?;
+    let mut transport = Rx11Transport::connect_tcp(stream, runtime.tcp_send_buffer_bytes)?;
 
     let handshake = server_handshake(
         &mut transport,
@@ -50,7 +51,13 @@ pub(super) async fn handle_client(
 
     let (x11_event_tx, mut x11_event_rx) =
         mpsc::channel::<X11ConnToRelay>(BufferDefaults::CHANNEL_BUFFER);
-    let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
+    // Byte-budgeted WAN queue: producers block once `outbound_queue_bytes`
+    // are in flight, so a slow link's latency stays bounded no matter how
+    // fast the X server bursts.
+    let (outbound_tx, outbound_rx) = outbound_channel(
+        BufferDefaults::OUTBOUND_CHANNEL,
+        runtime.outbound_queue_bytes,
+    );
 
     let heartbeat_task = spawn_heartbeat(outbound_tx.clone(), runtime.heartbeat_interval);
     // Coalescing writer: batches already-queued frames into one syscall per
@@ -85,7 +92,7 @@ pub(super) async fn handle_client(
 }
 
 fn spawn_heartbeat(
-    outbound: mpsc::Sender<Frame>,
+    outbound: OutboundSender,
     interval: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
@@ -103,7 +110,7 @@ fn spawn_heartbeat(
 /// Everything the relay loop touches, borrowed from [`handle_client`]'s scope.
 struct RelayContext<'a> {
     read_half: &'a mut Rx11TransportReadHalf,
-    outbound: &'a mpsc::Sender<Frame>,
+    outbound: &'a OutboundSender,
     x11_events: &'a mut mpsc::Receiver<X11ConnToRelay>,
     session_mgr: &'a Arc<SessionManager>,
     transport_id: &'a str,
@@ -157,7 +164,7 @@ async fn relay_loop(ctx: &mut RelayContext<'_>) -> rx11_core::error::Result<()> 
 
 /// Queue a frame for the writer task; a closed queue means the connection is
 /// gone and the loop must stop.
-async fn send_outbound(outbound: &mpsc::Sender<Frame>, frame: Frame) -> RelayAction {
+async fn send_outbound(outbound: &OutboundSender, frame: Frame) -> RelayAction {
     if outbound.send(frame).await.is_err() {
         RelayAction::Disconnect
     } else {
@@ -260,10 +267,15 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                         .await;
                 }
                 None => {
+                    // Those bytes are gone and the X server stream is
+                    // positional: keep the session alive would corrupt it.
+                    // Drop the connection so the client reconnects (resume
+                    // rebuilds transports and the compression stream).
                     warn!(
-                        "Decompression failed for {}, dropping frame",
+                        "Decompression failed for {} — failing the client connection",
                         msg.connection_id
                     );
+                    return RelayAction::Disconnect;
                 }
             }
             RelayAction::Continue

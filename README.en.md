@@ -34,7 +34,8 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **X Server auto-detection** — Probes local X Server availability before connecting, with platform-specific hints
 - **xauth integration** — Server automatically manages `xauth` entries (MIT-MAGIC-COOKIE-1) for enhanced security
 - **Graceful shutdown** — Sends `SessionDestroy` frame on Ctrl+C to clean up remote sessions; `rx11 run` forwards signals to child processes
-- **Data compression** — zstd/lz4/zlib with auto-negotiation; payloads over 256 bytes are compressed, falling back to raw when compression does not help
+- **Data compression** — `zstd_stream` by default: one continuous compression stream flushed per frame, so later frames reference the history of everything already sent (redraw-heavy traffic collapses on slow links); negotiates down to one-shot zstd/lz4/zlib. Payloads over 256 bytes are compressed
+- **WAN queue discipline** — the outbound queue towards the relay is capped by **in-flight bytes** (default 1 MB), not frame count, so a 3 Mbit/s link never accumulates minutes of bufferbloat; an optional `SO_SNDBUF` cap tames the kernel buffer too
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
 - **Capability negotiation** — incremental/resync/flow-control features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
 - **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11`), kinds *are* capability names, and unknown kinds pass through without parse failures
@@ -242,7 +243,14 @@ Priority: **CLI args > env vars > config file > defaults**
 # diff_chunk_size = 4096            incremental diff granularity
 # diff_min_block_size = 1024        frames shorter than this are never diffed
 # diff_min_savings_ratio = 0.1      minimum saved fraction for sending a diff
+# outbound_queue_bytes = 1048576    in-flight byte budget towards the WAN (queueing-delay cap)
+# tcp_send_buffer_bytes = 262144    cap the kernel send buffer too; omit to let the OS autotune
 ```
+
+On slow links (a 3 Mbit/s VPS running Xfce, say) set the last two explicitly:
+queueing delay ≈ (`outbound_queue_bytes` + `tcp_send_buffer_bytes`) / link rate.
+Compression is already cross-frame streaming zstd by default — no
+compatibility trade-off is needed to save bandwidth.
 
 Use `rx11 config init` to generate a commented template file.
 

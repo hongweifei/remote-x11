@@ -52,10 +52,10 @@ async fn bulk_over_tcp_dataplane_only() {
         let payload = Arc::clone(&payload);
         async move {
             let stream = TcpStream::connect(addr).await.unwrap();
-            let mut tx = Rx11Transport::connect_tcp(stream).unwrap();
+            let mut tx = Rx11Transport::connect_tcp(stream, None).unwrap();
             let dp = DataPlane::new(
                 features,
-                Some(rx11_core::compress::CompressionAlgo::Zstd),
+                Some(rx11_core::compress::CompressionAlgo::ZstdStream),
                 &rt,
             );
             let mut cache = ConnectionDataCache::from_runtime(&rt);
@@ -80,11 +80,11 @@ async fn bulk_over_tcp_dataplane_only() {
     });
 
     let (peer, _) = listener.accept().await.unwrap();
-    let mut rx = Rx11Transport::connect_tcp(peer).unwrap();
+    let mut rx = Rx11Transport::connect_tcp(peer, None).unwrap();
     let rt = Arc::clone(&rt);
     let dp = DataPlane::new(
         features.clone(),
-        Some(rx11_core::compress::CompressionAlgo::Zstd),
+        Some(rx11_core::compress::CompressionAlgo::ZstdStream),
         &rt,
     );
     let mut cache = ConnectionDataCache::from_runtime(&rt);
@@ -107,6 +107,7 @@ async fn bulk_over_tcp_dataplane_only() {
                         InboundOutcome::Payload { data, .. } => out.extend_from_slice(&data),
                         InboundOutcome::ResyncRequired { .. } => requests += 1,
                         InboundOutcome::Dropped => requests += 1000,
+                        InboundOutcome::StreamBroken => panic!("compression stream broke"),
                     }
                 }
                 other => panic!("unexpected frame {:?}", other.msg_type()),

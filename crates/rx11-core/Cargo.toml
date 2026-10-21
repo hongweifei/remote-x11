@@ -15,4 +15,5 @@ rand = { workspace = true }
 flate2 = { workspace = true }
 lz4_flex = { workspace = true }
 zstd = { workspace = true }
+socket2 = { workspace = true }
 uuid = { workspace = true }

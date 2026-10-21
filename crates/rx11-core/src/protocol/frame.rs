@@ -100,6 +100,13 @@ macro_rules! define_frame_types {
                     $( Frame::$EVar => 0, )*
                 }
             }
+
+            /// Frame size on the wire for queue accounting: deterministic
+            /// per frame (exact for binary, optimistic for JSON), so the
+            /// value charged on send equals the one released on receive.
+            pub fn encoded_size(&self) -> usize {
+                FRAME_HEADER_SIZE + self.payload_len_hint()
+            }
         }
 
         $(

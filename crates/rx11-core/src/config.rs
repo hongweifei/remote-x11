@@ -50,8 +50,15 @@ impl SshDefaults {
 impl BufferDefaults {
     /// Channel capacity between the X11 socket pump and the relay task.
     pub const CHANNEL_BUFFER: usize = 2048;
-    /// Channel capacity of the outbound frame queue.
+    /// Channel capacity of the outbound frame queue (frame COUNT fairness
+    /// bound; the latency bound is [`BufferDefaults::OUTBOUND_QUEUE_BYTES`]).
     pub const OUTBOUND_CHANNEL: usize = 2048;
+    /// In-flight BYTES budget for the WAN-bound outbound queue. Sized for
+    /// interactivity on slow links: at 3 Mbit/s (≈375 KB/s) this caps the
+    /// queueing delay contributed by our own buffer at ~2.8 s even while a
+    /// huge redraw burst saturates the link; on localhost the queue drains
+    /// in microseconds, so throughput is unaffected.
+    pub const OUTBOUND_QUEUE_BYTES: usize = 1024 * 1024;
     /// Initial size of raw TCP read buffers (transport and X11 proxy loops).
     pub const INITIAL_READ_BUF: usize = 64 * 1024;
     /// Growth ceiling for raw TCP read buffers in the X11 proxy loops.
@@ -83,6 +90,14 @@ pub struct RuntimeConfig {
     pub diff_min_block_size: usize,
     /// Minimum fraction of the base frame a diff must save to be sent.
     pub diff_min_savings_ratio: f64,
+    /// In-flight byte budget of the WAN-bound outbound queue (see
+    /// [`BufferDefaults::OUTBOUND_QUEUE_BYTES`]).
+    pub outbound_queue_bytes: usize,
+    /// Optional cap for the TCP `SO_SNDBUF` on the relay socket. Slow-WAN
+    /// tip: pair a small queue with a small kernel buffer so the total
+    /// in-flight bytes (queue + socket) stay near the link's patience
+    /// budget. `None` leaves the OS autotuning in charge.
+    pub tcp_send_buffer_bytes: Option<usize>,
 }
 
 impl Default for RuntimeConfig {
@@ -95,6 +110,8 @@ impl Default for RuntimeConfig {
             diff_chunk_size: IncrementalDefaults::DEFAULT_CHUNK_SIZE,
             diff_min_block_size: IncrementalDefaults::MIN_BLOCK_SIZE_FOR_DIFF,
             diff_min_savings_ratio: IncrementalDefaults::MIN_SAVINGS_RATIO,
+            outbound_queue_bytes: BufferDefaults::OUTBOUND_QUEUE_BYTES,
+            tcp_send_buffer_bytes: None,
         }
     }
 }
