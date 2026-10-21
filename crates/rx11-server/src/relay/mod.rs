@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use tracing::{info, warn};
 
-use rx11_core::config::ServerDefaults;
+use rx11_core::config::{RuntimeConfig, ServerDefaults};
 use rx11_core::stats::ConnectionStats;
 
 use crate::session::SessionManager;
@@ -23,10 +23,21 @@ pub struct RelayServer {
     x11_base_port: u16,
     active_connections: Arc<AtomicUsize>,
     stats: Arc<ConnectionStats>,
+    runtime: RuntimeConfig,
 }
 
 impl RelayServer {
+    /// Relay server with the default runtime profile.
     pub fn new(listen_addr: String, auth_token: String, x11_base_port: u16) -> Self {
+        Self::with_config(listen_addr, auth_token, x11_base_port, RuntimeConfig::default())
+    }
+
+    pub fn with_config(
+        listen_addr: String,
+        auth_token: String,
+        x11_base_port: u16,
+        runtime: RuntimeConfig,
+    ) -> Self {
         Self {
             listen_addr,
             auth_token,
@@ -34,6 +45,7 @@ impl RelayServer {
             x11_base_port,
             active_connections: Arc::new(AtomicUsize::new(0)),
             stats: Arc::new(ConnectionStats::new()),
+            runtime,
         }
     }
 
@@ -90,9 +102,10 @@ impl RelayServer {
         let stats = self.stats.clone();
         let auth_token = self.auth_token.clone();
         let conn_counter = self.active_connections.clone();
+        let runtime = self.runtime.clone();
 
         tokio::spawn(async move {
-            let result = handle_client(stream, addr, session_mgr, stats, &auth_token).await;
+            let result = handle_client(stream, addr, session_mgr, stats, runtime, &auth_token).await;
             conn_counter.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 warn!("Client handler error: {}", e);

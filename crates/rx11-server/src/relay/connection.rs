@@ -8,10 +8,9 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use rx11_core::compress::{
-    decompress_frame_data, maybe_incremental_or_compress_frame, CompressionAlgo,
-};
-use rx11_core::config::{BufferDefaults, ServerDefaults};
+use rx11_core::compress::decompress_frame_data;
+use rx11_core::config::{BufferDefaults, RuntimeConfig, ServerDefaults};
+use rx11_core::dataplane::DataPlane;
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
 use rx11_core::stats::ConnectionStats;
@@ -25,10 +24,11 @@ pub(super) async fn handle_client(
     addr: SocketAddr,
     session_mgr: Arc<SessionManager>,
     stats: Arc<ConnectionStats>,
+    runtime: RuntimeConfig,
     auth_token: &str,
 ) -> rx11_core::error::Result<()> {
     info!("Client connected from {}", addr);
-    let mut transport = Rx11Transport::new(stream)?;
+    let mut transport = Rx11Transport::connect_tcp(stream)?;
 
     let handshake = server_handshake(
         &mut transport,
@@ -36,7 +36,7 @@ pub(super) async fn handle_client(
         ServerDefaults::HANDSHAKE_TIMEOUT,
     )
     .await?;
-    let compression = handshake.compression;
+    let dataplane = DataPlane::new(handshake.features, handshake.compression, &runtime);
 
     if let Some(ref sid) = handshake.resume_session_id {
         info!(
@@ -53,10 +53,10 @@ pub(super) async fn handle_client(
         mpsc::channel::<X11ConnToRelay>(BufferDefaults::CHANNEL_BUFFER);
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
 
-    let heartbeat_task = spawn_heartbeat(outbound_tx.clone(), ServerDefaults::HEARTBEAT_INTERVAL);
+    let heartbeat_task = spawn_heartbeat(outbound_tx.clone(), runtime.heartbeat_interval);
     let sender_task = spawn_sender(outbound_rx, write_half);
 
-    let mut incremental_cache = ConnectionDataCache::new();
+    let mut incremental_cache = ConnectionDataCache::from_runtime(&runtime);
 
     let mut ctx = RelayContext {
         read_half: &mut read_half,
@@ -64,8 +64,9 @@ pub(super) async fn handle_client(
         x11_events: &mut x11_event_rx,
         session_mgr: &session_mgr,
         transport_id: &transport_id,
-        compression,
-        heartbeat_deadline: tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT,
+        dataplane,
+        runtime: &runtime,
+        heartbeat_deadline: tokio::time::Instant::now() + runtime.heartbeat_timeout,
         x11_event_tx: &x11_event_tx,
         incremental_cache: &mut incremental_cache,
         stats: &stats,
@@ -119,7 +120,8 @@ struct RelayContext<'a> {
     x11_events: &'a mut mpsc::Receiver<X11ConnToRelay>,
     session_mgr: &'a Arc<SessionManager>,
     transport_id: &'a str,
-    compression: Option<CompressionAlgo>,
+    dataplane: DataPlane,
+    runtime: &'a RuntimeConfig,
     heartbeat_deadline: tokio::time::Instant,
     x11_event_tx: &'a mpsc::Sender<X11ConnToRelay>,
     incremental_cache: &'a mut ConnectionDataCache,
@@ -220,6 +222,13 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             forward_to_x11(ctx, msg.connection_id, msg.data.to_vec()).await
         }
         Frame::IncrementalRequestFull(msg) => {
+            if !ctx.dataplane.features.request_resync {
+                warn!(
+                    "Client {} sent IncrementalRequestFull but resync capability was not negotiated; ignoring",
+                    ctx.transport_id
+                );
+                return RelayAction::Continue;
+            }
             if !ctx
                 .session_mgr
                 .owns_connection(msg.connection_id, ctx.transport_id)
@@ -232,7 +241,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 return RelayAction::Continue;
             }
             info!(
-                "Client {} requested full resend for {} (diff cache dropped a frame); clearing send base",
+                "Client {} requested full resend for {}; dropping send diff base",
                 ctx.transport_id, msg.connection_id
             );
             ctx.incremental_cache.clear_connection(msg.connection_id);
@@ -250,7 +259,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 );
                 return RelayAction::Continue;
             }
-            let Some(algo) = ctx.compression else {
+            let Some(algo) = ctx.dataplane.compression else {
                 warn!("CompressedDataX11 received but no compression negotiated, dropping");
                 return RelayAction::Continue;
             };
@@ -271,13 +280,12 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             RelayAction::Continue
         }
         Frame::HeartbeatAck => {
-            ctx.heartbeat_deadline =
-                tokio::time::Instant::now() + ServerDefaults::HEARTBEAT_TIMEOUT;
+            ctx.heartbeat_deadline = tokio::time::Instant::now() + ctx.runtime.heartbeat_timeout;
             RelayAction::Continue
         }
         Frame::FlowControl(msg) => {
             warn!(
-                "Client {} FlowControl {:?} for {:?} (not implemented)",
+                "Client {} FlowControl {:?} for {:?} (capability registered, behavior not implemented)",
                 ctx.transport_id, msg.action, msg.connection_id
             );
             RelayAction::Continue
@@ -347,30 +355,6 @@ async fn send_session_ack(
     send_outbound(ctx.outbound, Frame::SessionAck(ack)).await
 }
 
-/// Attribute one outbound X11 data frame to the relay stats: wire bytes
-/// plus compression / incremental savings relative to the original payload.
-fn record_outbound_frame(stats: &ConnectionStats, frame: &Frame, original_len: usize) {
-    match frame {
-        Frame::DataX11(m) => stats.add_bytes_sent(m.data.len() as u64),
-        Frame::CompressedDataX11(m) => {
-            stats.add_bytes_sent(m.data.len() as u64);
-            stats.add_compression_saved(m.original_len.saturating_sub(m.data.len()) as u64);
-        }
-        Frame::IncrementalDataX11(m) => {
-            let chunks_len: usize = m.chunks.iter().map(|c| c.data.len()).sum();
-            stats.add_bytes_sent(chunks_len as u64);
-            stats.add_incremental_saved(original_len.saturating_sub(chunks_len) as u64);
-        }
-        Frame::CompressedIncrementalDataX11(m) => {
-            stats.add_bytes_sent(m.data.len() as u64);
-            stats.add_incremental_compression_saved(
-                m.original_len.saturating_sub(m.data.len()) as u64
-            );
-        }
-        _ => {}
-    }
-}
-
 async fn handle_x11_event(
     event: Option<X11ConnToRelay>,
     ctx: &mut RelayContext<'_>,
@@ -395,16 +379,14 @@ async fn handle_x11_event(
             data,
             ..
         }) => {
-            let original_len = data.len();
             let sequence_id = ctx.incremental_cache.next_sequence_for(connection_id);
-            let frame = maybe_incremental_or_compress_frame(
+            let frame = ctx.dataplane.build_frame(
                 connection_id,
                 sequence_id,
                 data,
-                ctx.compression,
                 Some(ctx.incremental_cache),
+                Some(ctx.stats),
             );
-            record_outbound_frame(ctx.stats, &frame, original_len);
             send_outbound(ctx.outbound, frame).await
         }
         Some(X11ConnToRelay::Disconnected {
@@ -426,91 +408,5 @@ async fn handle_x11_event(
             .await
         }
         None => RelayAction::Disconnect,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use bytes::Bytes;
-    use rx11_core::protocol::{CompressedIncrementalX11DataMessage, IncrementalChunk};
-    use rx11_core::types::ConnectionId;
-
-    fn conn() -> ConnectionId {
-        ConnectionId::new(1)
-    }
-
-    #[test]
-    fn test_record_outbound_plain_counts_bytes_only() {
-        let stats = ConnectionStats::new();
-        let frame = Frame::DataX11(X11DataMessage {
-            connection_id: conn(),
-            sequence_id: 1,
-            data: Bytes::from(vec![7u8; 600]),
-        });
-        record_outbound_frame(&stats, &frame, 600);
-        let summary = stats.summary();
-        assert!(summary.contains("Sent: 600 B"), "{summary}");
-        assert!(!summary.contains("Compressed (full)"), "{summary}");
-        assert!(!summary.contains("Incremental"), "{summary}");
-    }
-
-    #[test]
-    fn test_record_outbound_compressed_counts_savings() {
-        let stats = ConnectionStats::new();
-        let frame = Frame::CompressedDataX11(CompressedX11DataMessage {
-            connection_id: conn(),
-            sequence_id: 2,
-            original_len: 1000,
-            data: Bytes::from(vec![0u8; 300]),
-        });
-        record_outbound_frame(&stats, &frame, 1000);
-        let summary = stats.summary();
-        assert!(summary.contains("Sent: 300 B"), "{summary}");
-        assert!(
-            summary.contains("Compressed (full): 1 frames, saved 700 B"),
-            "{summary}"
-        );
-    }
-
-    #[test]
-    fn test_record_outbound_incremental_counts_diff_savings() {
-        let stats = ConnectionStats::new();
-        let frame = Frame::IncrementalDataX11(IncrementalX11DataMessage {
-            connection_id: conn(),
-            sequence_id: 3,
-            base_sequence_id: 2,
-            total_len: 4096,
-            chunks: vec![IncrementalChunk {
-                offset: 1024,
-                length: 256,
-                data: Bytes::from(vec![1u8; 256]),
-            }],
-        });
-        record_outbound_frame(&stats, &frame, 4096);
-        let summary = stats.summary();
-        assert!(summary.contains("Sent: 256 B"), "{summary}");
-        assert!(
-            summary.contains("Incremental: 1 frames, saved 3.8 KB"),
-            "{summary}"
-        );
-    }
-
-    #[test]
-    fn test_record_outbound_compressed_incremental_uses_encoded_len() {
-        let stats = ConnectionStats::new();
-        // original_len carries the encoded-diff length, not the app payload.
-        let frame = Frame::CompressedIncrementalDataX11(CompressedIncrementalX11DataMessage {
-            connection_id: conn(),
-            sequence_id: 4,
-            original_len: 512,
-            data: Bytes::from(vec![0u8; 120]),
-        });
-        record_outbound_frame(&stats, &frame, 4096);
-        let summary = stats.summary();
-        assert!(
-            summary.contains("Compressed (incremental): 1 frames, saved 392 B"),
-            "{summary}"
-        );
     }
 }
