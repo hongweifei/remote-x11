@@ -56,6 +56,10 @@ impl BufferDefaults {
     pub const INITIAL_READ_BUF: usize = 64 * 1024;
     /// Growth ceiling for raw TCP read buffers in the X11 proxy loops.
     pub const PROXY_READ_BUF_MAX: usize = 256 * 1024;
+    /// Max frames one coalesced outbound write may carry.
+    pub const OUTBOUND_BATCH_FRAMES: usize = 64;
+    /// Max bytes one coalesced outbound write may carry.
+    pub const OUTBOUND_BATCH_BYTES: usize = 256 * 1024;
 }
 
 impl IncrementalDefaults {

@@ -24,6 +24,7 @@ mod messages;
 pub use binary::BinaryMessageCodec;
 pub use capability::{Capability, Features};
 pub use frame::{decode_frame, encode_frame, frame_header_size, Frame};
+pub(crate) use frame::{decode_frame_owned, peek_frame};
 pub use handshake::{client_handshake, server_handshake, HandshakeResult};
 pub use message_type::{MessageType, TagBand};
 pub use messages::*;

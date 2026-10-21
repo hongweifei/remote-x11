@@ -20,9 +20,29 @@ use crate::types::ConnectionId;
 
 pub trait BinaryMessageCodec {
     fn encode_payload(&self) -> Result<Bytes>;
+
+    /// Total encoded payload size; lets the framer seed its destination
+    /// buffer exactly (one allocation, no realloc-churn on hot paths).
+    fn payload_len(&self) -> usize;
+
+    /// Append the payload to `out` directly. Hot-path framing uses this to
+    /// materialize header+payload in ONE buffer, skipping the intermediate
+    /// payload allocation that [`Self::encode_payload`] needs.
+    fn encode_payload_into(&self, out: &mut BytesMut) -> Result<()>;
+
     fn decode_payload(data: &[u8]) -> Result<Self>
     where
         Self: Sized;
+
+    /// Decode from an owned buffer. Zero-copy implementations slice `data`
+    /// (refcounted) instead of `copy_from_slice`-ing it out of the read
+    /// buffer; the default keeps every non-data payload correct as-is.
+    fn decode_payload_owned(data: Bytes) -> Result<Self>
+    where
+        Self: Sized,
+    {
+        Self::decode_payload(&data)
+    }
 }
 
 /// Shared helpers for the two connection-data layouts above; `label` is only
@@ -31,6 +51,18 @@ mod helpers {
     use super::*;
 
     pub(super) fn encode_conn_seq(conn: u32, seq: u32, data: &[u8], label: &str) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(4 + 4 + data.len());
+        encode_conn_seq_into(&mut buf, conn, seq, data, label)?;
+        Ok(buf.freeze())
+    }
+
+    pub(super) fn encode_conn_seq_into(
+        buf: &mut BytesMut,
+        conn: u32,
+        seq: u32,
+        data: &[u8],
+        label: &str,
+    ) -> Result<()> {
         if data.len() > MAX_FRAME_SIZE {
             return Err(Rx11Error::Protocol(format!(
                 "{label} payload too large: {} bytes (max {})",
@@ -38,14 +70,24 @@ mod helpers {
                 MAX_FRAME_SIZE
             )));
         }
-        let mut buf = BytesMut::with_capacity(4 + 4 + data.len());
+        buf.reserve(4 + 4 + data.len());
         buf.extend_from_slice(&conn.to_be_bytes());
         buf.extend_from_slice(&seq.to_be_bytes());
         buf.extend_from_slice(data);
-        Ok(buf.freeze())
+        Ok(())
     }
 
     pub(super) fn decode_conn_seq(data: &[u8], label: &str) -> Result<(u32, u32, Bytes)> {
+        let (conn, seq, payload) = decode_conn_seq_parts(data, label)?;
+        Ok((conn, seq, Bytes::copy_from_slice(payload)))
+    }
+
+    /// Shared bounds-check + field parse; returns the payload as a borrowed
+    /// slice for the copying variant and `Bytes::slice` for the owned one.
+    pub(super) fn decode_conn_seq_parts<'d>(
+        data: &'d [u8],
+        label: &str,
+    ) -> Result<(u32, u32, &'d [u8])> {
         const MIN_LEN: usize = 8;
         if data.len() < MIN_LEN {
             return Err(Rx11Error::Protocol(format!(
@@ -56,7 +98,7 @@ mod helpers {
         }
         let conn = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-        Ok((conn, seq, Bytes::copy_from_slice(&data[MIN_LEN..])))
+        Ok((conn, seq, &data[MIN_LEN..]))
     }
 
     pub(super) fn encode_conn_seq_len(
@@ -66,6 +108,19 @@ mod helpers {
         data: &[u8],
         label: &str,
     ) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(4 + 4 + 4 + data.len());
+        encode_conn_seq_len_into(&mut buf, conn, seq, original_len, data, label)?;
+        Ok(buf.freeze())
+    }
+
+    pub(super) fn encode_conn_seq_len_into(
+        buf: &mut BytesMut,
+        conn: u32,
+        seq: u32,
+        original_len: usize,
+        data: &[u8],
+        label: &str,
+    ) -> Result<()> {
         let len_u32: u32 = original_len
             .try_into()
             .map_err(|_| Rx11Error::Protocol("original_len exceeds u32".into()))?;
@@ -76,18 +131,26 @@ mod helpers {
                 MAX_FRAME_SIZE
             )));
         }
-        let mut buf = BytesMut::with_capacity(4 + 4 + 4 + data.len());
+        buf.reserve(4 + 4 + 4 + data.len());
         buf.extend_from_slice(&conn.to_be_bytes());
         buf.extend_from_slice(&seq.to_be_bytes());
         buf.extend_from_slice(&len_u32.to_be_bytes());
         buf.extend_from_slice(data);
-        Ok(buf.freeze())
+        Ok(())
     }
 
     pub(super) fn decode_conn_seq_len(
         data: &[u8],
         label: &str,
     ) -> Result<(u32, u32, usize, Bytes)> {
+        let (conn, seq, original_len, payload) = decode_conn_seq_len_parts(data, label)?;
+        Ok((conn, seq, original_len, Bytes::copy_from_slice(payload)))
+    }
+
+    pub(super) fn decode_conn_seq_len_parts<'d>(
+        data: &'d [u8],
+        label: &str,
+    ) -> Result<(u32, u32, usize, &'d [u8])> {
         const MIN_LEN: usize = 12;
         if data.len() < MIN_LEN {
             return Err(Rx11Error::Protocol(format!(
@@ -99,20 +162,32 @@ mod helpers {
         let conn = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
         let seq = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
         let original_len = u32::from_be_bytes([data[8], data[9], data[10], data[11]]) as usize;
-        Ok((
-            conn,
-            seq,
-            original_len,
-            Bytes::copy_from_slice(&data[MIN_LEN..]),
-        ))
+        Ok((conn, seq, original_len, &data[MIN_LEN..]))
     }
 }
 
-use helpers::{decode_conn_seq, decode_conn_seq_len, encode_conn_seq, encode_conn_seq_len};
+use helpers::{
+    decode_conn_seq, decode_conn_seq_len, decode_conn_seq_len_parts, decode_conn_seq_parts,
+    encode_conn_seq, encode_conn_seq_into, encode_conn_seq_len, encode_conn_seq_len_into,
+};
 
 impl BinaryMessageCodec for StreamDataMessage {
+    fn payload_len(&self) -> usize {
+        4 + 4 + self.data.len()
+    }
+
     fn encode_payload(&self) -> Result<Bytes> {
         encode_conn_seq(
+            self.connection_id.get(),
+            self.sequence_id,
+            &self.data,
+            "StreamData",
+        )
+    }
+
+    fn encode_payload_into(&self, out: &mut BytesMut) -> Result<()> {
+        encode_conn_seq_into(
+            out,
             self.connection_id.get(),
             self.sequence_id,
             &self.data,
@@ -128,11 +203,35 @@ impl BinaryMessageCodec for StreamDataMessage {
             data: payload,
         })
     }
+
+    fn decode_payload_owned(data: Bytes) -> Result<Self> {
+        let (conn, sequence_id, _) = decode_conn_seq_parts(&data, "StreamData")?;
+        Ok(Self {
+            connection_id: ConnectionId::new(conn),
+            sequence_id,
+            data: data.slice(8..),
+        })
+    }
 }
 
 impl BinaryMessageCodec for CompressedStreamDataMessage {
+    fn payload_len(&self) -> usize {
+        4 + 4 + 4 + self.data.len()
+    }
+
     fn encode_payload(&self) -> Result<Bytes> {
         encode_conn_seq_len(
+            self.connection_id.get(),
+            self.sequence_id,
+            self.original_len,
+            &self.data,
+            "CompressedStreamData",
+        )
+    }
+
+    fn encode_payload_into(&self, out: &mut BytesMut) -> Result<()> {
+        encode_conn_seq_len_into(
+            out,
             self.connection_id.get(),
             self.sequence_id,
             self.original_len,
@@ -151,11 +250,37 @@ impl BinaryMessageCodec for CompressedStreamDataMessage {
             data: payload,
         })
     }
+
+    fn decode_payload_owned(data: Bytes) -> Result<Self> {
+        let (conn, sequence_id, original_len, _) =
+            decode_conn_seq_len_parts(&data, "CompressedStreamData")?;
+        Ok(Self {
+            connection_id: ConnectionId::new(conn),
+            sequence_id,
+            original_len,
+            data: data.slice(12..),
+        })
+    }
 }
 
 impl BinaryMessageCodec for CompressedIncrementalStreamDataMessage {
+    fn payload_len(&self) -> usize {
+        4 + 4 + 4 + self.data.len()
+    }
+
     fn encode_payload(&self) -> Result<Bytes> {
         encode_conn_seq_len(
+            self.connection_id.get(),
+            self.sequence_id,
+            self.original_len,
+            &self.data,
+            "CompressedIncrementalStreamData",
+        )
+    }
+
+    fn encode_payload_into(&self, out: &mut BytesMut) -> Result<()> {
+        encode_conn_seq_len_into(
+            out,
             self.connection_id.get(),
             self.sequence_id,
             self.original_len,
@@ -174,6 +299,17 @@ impl BinaryMessageCodec for CompressedIncrementalStreamDataMessage {
             data: payload,
         })
     }
+
+    fn decode_payload_owned(data: Bytes) -> Result<Self> {
+        let (conn, sequence_id, original_len, _) =
+            decode_conn_seq_len_parts(&data, "CompressedIncrementalStreamData")?;
+        Ok(Self {
+            connection_id: ConnectionId::new(conn),
+            sequence_id,
+            original_len,
+            data: data.slice(12..),
+        })
+    }
 }
 
 /// Read a big-endian `u32` at `pos`; caller guarantees bounds.
@@ -182,7 +318,25 @@ fn be_u32_at(data: &[u8], pos: usize) -> u32 {
 }
 
 impl BinaryMessageCodec for IncrementalStreamDataMessage {
+    fn payload_len(&self) -> usize {
+        4 + 4 + 4 + 4 + 2 + self.chunks.iter().map(|c| 8 + c.data.len()).sum::<usize>()
+    }
+
     fn encode_payload(&self) -> Result<Bytes> {
+        let mut buf = BytesMut::with_capacity(self.payload_len());
+        let start = buf.len();
+        self.encode_payload_into(&mut buf)?;
+        if buf.len() - start > MAX_FRAME_SIZE {
+            return Err(Rx11Error::Protocol(format!(
+                "IncrementalStreamData payload too large: {} bytes (max {})",
+                buf.len() - start,
+                MAX_FRAME_SIZE
+            )));
+        }
+        Ok(buf.freeze())
+    }
+
+    fn encode_payload_into(&self, out: &mut BytesMut) -> Result<()> {
         let total_len_u32: u32 = self
             .total_len
             .try_into()
@@ -193,12 +347,12 @@ impl BinaryMessageCodec for IncrementalStreamDataMessage {
             .try_into()
             .map_err(|_| Rx11Error::Protocol("too many chunks".into()))?;
 
-        let mut buf = BytesMut::new();
-        buf.extend_from_slice(&self.connection_id.get().to_be_bytes());
-        buf.extend_from_slice(&self.sequence_id.to_be_bytes());
-        buf.extend_from_slice(&self.base_sequence_id.to_be_bytes());
-        buf.extend_from_slice(&total_len_u32.to_be_bytes());
-        buf.extend_from_slice(&chunk_count_u16.to_be_bytes());
+        out.reserve(4 + 4 + 4 + 4 + 2);
+        out.extend_from_slice(&self.connection_id.get().to_be_bytes());
+        out.extend_from_slice(&self.sequence_id.to_be_bytes());
+        out.extend_from_slice(&self.base_sequence_id.to_be_bytes());
+        out.extend_from_slice(&total_len_u32.to_be_bytes());
+        out.extend_from_slice(&chunk_count_u16.to_be_bytes());
 
         for chunk in &self.chunks {
             let offset_u32: u32 = chunk
@@ -209,77 +363,106 @@ impl BinaryMessageCodec for IncrementalStreamDataMessage {
                 .length
                 .try_into()
                 .map_err(|_| Rx11Error::Protocol("chunk length exceeds u32".into()))?;
-            buf.extend_from_slice(&offset_u32.to_be_bytes());
-            buf.extend_from_slice(&length_u32.to_be_bytes());
-            buf.extend_from_slice(&chunk.data);
+            out.reserve(8 + chunk.data.len());
+            out.extend_from_slice(&offset_u32.to_be_bytes());
+            out.extend_from_slice(&length_u32.to_be_bytes());
+            out.extend_from_slice(&chunk.data);
         }
 
-        if buf.len() > MAX_FRAME_SIZE {
-            return Err(Rx11Error::Protocol(format!(
-                "IncrementalStreamData payload too large: {} bytes (max {})",
-                buf.len(),
-                MAX_FRAME_SIZE
-            )));
-        }
-
-        Ok(buf.freeze())
+        Ok(())
     }
 
     fn decode_payload(data: &[u8]) -> Result<Self> {
-        const MIN_LEN: usize = 4 + 4 + 4 + 4 + 2;
-        if data.len() < MIN_LEN {
-            return Err(Rx11Error::Protocol(format!(
-                "IncrementalStreamData payload too short: {} bytes (min {})",
-                data.len(),
-                MIN_LEN
-            )));
-        }
-
-        let mut pos = 0;
-        let connection_id = be_u32_at(data, pos);
-        pos += 4;
-        let sequence_id = be_u32_at(data, pos);
-        pos += 4;
-        let base_sequence_id = be_u32_at(data, pos);
-        pos += 4;
-        let total_len = be_u32_at(data, pos) as usize;
-        pos += 4;
-        let chunk_count = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
-        pos += 2;
-
-        let mut chunks = Vec::with_capacity(chunk_count);
-        for _ in 0..chunk_count {
-            if pos + 8 > data.len() {
-                return Err(Rx11Error::Protocol(
-                    "Invalid IncrementalStreamData chunk header".into(),
-                ));
-            }
-            let offset = be_u32_at(data, pos) as usize;
-            pos += 4;
-            let length = be_u32_at(data, pos) as usize;
-            pos += 4;
-            if pos + length > data.len() {
-                return Err(Rx11Error::Protocol(
-                    "Invalid IncrementalStreamData chunk data".into(),
-                ));
-            }
-            let chunk_data = Bytes::copy_from_slice(&data[pos..pos + length]);
-            pos += length;
-            chunks.push(IncrementalChunk {
+        let (fields, chunks) = decode_incremental_parts(data)?;
+        let chunks = chunks
+            .into_iter()
+            .map(|(offset, length, pos)| IncrementalChunk {
                 offset,
                 length,
-                data: chunk_data,
-            });
-        }
-
-        Ok(Self {
-            connection_id: ConnectionId::new(connection_id),
-            sequence_id,
-            base_sequence_id,
-            total_len,
-            chunks,
-        })
+                data: Bytes::copy_from_slice(&data[pos..pos + length]),
+            })
+            .collect();
+        Ok(build_incremental(fields, chunks))
     }
+
+    fn decode_payload_owned(data: Bytes) -> Result<Self> {
+        let (fields, chunks) = decode_incremental_parts(&data)?;
+        let chunks = chunks
+            .into_iter()
+            .map(|(offset, length, pos)| IncrementalChunk {
+                offset,
+                length,
+                data: data.slice(pos..pos + length),
+            })
+            .collect();
+        Ok(build_incremental(fields, chunks))
+    }
+}
+
+/// Validated header fields plus each chunk's `(offset, length, position)`;
+/// payload bytes stay with the source buffer so each decode variant can copy
+/// or alias them without a second pass.
+type IncrementalParts = ((u32, u32, u32, usize), Vec<(usize, usize, usize)>);
+
+fn build_incremental(
+    (connection_id, sequence_id, base_sequence_id, total_len): (u32, u32, u32, usize),
+    chunks: Vec<IncrementalChunk>,
+) -> IncrementalStreamDataMessage {
+    IncrementalStreamDataMessage {
+        connection_id: ConnectionId::new(connection_id),
+        sequence_id,
+        base_sequence_id,
+        total_len,
+        chunks,
+    }
+}
+
+fn decode_incremental_parts(data: &[u8]) -> Result<IncrementalParts> {
+    const MIN_LEN: usize = 4 + 4 + 4 + 4 + 2;
+    if data.len() < MIN_LEN {
+        return Err(Rx11Error::Protocol(format!(
+            "IncrementalStreamData payload too short: {} bytes (min {})",
+            data.len(),
+            MIN_LEN
+        )));
+    }
+
+    let mut pos = 0;
+    let connection_id = be_u32_at(data, pos);
+    pos += 4;
+    let sequence_id = be_u32_at(data, pos);
+    pos += 4;
+    let base_sequence_id = be_u32_at(data, pos);
+    pos += 4;
+    let total_len = be_u32_at(data, pos) as usize;
+    pos += 4;
+    let chunk_count = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+
+    let mut chunks = Vec::with_capacity(chunk_count);
+    for _ in 0..chunk_count {
+        if pos + 8 > data.len() {
+            return Err(Rx11Error::Protocol(
+                "Invalid IncrementalStreamData chunk header".into(),
+            ));
+        }
+        let offset = be_u32_at(data, pos) as usize;
+        pos += 4;
+        let length = be_u32_at(data, pos) as usize;
+        pos += 4;
+        if pos + length > data.len() {
+            return Err(Rx11Error::Protocol(
+                "Invalid IncrementalStreamData chunk data".into(),
+            ));
+        }
+        chunks.push((offset, length, pos));
+        pos += length;
+    }
+
+    Ok((
+        (connection_id, sequence_id, base_sequence_id, total_len),
+        chunks,
+    ))
 }
 
 #[cfg(test)]

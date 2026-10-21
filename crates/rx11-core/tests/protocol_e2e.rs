@@ -357,3 +357,72 @@ async fn resume_session_id_round_trips_through_negotiation() {
     assert_eq!(server_hs.unwrap().resume_session_id, Some(resume.clone()));
     assert_eq!(client_hs.unwrap().resume_session_id, Some(resume));
 }
+
+/// A length-valid header carrying an undecodable payload must fail the
+/// transport: X11 is a strict byte stream, so silently skipping the frame
+/// would lose those bytes forever. Reconnect-with-resume is the recovery.
+#[tokio::test]
+async fn valid_header_with_corrupt_payload_fails_the_connection() {
+    use tokio::io::AsyncWriteExt;
+    let (server_side, mut client_side) = duplex(4096);
+    let mut transport = Rx11Transport::new(server_side);
+
+    let mut raw = Vec::new();
+    raw.extend_from_slice(&rx11_core::protocol::MAGIC_BYTES);
+    raw.push(rx11_core::protocol::WIRE_VERSION);
+    // StreamData (0x20) claiming a 4-byte payload: below the 8-byte minimum.
+    raw.extend_from_slice(&0x20u16.to_be_bytes());
+    raw.extend_from_slice(&4u32.to_be_bytes());
+    raw.extend_from_slice(&[0u8; 4]);
+    client_side.write_all(&raw).await.unwrap();
+
+    let err = transport.recv_frame().await.unwrap_err();
+    assert!(
+        matches!(err, rx11_core::error::Rx11Error::Protocol(_)),
+        "expected protocol error, got {err:?}"
+    );
+}
+
+/// The coalescing writer must preserve frame ORDER and byte-exact framing
+/// when multiple frames arrive while it is busy (the whole point of the
+/// batch optimization is that the wire stays identical).
+#[tokio::test]
+async fn drain_frames_batches_without_changing_the_wire() {
+    use tokio::sync::mpsc;
+    let (a, b) = duplex(64 * 1024);
+    let transport_a = Rx11Transport::new(a);
+    let mut reader = Rx11Transport::new(b);
+    let (tx, rx) = mpsc::channel::<Frame>(64);
+    let (_, write_half) = transport_a.split();
+
+    let frames: Vec<Frame> = (1..=20u32)
+        .map(|i| {
+            Frame::StreamData(rx11_core::protocol::StreamDataMessage {
+                connection_id: ConnectionId::new(7),
+                sequence_id: i,
+                data: Bytes::from(vec![i as u8; 4096]),
+            })
+        })
+        .collect();
+    let expected = frames.clone();
+    let sender = tokio::spawn(async move {
+        for f in &frames {
+            tx.send(f.clone()).await.unwrap();
+        }
+        // Close the queue before draining: drain_frames runs over whatever
+        // piled up (all 20 here, duplex capacity permitting) and ends.
+        drop(tx);
+        rx11_core::transport::drain_frames(rx, write_half).await;
+    });
+    for want in &expected {
+        let got = reader.recv_frame().await.unwrap();
+        match (want, &got) {
+            (Frame::StreamData(w), Frame::StreamData(g)) => {
+                assert_eq!(w.sequence_id, g.sequence_id);
+                assert_eq!(&w.data[..], &g.data[..]);
+            }
+            _ => panic!("frame shape drift: expected {want:?}"),
+        }
+    }
+    sender.await.unwrap();
+}

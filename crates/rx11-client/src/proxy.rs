@@ -110,14 +110,21 @@ struct ProxyContext<'a> {
 /// Relay both directions until either side closes; buffers grow geometrically
 /// up to the proxy read limit.
 async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
-    let mut buf = vec![0u8; BufferDefaults::INITIAL_READ_BUF];
+    // BytesMut accumulation: kernel read lands directly in the buffer that
+    // becomes the frame payload (split().freeze() is a refcount, not a
+    // memcpy), saving one full payload copy per read.
+    let mut buf = bytes::BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF);
     loop {
+        let want = (buf.capacity() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
+        if buf.capacity() < want {
+            buf.reserve(want - buf.capacity());
+        }
         tokio::select! {
-            result = ctx.local_read.read(&mut buf) => {
+            result = ctx.local_read.read_buf(&mut buf) => {
                 match result {
                     Ok(0) => break,
-                    Ok(n) => {
-                        let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                    Ok(_) => {
+                        let data = buf.split().freeze();
                         let seq_id = ctx.seq.fetch_add(1, Ordering::Relaxed);
 
                         // build_frame owns outbound stats (wire bytes plus
@@ -131,11 +138,6 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
                         );
                         if ctx.outbound.send(frame).await.is_err() {
                             break;
-                        }
-
-                        if buf.len() < BufferDefaults::PROXY_READ_BUF_MAX {
-                            let new_size = (buf.len() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
-                            buf.resize(new_size, 0);
                         }
                     }
                     Err(e) => {

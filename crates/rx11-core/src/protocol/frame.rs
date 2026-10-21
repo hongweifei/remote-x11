@@ -40,7 +40,11 @@ macro_rules! define_frame_types {
                 }
             }
 
-            pub fn encode(&self) -> Result<Bytes> {
+            /// Append `MAGIC|version|type|len|payload` for this frame to
+            /// `out` in a single buffer. Binary payloads are materialized
+            /// with exactly one memcpy (the copy into `out`); JSON frames
+            /// additionally borrow through `serde_json`'s Vec.
+            pub fn encode_into(&self, out: &mut BytesMut) -> Result<()> {
                 match self {
                     $(
                         Frame::$JVar(msg) => {
@@ -52,18 +56,48 @@ macro_rules! define_frame_types {
                                     json.len(), MAX_FRAME_SIZE
                                 )));
                             }
-                            encode_raw(MessageType::$JVar as u16, &json)
+                            let at = begin_header(out, MessageType::$JVar as u16);
+                            out.reserve(json.len());
+                            out.extend_from_slice(&json);
+                            finish_header(out, at);
                         }
                     )*
                     $(
                         Frame::$BVar(msg) => {
-                            let payload = < $BPayload as BinaryMessageCodec >::encode_payload(msg)?;
-                            encode_raw(MessageType::$BVar as u16, &payload)
+                            let at = begin_header(out, MessageType::$BVar as u16);
+                            if let Err(e) = < $BPayload as BinaryMessageCodec >::encode_payload_into(msg, out) {
+                                out.truncate(at);
+                                return Err(e);
+                            }
+                            if let Err(e) = finish_header_checked(out, at, stringify!($BVar)) {
+                                out.truncate(at);
+                                return Err(e);
+                            }
                         }
                     )*
                     $(
-                        Frame::$EVar => encode_raw(MessageType::$EVar as u16, &[]),
+                        Frame::$EVar => {
+                            let at = begin_header(out, MessageType::$EVar as u16);
+                            finish_header(out, at);
+                        }
                     )*
+                }
+                Ok(())
+            }
+
+            pub fn encode(&self) -> Result<Bytes> {
+                let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + self.payload_len_hint());
+                self.encode_into(&mut buf)?;
+                Ok(buf.freeze())
+            }
+
+            /// Exact or optimistic payload size, used to seed encode buffers
+            /// at their final size (one allocation, zero growth copies).
+            fn payload_len_hint(&self) -> usize {
+                match self {
+                    $( Frame::$JVar(_) => 128, )*
+                    $( Frame::$BVar(msg) => < $BPayload as BinaryMessageCodec >::payload_len(msg), )*
+                    $( Frame::$EVar => 0, )*
                 }
             }
         }
@@ -111,6 +145,25 @@ macro_rules! define_frame_types {
                 )*
             }
         }
+
+        /// Owned-buffer twin of [`decode_payload`]: binary payloads alias the
+        /// caller's allocation (refcounted slices, no memcpy).
+        fn decode_payload_owned(msg_type: MessageType, payload: Bytes) -> Result<Frame> {
+            match msg_type {
+                $(
+                    MessageType::$JVar => decode_payload(msg_type, &payload),
+                )*
+                $(
+                    MessageType::$BVar => {
+                        < $BPayload as BinaryMessageCodec >::decode_payload_owned(payload)
+                            .map(Frame::$BVar)
+                    }
+                )*
+                $(
+                    MessageType::$EVar => decode_payload(msg_type, &payload),
+                )*
+            }
+        }
     };
 }
 
@@ -143,25 +196,43 @@ define_frame_types! {
     }
 }
 
-fn encode_raw(msg_type: u16, payload: &[u8]) -> Result<Bytes> {
-    let len: u32 = payload
-        .len()
-        .try_into()
-        .map_err(|_| Rx11Error::Protocol("payload exceeds u32 max".into()))?;
-    let mut buf = BytesMut::with_capacity(FRAME_HEADER_SIZE + payload.len());
-    buf.extend_from_slice(&MAGIC_BYTES);
-    buf.extend_from_slice(&[WIRE_VERSION]);
-    buf.extend_from_slice(&msg_type.to_be_bytes());
-    buf.extend_from_slice(&len.to_be_bytes());
-    buf.extend_from_slice(payload);
-    Ok(buf.freeze())
+/// Write `MAGIC|version|type|len(placeholder)` at the current tail; returns
+/// the start offset so `finish_header` can back-patch the payload length
+/// once the payload has been appended.
+fn begin_header(out: &mut BytesMut, msg_type: u16) -> usize {
+    let at = out.len();
+    out.reserve(FRAME_HEADER_SIZE);
+    out.extend_from_slice(&MAGIC_BYTES);
+    out.extend_from_slice(&[WIRE_VERSION]);
+    out.extend_from_slice(&msg_type.to_be_bytes());
+    out.extend_from_slice(&0u32.to_be_bytes());
+    at
 }
 
-pub fn encode_frame(frame: &Frame) -> Result<Bytes> {
-    frame.encode()
+fn finish_header(out: &mut BytesMut, at: usize) {
+    let payload_len = (out.len() - at - FRAME_HEADER_SIZE) as u32;
+    out[at + 7..at + FRAME_HEADER_SIZE].copy_from_slice(&payload_len.to_be_bytes());
 }
 
-pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
+/// `finish_header` plus the MAX_FRAME_SIZE check; on overflow the partially
+/// written frame is truncated away so `out` keeps only prior frames.
+fn finish_header_checked(out: &mut BytesMut, at: usize, label: &str) -> Result<()> {
+    let payload_len = out.len() - at - FRAME_HEADER_SIZE;
+    if payload_len > MAX_FRAME_SIZE {
+        out.truncate(at);
+        return Err(Rx11Error::Protocol(format!(
+            "{label} payload too large: {payload_len} bytes (max {MAX_FRAME_SIZE})"
+        )));
+    }
+    finish_header(out, at);
+    Ok(())
+}
+
+/// Parse + validate the frame header WITHOUT consuming anything.
+/// `Ok(None)` = not enough bytes for a header yet; `Ok(Some((mt, total)))` =
+/// a well-formed header whose full frame is `total` bytes; `Err` = corrupt
+/// header (magic, version, unknown type or oversized length).
+pub(crate) fn peek_frame(data: &[u8]) -> Result<Option<(MessageType, usize)>> {
     if data.len() < FRAME_HEADER_SIZE {
         return Ok(None);
     }
@@ -183,14 +254,33 @@ pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
             payload_len, MAX_FRAME_SIZE
         )));
     }
-    let total = FRAME_HEADER_SIZE + payload_len;
+    let msg_type = MessageType::try_from(msg_type)?;
+    Ok(Some((msg_type, FRAME_HEADER_SIZE + payload_len)))
+}
+
+pub fn encode_frame(frame: &Frame) -> Result<Bytes> {
+    frame.encode()
+}
+
+/// Borrowed decode (payloads are copied out). Kept for tests and callers
+/// that work on plain slices; the transport uses `decode_frame_bytes`.
+pub fn decode_frame(data: &[u8]) -> Result<Option<(Frame, usize)>> {
+    let (msg_type, total) = match peek_frame(data)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
     if data.len() < total {
         return Ok(None);
     }
     let payload = &data[FRAME_HEADER_SIZE..total];
-    let msg_type = MessageType::try_from(msg_type)?;
     let frame = decode_payload(msg_type, payload)?;
     Ok(Some((frame, total)))
+}
+
+/// Owned-buffer twin of [`decode_payload`]: binary payloads alias the
+/// caller's allocation (refcounted slices, no memcpy).
+pub(crate) fn decode_frame_owned(msg_type: MessageType, payload: Bytes) -> Result<Frame> {
+    decode_payload_owned(msg_type, payload)
 }
 
 pub const fn frame_header_size() -> usize {

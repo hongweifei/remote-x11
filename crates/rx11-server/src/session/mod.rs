@@ -381,20 +381,46 @@ impl SessionManager {
         }
     }
 
-    pub async fn send_to_x11_connection(&self, conn_id: ConnectionId, data: Vec<u8>) {
+    pub async fn send_to_x11_connection(&self, conn_id: ConnectionId, data: bytes::Bytes) {
         if let Some(state) = self.connections.lock().await.get(&conn_id.get()) {
-            if state
-                .sender
-                .send(X11RelayToConn::Data(bytes::Bytes::from(data)))
-                .await
-                .is_err()
-            {
+            if state.sender.send(X11RelayToConn::Data(data)).await.is_err() {
                 warn!(
                     "Failed to send data to x11 connection {}, channel full or closed",
                     conn_id
                 );
             }
         }
+    }
+
+    /// Ownership-checked delivery in a single session-manager lookup: verify
+    /// `client_id` owns the connection's display, then hand the payload to
+    /// that X11 connection. Returns false for unknown or foreign-owned
+    /// connections (the caller logs).
+    pub async fn deliver_to_x11(
+        &self,
+        conn_id: ConnectionId,
+        client_id: &str,
+        data: bytes::Bytes,
+    ) -> bool {
+        let route = {
+            let conns = self.connections.lock().await;
+            conns
+                .get(&conn_id.get())
+                .map(|state| (state.display, state.sender.clone()))
+        };
+        let Some((display, sender)) = route else {
+            return false;
+        };
+        if !self.owns_session(display, client_id).await {
+            return false;
+        }
+        if sender.send(X11RelayToConn::Data(data)).await.is_err() {
+            warn!(
+                "Failed to send data to x11 connection {}, channel full or closed",
+                conn_id
+            );
+        }
+        true
     }
 
     pub async fn destroy_all_sessions(&self) {

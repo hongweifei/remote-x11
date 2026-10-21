@@ -238,8 +238,7 @@ impl LocalConnector {
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
 
-        let (outbound_tx, mut outbound_rx) =
-            mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
+        let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
 
         let stats_logger = {
             let stats = stats.clone();
@@ -254,15 +253,7 @@ impl LocalConnector {
             })
         };
 
-        let sender_task = tokio::spawn(async move {
-            let mut write_half = write_half;
-            while let Some(frame) = outbound_rx.recv().await {
-                if write_half.send_frame(&frame).await.is_err() {
-                    break;
-                }
-            }
-            let _ = write_half.flush().await;
-        });
+        let sender_task = tokio::spawn(rx11_core::transport::drain_frames(outbound_rx, write_half));
 
         info!(
             "Proxying X11 data: relay <-> local X server at {}",

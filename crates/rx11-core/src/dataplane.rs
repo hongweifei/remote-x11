@@ -10,6 +10,8 @@
 //! - adding a new data-plane stage (e.g. a future retransmit window or
 //!   flow-control hook) means extending this module, not the relay loops.
 
+use std::sync::Mutex;
+
 use bytes::Bytes;
 
 use crate::compress::CompressionAlgo;
@@ -38,12 +40,34 @@ pub enum InboundOutcome {
     Dropped,
 }
 
+/// Reusable zstd contexts. `zstd::encode_all`/`decode_all` allocate and
+/// initialize a fresh (de)compression context per call — at ~tens of
+/// microseconds each, that dominated the per-frame CPU at our frame sizes.
+/// A `DataPlane` is per-connection-task, so this state rides along with the
+/// negotiated policy it belongs to; the mutex only guards interior mutability
+/// (never held across an await).
+/// Opaque pooled codec state; the zstd contexts don't implement Debug.
+#[derive(Default)]
+struct ZstdContexts {
+    compressor: Mutex<Option<zstd::bulk::Compressor<'static>>>,
+    decompressor: Mutex<Option<zstd::bulk::Decompressor<'static>>>,
+}
+
+impl std::fmt::Debug for ZstdContexts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZstdContexts")
+            .field("pooled", &true)
+            .finish()
+    }
+}
+
 /// Negotiated data-plane configuration for one relay session.
 #[derive(Debug, Clone)]
 pub struct DataPlane {
     pub features: Features,
     pub compression: Option<CompressionAlgo>,
     pub compression_threshold: usize,
+    zstd: std::sync::Arc<ZstdContexts>,
 }
 
 impl DataPlane {
@@ -56,12 +80,63 @@ impl DataPlane {
             features,
             compression,
             compression_threshold: runtime.compression_threshold,
+            zstd: std::sync::Arc::new(ZstdContexts::default()),
         }
     }
 
     fn compress(&self, data: &[u8]) -> Option<Bytes> {
         let algo = self.compression?;
-        algo.compress_with(data, self.compression_threshold)
+        if data.len() < self.compression_threshold {
+            return None;
+        }
+        // zstd runs through the pooled context; other algorithms use the
+        // stateless codec (their setup cost is negligible).
+        let compressed = match algo {
+            CompressionAlgo::Zstd => self.zstd_compress(data)?,
+            other => other.compress_with(data, 0)?,
+        };
+        if compressed.len() >= data.len() {
+            return None;
+        }
+        Some(compressed)
+    }
+
+    fn zstd_compress(&self, data: &[u8]) -> Option<Bytes> {
+        let mut guard = self.zstd.compressor.lock().ok()?;
+        if guard.is_none() {
+            *guard =
+                Some(zstd::bulk::Compressor::new(crate::compress::ZSTD_COMPRESSION_LEVEL).ok()?);
+        }
+        // Reused context, one-shot compress; the Vec moves into `Bytes`
+        // without a copy.
+        let out = guard.as_mut()?.compress(data).ok()?;
+        Some(Bytes::from(out))
+    }
+
+    /// Decompress one compressed data-plane payload with the negotiated
+    /// algorithm, reusing the pooled zstd context. Sole decompression
+    /// authority for both ends' inbound paths.
+    pub fn decompress_payload(&self, compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
+        let algo = self.compression?;
+        match algo {
+            CompressionAlgo::Zstd => self.zstd_decompress(compressed, original_len),
+            other => other.decompress(compressed, original_len),
+        }
+    }
+
+    fn zstd_decompress(&self, compressed: &[u8], original_len: usize) -> Option<Vec<u8>> {
+        let mut guard = self.zstd.decompressor.lock().ok()?;
+        if guard.is_none() {
+            *guard = Some(zstd::bulk::Decompressor::new().ok()?);
+        }
+        // Capped at the advertised size: an oversized/undersized frame
+        // errors out here, which is exactly the integrity check the
+        // stateless path performed by comparing result lengths.
+        let out = guard.as_mut()?.decompress(compressed, original_len).ok()?;
+        if out.len() != original_len {
+            return None;
+        }
+        Some(out)
     }
 
     fn plain_or_compressed(
@@ -121,8 +196,8 @@ impl DataPlane {
         let original_len = data.len();
         let frame = match (self.features.supports(Capability::Incremental), cache) {
             (true, Some(cache)) => {
-                let diff = cache.compute_incremental(connection_id, sequence_id, &data);
-                cache.update_cache(connection_id, sequence_id, &data);
+                let diff = cache.compute_incremental_owned(connection_id, sequence_id, &data);
+                cache.update_cache_owned(connection_id, sequence_id, data.clone());
                 match diff {
                     Some(diff) => self.wrap_diff(diff, connection_id, sequence_id),
                     None => self.plain_or_compressed(connection_id, sequence_id, data),
@@ -146,29 +221,29 @@ impl DataPlane {
         match frame {
             Frame::StreamData(msg) => {
                 stats.add_bytes_received(msg.data.len() as u64);
-                cache.update_cache(msg.connection_id, msg.sequence_id, &msg.data);
+                cache.update_cache_owned(msg.connection_id, msg.sequence_id, msg.data.clone());
                 InboundOutcome::Payload {
                     connection_id: msg.connection_id,
                     data: msg.data,
                 }
             }
             Frame::CompressedStreamData(msg) => {
-                let Some(algo) = self.compression else {
+                if self.compression.is_none() {
                     tracing::warn!("CompressedStreamData but no compression negotiated, dropping");
                     return InboundOutcome::Dropped;
-                };
+                }
                 let original_len = msg.original_len;
                 let compressed_len = msg.data.len();
                 let conn = msg.connection_id;
                 let seq = msg.sequence_id;
-                let Some(decompressed) = crate::compress::decompress_frame_data(&msg, algo) else {
+                let Some(decompressed) = self.decompress_payload(&msg.data, original_len) else {
                     tracing::warn!("Decompression failed for {}, dropping frame", conn);
                     return InboundOutcome::Dropped;
                 };
                 stats.add_compression_saved(original_len.saturating_sub(compressed_len) as u64);
                 let data = Bytes::from(decompressed);
                 stats.add_bytes_received(data.len() as u64);
-                cache.update_cache(conn, seq, &data);
+                cache.update_cache_owned(conn, seq, data.clone());
                 InboundOutcome::Payload {
                     connection_id: conn,
                     data,
@@ -176,16 +251,16 @@ impl DataPlane {
             }
             Frame::IncrementalStreamData(msg) => self.apply_diff(msg, cache, stats),
             Frame::CompressedIncrementalStreamData(msg) => {
-                let Some(algo) = self.compression else {
+                if self.compression.is_none() {
                     tracing::warn!(
                         "CompressedIncrementalStreamData but no compression negotiated, dropping"
                     );
                     return InboundOutcome::Dropped;
-                };
+                }
                 let conn = msg.connection_id;
                 let original_len = msg.original_len;
                 let compressed_len = msg.data.len();
-                let Some(diff_bytes) = crate::compress::decompress_frame_data(&msg, algo) else {
+                let Some(diff_bytes) = self.decompress_payload(&msg.data, original_len) else {
                     tracing::warn!(
                         "Incremental decompression failed for {}, dropping frame",
                         conn
@@ -234,7 +309,6 @@ impl DataPlane {
         let saved =
             total_len.saturating_sub(msg.chunks.iter().map(|c| c.data.len()).sum::<usize>());
         stats.add_incremental_saved(saved as u64);
-        let data = Bytes::from(data);
         stats.add_bytes_received(data.len() as u64);
         // apply_incremental already refreshed the cache.
         InboundOutcome::Payload {

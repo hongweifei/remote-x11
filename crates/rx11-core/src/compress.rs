@@ -11,7 +11,10 @@ use crate::protocol::CompressedPayload;
 /// Payloads smaller than this skip compression entirely.
 pub const COMPRESSION_THRESHOLD: usize = 256;
 
-const ZSTD_COMPRESSION_LEVEL: i32 = 3;
+/// zstd level used by both the stateless helper (`encode_all`) and the
+/// pooled `DataPlane` contexts; a single source of truth for the wire's
+/// compression profile.
+pub(crate) const ZSTD_COMPRESSION_LEVEL: i32 = 3;
 const ZLIB_COMPRESSION_LEVEL: u32 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Hash)]

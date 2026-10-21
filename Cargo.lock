@@ -537,9 +537,11 @@ dependencies = [
  "async-trait",
  "bytes",
  "hex",
+ "rx11-client",
  "rx11-core",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

@@ -8,13 +8,12 @@ use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use rx11_core::compress::decompress_frame_data;
 use rx11_core::config::{BufferDefaults, RuntimeConfig, ServerDefaults};
 use rx11_core::dataplane::DataPlane;
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
 use rx11_core::stats::ConnectionStats;
-use rx11_core::transport::{Rx11Transport, Rx11TransportReadHalf, Rx11TransportWriteHalf};
+use rx11_core::transport::{drain_frames, Rx11Transport, Rx11TransportReadHalf};
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
 use crate::session::{Session, SessionManager, X11ConnToRelay};
@@ -54,7 +53,9 @@ pub(super) async fn handle_client(
     let (outbound_tx, outbound_rx) = mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
 
     let heartbeat_task = spawn_heartbeat(outbound_tx.clone(), runtime.heartbeat_interval);
-    let sender_task = spawn_sender(outbound_rx, write_half);
+    // Coalescing writer: batches already-queued frames into one syscall per
+    // batch while keeping idle-queue latency at one frame.
+    let sender_task = tokio::spawn(drain_frames(outbound_rx, write_half));
 
     let mut incremental_cache = ConnectionDataCache::from_runtime(&runtime);
 
@@ -96,20 +97,6 @@ fn spawn_heartbeat(
                 break;
             }
         }
-    })
-}
-
-fn spawn_sender(
-    mut rx: mpsc::Receiver<Frame>,
-    mut write_half: Rx11TransportWriteHalf,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(frame) = rx.recv().await {
-            if write_half.send_frame(&frame).await.is_err() {
-                break;
-            }
-        }
-        let _ = write_half.flush().await;
     })
 }
 
@@ -177,7 +164,6 @@ async fn send_outbound(outbound: &mpsc::Sender<Frame>, frame: Frame) -> RelayAct
         RelayAction::Continue
     }
 }
-
 async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> RelayAction {
     match frame {
         Frame::SessionCreate(msg) => {
@@ -219,7 +205,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
         }
         Frame::StreamData(msg) => {
             ctx.stats.add_bytes_received(msg.data.len() as u64);
-            forward_to_x11(ctx, msg.connection_id, msg.data.to_vec()).await
+            forward_to_x11(ctx, msg.connection_id, msg.data).await
         }
         Frame::StreamResyncRequest(msg) => {
             if !ctx.dataplane.features.supports(Capability::RequestResync) {
@@ -259,15 +245,18 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 );
                 return RelayAction::Continue;
             }
-            let Some(algo) = ctx.dataplane.compression else {
+            if ctx.dataplane.compression.is_none() {
                 warn!("CompressedStreamData received but no compression negotiated, dropping");
                 return RelayAction::Continue;
-            };
+            }
             ctx.stats.add_bytes_received(msg.data.len() as u64);
-            match decompress_frame_data(&msg, algo) {
+            match ctx
+                .dataplane
+                .decompress_payload(&msg.data, msg.original_len)
+            {
                 Some(decompressed) => {
                     ctx.session_mgr
-                        .send_to_x11_connection(msg.connection_id, decompressed)
+                        .send_to_x11_connection(msg.connection_id, bytes::Bytes::from(decompressed))
                         .await;
                 }
                 None => {
@@ -301,26 +290,23 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
     }
 }
 
-/// Ownership-checked plain-data forwarding for the StreamData path.
+/// Ownership-checked plain-data forwarding for the StreamData path: one
+/// session-manager lookup performs ownership and delivery together.
 async fn forward_to_x11(
     ctx: &mut RelayContext<'_>,
     connection_id: ConnectionId,
-    data: Vec<u8>,
+    data: bytes::Bytes,
 ) -> RelayAction {
     if !ctx
         .session_mgr
-        .owns_connection(connection_id, ctx.transport_id)
+        .deliver_to_x11(connection_id, ctx.transport_id, data)
         .await
     {
         warn!(
             "Client {} sent data for unowned {}",
             ctx.transport_id, connection_id
         );
-        return RelayAction::Continue;
     }
-    ctx.session_mgr
-        .send_to_x11_connection(connection_id, data)
-        .await;
     RelayAction::Continue
 }
 

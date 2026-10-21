@@ -149,12 +149,19 @@ async fn handle_x11_connection(
     let event_tx_clone = event_tx.clone();
 
     let socket_to_relay = async move {
-        let mut buf = vec![0u8; BufferDefaults::INITIAL_READ_BUF];
+        // BytesMut accumulation: the kernel copy lands directly in the
+        // buffer that becomes the frame payload (`split().freeze()` is a
+        // refcount, not a memcpy), saving one full payload copy per read.
+        let mut buf = bytes::BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF);
         loop {
-            match read_half.read(&mut buf).await {
+            let want = (buf.capacity() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
+            if buf.capacity() < want {
+                buf.reserve(want - buf.capacity());
+            }
+            match read_half.read_buf(&mut buf).await {
                 Ok(0) => break,
-                Ok(n) => {
-                    let data = bytes::Bytes::copy_from_slice(&buf[..n]);
+                Ok(_) => {
+                    let data = buf.split().freeze();
                     if event_tx_clone
                         .send(X11ConnToRelay::Data {
                             display: disp,
@@ -165,10 +172,6 @@ async fn handle_x11_connection(
                         .is_err()
                     {
                         break;
-                    }
-                    if buf.len() < BufferDefaults::PROXY_READ_BUF_MAX {
-                        let new_size = (buf.len() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
-                        buf.resize(new_size, 0);
                     }
                 }
                 Err(_) => break,

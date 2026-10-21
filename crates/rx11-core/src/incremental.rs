@@ -1,7 +1,7 @@
 use crate::config::{IncrementalDefaults, RuntimeConfig};
 use crate::protocol::{IncrementalChunk, IncrementalStreamDataMessage};
 use crate::types::ConnectionId;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
 
 /// Tuning knobs captured at cache construction (from `RuntimeConfig`).
@@ -29,7 +29,10 @@ pub struct ConnectionDataCache {
 
 struct CachedData {
     sequence_id: u32,
-    data: Vec<u8>,
+    /// Refcounted view of the last full payload; caching a frame is a clone
+    /// (O(1)), not a memcpy — the hot path feeds owned `Bytes` from the
+    /// read side or the proxy buffer.
+    data: Bytes,
 }
 
 impl ConnectionDataCache {
@@ -64,19 +67,25 @@ impl ConnectionDataCache {
     }
 
     pub fn update_cache(&mut self, connection_id: ConnectionId, sequence_id: u32, data: &[u8]) {
-        self.last_data.insert(
-            connection_id,
-            CachedData {
-                sequence_id,
-                data: data.to_vec(),
-            },
-        );
+        self.update_cache_owned(connection_id, sequence_id, Bytes::copy_from_slice(data));
+    }
+
+    /// Cache an owned payload: stores the `Bytes` handle itself, so this is
+    /// a refcount bump rather than a payload copy.
+    pub fn update_cache_owned(
+        &mut self,
+        connection_id: ConnectionId,
+        sequence_id: u32,
+        data: Bytes,
+    ) {
+        self.last_data
+            .insert(connection_id, CachedData { sequence_id, data });
     }
 
     pub fn get_cached(&self, connection_id: ConnectionId) -> Option<(u32, &[u8])> {
         self.last_data
             .get(&connection_id)
-            .map(|cached| (cached.sequence_id, cached.data.as_slice()))
+            .map(|cached| (cached.sequence_id, &cached.data[..]))
     }
 
     /// Sequence number the next outgoing frame for this connection should
@@ -95,13 +104,39 @@ impl ConnectionDataCache {
         new_sequence_id: u32,
         new_data: &[u8],
     ) -> Option<IncrementalStreamDataMessage> {
+        self.compute_incremental_inner(connection_id, new_sequence_id, new_data, |offset, len| {
+            Bytes::copy_from_slice(&new_data[offset..offset + len])
+        })
+    }
+
+    /// Zero-copy chunking variant: changed chunks alias `new_data`'s
+    /// allocation (refcounted slices).
+    pub fn compute_incremental_owned(
+        &self,
+        connection_id: ConnectionId,
+        new_sequence_id: u32,
+        new_data: &Bytes,
+    ) -> Option<IncrementalStreamDataMessage> {
+        let data = new_data.clone();
+        self.compute_incremental_inner(connection_id, new_sequence_id, new_data, |offset, len| {
+            data.slice(offset..offset + len)
+        })
+    }
+
+    fn compute_incremental_inner(
+        &self,
+        connection_id: ConnectionId,
+        new_sequence_id: u32,
+        new_data: &[u8],
+        take: impl Fn(usize, usize) -> Bytes,
+    ) -> Option<IncrementalStreamDataMessage> {
         let (base_sequence_id, old_data) = self.get_cached(connection_id)?;
 
         if new_data.len() < self.params.min_block_size {
             return None;
         }
 
-        let chunks = self.compute_diff_chunks(old_data, new_data);
+        let chunks = self.compute_diff_chunks(old_data, new_data, &take);
 
         // Identical payload: an empty diff relies on the receiver's cache
         // staying in sync; fall back to a full (compressible) frame instead.
@@ -129,7 +164,12 @@ impl ConnectionDataCache {
         })
     }
 
-    fn compute_diff_chunks(&self, old_data: &[u8], new_data: &[u8]) -> Vec<IncrementalChunk> {
+    fn compute_diff_chunks(
+        &self,
+        old_data: &[u8],
+        new_data: &[u8],
+        take: &impl Fn(usize, usize) -> Bytes,
+    ) -> Vec<IncrementalChunk> {
         let mut chunks = Vec::new();
         let mut offset = 0;
 
@@ -148,7 +188,7 @@ impl ConnectionDataCache {
                 chunks.push(IncrementalChunk {
                     offset,
                     length: new_chunk.len(),
-                    data: Bytes::copy_from_slice(new_chunk),
+                    data: take(offset, new_chunk.len()),
                 });
             }
 
@@ -158,14 +198,14 @@ impl ConnectionDataCache {
         chunks
     }
 
-    pub fn apply_incremental(&mut self, msg: &IncrementalStreamDataMessage) -> Option<Vec<u8>> {
+    pub fn apply_incremental(&mut self, msg: &IncrementalStreamDataMessage) -> Option<Bytes> {
         let (cached_seq, cached_data) = self.get_cached(msg.connection_id)?;
 
         if cached_seq != msg.base_sequence_id {
             return None;
         }
 
-        let mut result = vec![0u8; msg.total_len];
+        let mut result = BytesMut::zeroed(msg.total_len);
 
         if cached_data.len() <= msg.total_len {
             result[..cached_data.len()].copy_from_slice(cached_data);
@@ -184,9 +224,10 @@ impl ConnectionDataCache {
             result[chunk.offset..end].copy_from_slice(&chunk.data);
         }
 
-        self.update_cache(msg.connection_id, msg.sequence_id, &result);
+        let data = result.freeze();
+        self.update_cache_owned(msg.connection_id, msg.sequence_id, data.clone());
 
-        Some(result)
+        Some(data)
     }
 
     pub fn clear_connection(&mut self, connection_id: ConnectionId) {
