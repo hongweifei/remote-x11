@@ -11,8 +11,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, error};
 
-use rx11_core::compress::{maybe_compress_frame, CompressionAlgo};
 use rx11_core::config::BufferDefaults;
+use rx11_core::dataplane::DataPlane;
 use rx11_core::protocol::{Frame, X11DisconnectMessage};
 use rx11_core::stats::ConnectionStats;
 use rx11_core::types::{ConnectionId, DisplayNumber};
@@ -30,7 +30,7 @@ pub(crate) struct ProxyDeps<'a> {
     pub outbound: &'a mpsc::Sender<Frame>,
     pub x11_connections: &'a SharedX11Conns,
     pub stats: &'a Arc<ConnectionStats>,
-    pub compression: Option<CompressionAlgo>,
+    pub dataplane: &'a DataPlane,
     pub seq: &'a Arc<AtomicU32>,
     pub local_x11_addr: &'a str,
 }
@@ -67,7 +67,7 @@ pub(crate) async fn spawn_local_connection(
     let stats = Arc::clone(deps.stats);
     let conns = Arc::clone(deps.x11_connections);
     let seq = Arc::clone(deps.seq);
-    let compression = deps.compression;
+    let dataplane = *deps.dataplane; // Copy into the spawned task's scope.
 
     let handle = tokio::spawn(async move {
         let ctx = ProxyContext {
@@ -77,7 +77,7 @@ pub(crate) async fn spawn_local_connection(
             relay_rx: &mut write_rx,
             outbound: &outbound,
             stats: &stats,
-            compression,
+            dataplane: &dataplane,
             seq: &seq,
         };
         pump_local_x11_connection(ctx).await;
@@ -106,7 +106,7 @@ struct ProxyContext<'a> {
     relay_rx: &'a mut mpsc::Receiver<bytes::Bytes>,
     outbound: &'a mpsc::Sender<Frame>,
     stats: &'a ConnectionStats,
-    compression: Option<CompressionAlgo>,
+    dataplane: &'a DataPlane,
     seq: &'a Arc<AtomicU32>,
 }
 
@@ -123,23 +123,18 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
                         let data = bytes::Bytes::copy_from_slice(&buf[..n]);
                         let seq_id = ctx.seq.fetch_add(1, Ordering::Relaxed);
 
-                        let frame = maybe_compress_frame(
+                        // build_frame owns outbound stats (wire bytes plus
+                        // compression savings for the emitted shape).
+                        let frame = ctx.dataplane.build_frame(
                             ctx.conn_id,
                             seq_id,
-                            data.clone(),
-                            ctx.compression,
+                            data,
+                            None,
+                            Some(ctx.stats),
                         );
-                        // Record savings from the frame we actually built:
-                        // the old `data.len() - n` expression was always zero.
-                        if let Frame::CompressedDataX11(m) = &frame {
-                            ctx.stats.add_compression_saved(
-                                m.original_len.saturating_sub(m.data.len()) as u64,
-                            );
-                        }
                         if ctx.outbound.send(frame).await.is_err() {
                             break;
                         }
-                        ctx.stats.add_bytes_sent(n as u64);
 
                         if buf.len() < BufferDefaults::PROXY_READ_BUF_MAX {
                             let new_size = (buf.len() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);

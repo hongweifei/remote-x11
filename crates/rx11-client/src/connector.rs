@@ -12,8 +12,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
-use rx11_core::compress::CompressionAlgo;
-use rx11_core::config::{BufferDefaults, ClientDefaults};
+use rx11_core::config::{BufferDefaults, ClientDefaults, RuntimeConfig};
+use rx11_core::dataplane::DataPlane;
 use rx11_core::error::{is_retriable_io_error, Rx11Error};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{
@@ -41,6 +41,7 @@ pub struct LocalConnector {
     max_retries: u32,
     retry_base_delay: Duration,
     retry_max_delay: Duration,
+    runtime: RuntimeConfig,
 }
 
 impl LocalConnector {
@@ -60,7 +61,14 @@ impl LocalConnector {
             max_retries: ClientDefaults::MAX_RETRIES,
             retry_base_delay: ClientDefaults::RETRY_BASE_DELAY,
             retry_max_delay: ClientDefaults::RETRY_MAX_DELAY,
+            runtime: RuntimeConfig::default(),
         }
+    }
+
+    /// Apply a runtime profile (timeouts, compression threshold, diffing).
+    pub fn with_runtime(mut self, runtime: RuntimeConfig) -> Self {
+        self.runtime = runtime;
+        self
     }
 
     /// Run connect/serve cycles, retrying retriable failures while carrying
@@ -112,7 +120,7 @@ impl LocalConnector {
         &self,
         resume_session_id: Option<&str>,
         saved_session_id: &mut Option<String>,
-    ) -> anyhow::Result<(Rx11Transport, DisplayNumber, Option<CompressionAlgo>)> {
+    ) -> anyhow::Result<(Rx11Transport, DisplayNumber, DataPlane)> {
         info!("Connecting to relay at {}", self.relay_addr);
         let stream = tokio::time::timeout(
             ClientDefaults::TCP_CONNECT_TIMEOUT,
@@ -120,7 +128,7 @@ impl LocalConnector {
         )
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
-        let mut transport = Rx11Transport::new(stream)?;
+        let mut transport = Rx11Transport::connect_tcp(stream)?;
 
         let resume_sid = resume_session_id
             .map(|s| SessionId::new(s.to_string()))
@@ -151,7 +159,8 @@ impl LocalConnector {
             disp
         };
 
-        Ok((transport, display, compression))
+        let dataplane = DataPlane::new(handshake.features, compression, &self.runtime);
+        Ok((transport, display, dataplane))
     }
 
     async fn try_resume_session(
@@ -220,14 +229,14 @@ impl LocalConnector {
         resume_session_id: Option<&str>,
         saved_session_id: &mut Option<String>,
     ) -> anyhow::Result<()> {
-        let (transport, actual_display, compression) =
+        let (transport, actual_display, dataplane) =
             self.establish(resume_session_id, saved_session_id).await?;
         let (mut read_half, write_half) = transport.split();
 
         let x11_connections = new_shared_conns();
         let stats = Arc::new(ConnectionStats::new());
         let seq_counter = Arc::new(AtomicU32::new(1));
-        let mut incremental_cache = ConnectionDataCache::new();
+        let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
 
         let (outbound_tx, mut outbound_rx) =
             mpsc::channel::<Frame>(BufferDefaults::OUTBOUND_CHANNEL);
@@ -267,12 +276,13 @@ impl LocalConnector {
                     outbound: &outbound_tx,
                     x11_connections: &x11_connections,
                     stats: &stats,
-                    compression,
+                    dataplane: &dataplane,
                     seq: &seq_counter,
                     local_x11_addr: &self.local_x11_addr,
                 },
                 incremental_cache: &mut incremental_cache,
                 display: actual_display,
+                read_timeout: self.runtime.client_read_timeout,
             };
             serve(&mut ctx).await
         };
