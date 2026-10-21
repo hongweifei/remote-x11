@@ -65,12 +65,15 @@ impl RelayServer {
         self.session_mgr.set_x11_listener(x11_listener).await;
 
         let stats_task = spawn_stats_reporter(self.stats.clone(), ServerDefaults::STATUS_INTERVAL);
+        // One shared audio capture for the whole relay: recorder + encoder,
+        // fan-out per attached client. Lives as long as this loop.
+        let audio_hub = crate::audio::AudioHub::new(self.runtime.clone());
 
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     let (stream, addr) = result?;
-                    self.spawn_client(stream, addr);
+                    self.spawn_client(stream, addr, audio_hub.clone());
                 }
                 _ = tokio::signal::ctrl_c() => {
                     info!("Received shutdown signal, cleaning up...");
@@ -85,7 +88,12 @@ impl RelayServer {
         Ok(())
     }
 
-    fn spawn_client(&self, stream: tokio::net::TcpStream, addr: std::net::SocketAddr) {
+    fn spawn_client(
+        &self,
+        stream: tokio::net::TcpStream,
+        addr: std::net::SocketAddr,
+        audio: crate::audio::AudioHub,
+    ) {
         let count = self.active_connections.fetch_add(1, Ordering::Relaxed) + 1;
         if count > ServerDefaults::MAX_CONNECTIONS {
             self.active_connections.fetch_sub(1, Ordering::Relaxed);
@@ -110,8 +118,16 @@ impl RelayServer {
         let runtime = self.runtime.clone();
 
         tokio::spawn(async move {
-            let result =
-                handle_client(stream, addr, session_mgr, stats, runtime, &auth_token).await;
+            let result = handle_client(
+                stream,
+                addr,
+                session_mgr,
+                stats,
+                runtime,
+                audio,
+                &auth_token,
+            )
+            .await;
             conn_counter.fetch_sub(1, Ordering::Relaxed);
             if let Err(e) = result {
                 warn!("Client handler error: {}", e);

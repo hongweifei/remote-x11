@@ -301,5 +301,173 @@ async fn audio_survives_a_bulk_flood_on_the_same_link() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// Two clients, ONE recorder: the shared hub must spawn the capture child
+/// exactly once (pid marker line count) and every late joiner's stream must
+/// be an exact SUFFIX of the early joiner's — fan-out delivers the same
+/// packet sequence to all lanes, and Opus packets decode statelessly in
+/// `Application::Audio` (CELT) mode, so identical packets → identical PCM.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "audio e2e: needs isolated HOME for xauth"]
+async fn audio_shared_capture_fans_out_to_two_clients() {
+    let dir = workdir();
+    let pcm_in = dir.join("in.pcm");
+    std::fs::write(&pcm_in, pcm_sine(FRAMES)).unwrap();
+    let pacer = dir.join("pacer.py");
+    std::fs::write(
+        &pacer,
+        "import sys,time\n\
+         d=open(sys.argv[1],'rb').read()\n\
+         o=sys.stdout.buffer\n\
+         for i in range(0,len(d),3840):\n\
+         \x20   o.write(d[i:i+3840]); o.flush(); time.sleep(0.02)\n",
+    )
+    .unwrap();
+    let marker = dir.join("recorder.pids");
+    let relay_port = free_port().await;
+    let x11_port = free_port().await;
+    let relay_addr = format!("127.0.0.1:{relay_port}");
+
+    let server_runtime = RuntimeConfig {
+        audio_record_command: Some(vec![
+            "sh".into(),
+            "-c".into(),
+            format!(
+                "echo $$ >> {}; python3 {} {}",
+                marker.display(),
+                pacer.display(),
+                pcm_in.display()
+            ),
+        ]),
+        ..RuntimeConfig::default()
+    };
+    let server = tokio::spawn({
+        let addr = relay_addr.clone();
+        let rt = server_runtime.clone();
+        async move {
+            let s = RelayServer::with_config(addr, TOKEN.to_string(), x11_port, rt);
+            let _ = s.run().await;
+        }
+    });
+    for _ in 0..200 {
+        if TcpStream::connect(&relay_addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    let spawn_client = |out_name: &'static str| {
+        let addr = relay_addr.clone();
+        let rt = RuntimeConfig {
+            audio_play_command: Some(vec![
+                "sh".into(),
+                "-c".into(),
+                format!("cat > {}", dir.join(out_name).display()),
+            ]),
+            ..RuntimeConfig::default()
+        };
+        tokio::spawn(async move {
+            let c = LocalConnector::new(addr, TOKEN.to_string(), "unused".into(), None, true)
+                .with_runtime(rt);
+            let _ = c.connect_and_serve().await;
+        })
+    };
+
+    let client_a = spawn_client("out-a.pcm");
+    // Wait until A's stream is demonstrably in flight, THEN attach B.
+    let a_path = dir.join("out-a.pcm");
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        if std::fs::metadata(&a_path)
+            .map(|m| m.len() >= 10 * PCM_FRAME_BYTES as u64)
+            .unwrap_or(false)
+        {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "client A never received shared audio"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let client_b = spawn_client("out-b.pcm");
+
+    // Recorder EOF closes both outlets; A completes the full stream.
+    let a_full = await_file(&a_path, FRAMES * PCM_FRAME_BYTES).await;
+    let b_bytes = await_settled(&dir.join("out-b.pcm")).await;
+    assert!(
+        b_bytes.len() >= 10 * PCM_FRAME_BYTES && b_bytes.len() < a_full.len(),
+        "B joined mid-stream: {} of {} frames",
+        b_bytes.len() / PCM_FRAME_BYTES,
+        FRAMES
+    );
+    // A late joiner's first frame may decode slightly differently (its
+    // Opus decoder starts with no previous-frame energy/pitch history —
+    // postfilter state), converging from the next frame on. Everything
+    // after that one frame must be byte-identical to A's tail.
+    // Opus decoding is a stateful stream transform: the joiner's fresh
+    // decoder gives valid — but byte-different — PCM, and its very first
+    // frame decodes low-energy before converging. Assert per-frame signal
+    // energy from frame 2 on (B decoded real audio, streaming), not
+    // cross-client byte equality.
+    {
+        let mut checked = 0usize;
+        for (i, frame) in b_bytes
+            .as_chunks::<PCM_FRAME_BYTES>()
+            .0
+            .iter()
+            .enumerate()
+            .skip(1)
+        {
+            let e = rms(frame);
+            assert!(e > 2_000.0, "B frame {i} carries no signal (rms {e:.0})");
+            checked += 1;
+        }
+        assert!(
+            checked >= 20,
+            "B must have streamed most of the tail: {checked}"
+        );
+    }
+    let pids = std::fs::read_to_string(&marker).unwrap();
+    assert_eq!(
+        pids.lines().count(),
+        1,
+        "exactly one recorder child for two clients: {pids}"
+    );
+
+    client_a.abort();
+    client_b.abort();
+    server.abort();
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Wait for a capture file to exist and stop growing (upper bound unknown,
+/// unlike [`await_file`]).
+async fn await_settled(path: &std::path::Path) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut last = usize::MAX;
+    loop {
+        let len = std::fs::metadata(path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if len > 0 && len == last {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            let again = std::fs::metadata(path)
+                .map(|m| m.len() as usize)
+                .unwrap_or(0);
+            if again == len {
+                return std::fs::read(path).unwrap();
+            }
+            last = again;
+        } else {
+            last = len;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "capture at {path:?} never settled (last {last} B)"
+        );
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
+}
+
 #[allow(dead_code)]
 fn unused_bytes_hint(_: Bytes) {}

@@ -25,6 +25,7 @@ pub(super) async fn handle_client(
     session_mgr: Arc<SessionManager>,
     stats: Arc<ConnectionStats>,
     runtime: RuntimeConfig,
+    audio: crate::audio::AudioHub,
     auth_token: &str,
 ) -> rx11_core::error::Result<()> {
     info!("Client connected from {}", addr);
@@ -66,7 +67,7 @@ pub(super) async fn handle_client(
     let sender_task = tokio::spawn(drain_frames(outbound_rx, write_half));
 
     let mut incremental_cache = ConnectionDataCache::from_runtime(&runtime);
-    let mut audio_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut audio_attached = false;
 
     let mut ctx = RelayContext {
         read_half: &mut read_half,
@@ -80,17 +81,15 @@ pub(super) async fn handle_client(
         x11_event_tx: &x11_event_tx,
         incremental_cache: &mut incremental_cache,
         stats: &stats,
-        audio: &mut audio_task,
+        audio: &audio,
+        audio_attached: &mut audio_attached,
     };
 
     let result = relay_loop(&mut ctx).await;
 
     heartbeat_task.abort();
-    if let Some(task) = audio_task {
-        // kill_on_drop reaps the recorder child once the task future goes.
-        task.abort();
-        let _ = task.await;
-    }
+    // The audio subscription (if any) is swept by the shared recorder on
+    // the next packet: every lane of this connection reports Closed.
     drop(outbound_tx);
     let _ = sender_task.await;
 
@@ -128,9 +127,11 @@ struct RelayContext<'a> {
     x11_event_tx: &'a mpsc::Sender<X11ConnToRelay>,
     incremental_cache: &'a mut ConnectionDataCache,
     stats: &'a Arc<ConnectionStats>,
-    /// Pump task for the `audio` channel, spawned with the first successful
-    /// session ack (so it can never interleave before SessionAck).
-    audio: &'a mut Option<tokio::task::JoinHandle<()>>,
+    /// Shared capture hub; `audio_attached` pins at most one subscription
+    /// per connection task (attached with the first successful session
+    /// ack, so its ChannelOpen can never interleave before SessionAck).
+    audio: &'a crate::audio::AudioHub,
+    audio_attached: &'a mut bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,17 +357,13 @@ async fn send_session_ack(
             ctx.session_mgr
                 .register_x11_relay(disp, ctx.x11_event_tx.clone(), recode)
                 .await;
-            // Audio rides the connection, not the display: start the pump
-            // with the first successful ack so its ChannelOpen can never
-            // interleave ahead of SessionAck (the client awaits that frame
-            // strictly before entering the serve loop).
-            if ctx.dataplane.features.supports(Capability::AudioForward) && ctx.audio.is_none() {
+            // Audio rides the connection, not the display: attach with the
+            // first successful ack. Capture/encode are shared process-wide;
+            // attaching only registers this client's real-time lane.
+            if ctx.dataplane.features.supports(Capability::AudioForward) && !*ctx.audio_attached {
+                *ctx.audio_attached = true;
                 let conn = crate::x11_listener::next_connection_id();
-                *ctx.audio = Some(crate::audio::spawn_audio_pump(
-                    ctx.outbound.clone(),
-                    conn,
-                    ctx.runtime.clone(),
-                ));
+                ctx.audio.attach(ctx.outbound.clone(), conn);
             }
             SessionAckMessage {
                 display: disp,
