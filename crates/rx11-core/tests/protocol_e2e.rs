@@ -48,13 +48,19 @@ struct Session {
 /// the data plane, `client_rx` reads whatever the relay emits.
 async fn negotiated_session() -> (Session, Features, Option<CompressionAlgo>) {
     let (server_side, client_side) = duplex(8192);
+    let rt = RuntimeConfig::default();
     let mut server_transport = Rx11Transport::new(server_side);
     let mut client_transport = Rx11Transport::new(client_side);
 
     let token = Token::new(generate_token()).unwrap();
     let (server_hs, client_hs) = tokio::join!(
-        server_handshake(&mut server_transport, token.as_str(), HANDSHAKE_TIMEOUT),
-        client_handshake(&mut client_transport, &token, None, HANDSHAKE_TIMEOUT)
+        server_handshake(
+            &mut server_transport,
+            token.as_str(),
+            HANDSHAKE_TIMEOUT,
+            &rt,
+        ),
+        client_handshake(&mut client_transport, &token, None, HANDSHAKE_TIMEOUT, &rt,)
     );
 
     let server_hs = server_hs.expect("server handshake");
@@ -91,6 +97,7 @@ async fn handshake_negotiates_all_capabilities_and_compression() {
 #[tokio::test]
 async fn handshake_fails_fast_on_wrong_token() {
     let (server_side, client_side) = duplex(4096);
+    let rt = RuntimeConfig::default();
     let mut server_transport = Rx11Transport::new(server_side);
     let mut client_transport = Rx11Transport::new(client_side);
 
@@ -101,9 +108,16 @@ async fn handshake_fails_fast_on_wrong_token() {
         server_handshake(
             &mut server_transport,
             server_token.as_str(),
-            HANDSHAKE_TIMEOUT
+            HANDSHAKE_TIMEOUT,
+            &rt,
         ),
-        client_handshake(&mut client_transport, &attacker, None, HANDSHAKE_TIMEOUT)
+        client_handshake(
+            &mut client_transport,
+            &attacker,
+            None,
+            HANDSHAKE_TIMEOUT,
+            &rt,
+        )
     );
 
     let server_err = match server_result {
@@ -120,11 +134,12 @@ async fn handshake_fails_fast_on_wrong_token() {
 
 #[tokio::test]
 async fn handshake_rejects_other_protocol_version() {
+    let rt = RuntimeConfig::default();
     let (server_side, mut client_side) = duplex(4096);
     let mut server_transport = Rx11Transport::new(server_side);
 
     let server = tokio::spawn(async move {
-        server_handshake(&mut server_transport, "t", HANDSHAKE_TIMEOUT).await
+        server_handshake(&mut server_transport, "t", HANDSHAKE_TIMEOUT, &rt).await
     });
 
     // Same wire version, foreign handshake version: rejected by the Hello
@@ -340,6 +355,7 @@ async fn feature_gated_dataplane_never_emits_diffs() {
 
 #[tokio::test]
 async fn resume_session_id_round_trips_through_negotiation() {
+    let rt = RuntimeConfig::default();
     let (server_side, client_side) = duplex(4096);
     let mut server_transport = Rx11Transport::new(server_side);
     let mut client_transport = Rx11Transport::new(client_side);
@@ -347,12 +363,18 @@ async fn resume_session_id_round_trips_through_negotiation() {
     let resume = SessionId::new("resume-me-42".to_string()).unwrap();
 
     let (server_hs, client_hs) = tokio::join!(
-        server_handshake(&mut server_transport, token.as_str(), HANDSHAKE_TIMEOUT),
+        server_handshake(
+            &mut server_transport,
+            token.as_str(),
+            HANDSHAKE_TIMEOUT,
+            &rt,
+        ),
         client_handshake(
             &mut client_transport,
             &token,
             Some(&resume),
-            HANDSHAKE_TIMEOUT
+            HANDSHAKE_TIMEOUT,
+            &rt,
         )
     );
     assert_eq!(server_hs.unwrap().resume_session_id, Some(resume.clone()));

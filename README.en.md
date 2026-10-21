@@ -36,6 +36,7 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Graceful shutdown** — Sends `SessionDestroy` frame on Ctrl+C to clean up remote sessions; `rx11 run` forwards signals to child processes
 - **Data compression** — `zstd_stream` by default: one continuous compression stream flushed per frame, so later frames reference the history of everything already sent (redraw-heavy traffic collapses on slow links); negotiates down to one-shot zstd/lz4/zlib. Payloads over 256 bytes are compressed
 - **WAN queue discipline** — the outbound queue towards the relay is capped by **in-flight bytes** (default 1 MB), not frame count, so a 3 Mbit/s link never accumulates minutes of bufferbloat; an optional `SO_SNDBUF` cap tames the kernel buffer too
+- **Image re-encoding (opt-in)** — the `x11_recode` capability recognizes large core `PutImage` requests (ZPixmap, depth 24/32) and ships them as JPEG (lossy, 10–50× smaller) or lossless PNG on the wire; the client re-expands them into the original request bytes before the local X server sees anything. Non-image traffic passes byte-for-byte. Off by default; both ends must set `image_recode = true`. Honest edge: GL-rendered video and Xv extension paths are out of recognition scope — that's framebuffer territory (Xpra/x2go), not a transparent forwarder's
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
 - **Capability negotiation** — incremental/resync/flow-control features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
 - **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11`), kinds *are* capability names, and unknown kinds pass through without parse failures
@@ -245,6 +246,10 @@ Priority: **CLI args > env vars > config file > defaults**
 # diff_min_savings_ratio = 0.1      minimum saved fraction for sending a diff
 # outbound_queue_bytes = 1048576    in-flight byte budget towards the WAN (queueing-delay cap)
 # tcp_send_buffer_bytes = 262144    cap the kernel send buffer too; omit to let the OS autotune
+# image_recode = false              image re-encoding master switch (both ends must enable)
+# image_recode_codec = "jpeg"       jpeg (lossy, bandwidth) | png (lossless)
+# image_recode_quality = 80         JPEG quality
+# image_recode_min_bytes = 16384    pixel blocks below this pass through untouched
 ```
 
 On slow links (a 3 Mbit/s VPS running Xfce, say) set the last two explicitly:

@@ -115,10 +115,10 @@ async fn handle_x11_connection(
 
     let connection_id = next_connection_id();
 
-    let event_tx = tokio::time::timeout(ServerDefaults::HANDSHAKE_TIMEOUT, async {
+    let (event_tx, recode) = tokio::time::timeout(ServerDefaults::HANDSHAKE_TIMEOUT, async {
         loop {
-            if let Some(tx) = session_mgr.get_x11_event_sender(disp).await {
-                return Ok::<_, std::convert::Infallible>(tx);
+            if let Some(ingress) = session_mgr.get_x11_relay_ingress(disp).await {
+                return Ok::<_, std::convert::Infallible>(ingress);
             }
             tokio::time::sleep(RELAY_REGISTER_RETRY).await;
         }
@@ -153,6 +153,11 @@ async fn handle_x11_connection(
         // buffer that becomes the frame payload (`split().freeze()` is a
         // refcount, not a memcpy), saving one full payload copy per read.
         let mut buf = bytes::BytesMut::with_capacity(BufferDefaults::INITIAL_READ_BUF);
+        // With `x11_recode` negotiated for this display, app requests pass
+        // through the protocol-aware machine: read chunks in, framed UNITS
+        // (raw spans / image containers) out, one relay event each.
+        let mut machine = recode.map(rx11_core::x11recode::DownstreamReencoder::new);
+        let mut units: Vec<bytes::Bytes> = Vec::new();
         loop {
             let want = (buf.capacity() * 2).min(BufferDefaults::PROXY_READ_BUF_MAX);
             if buf.capacity() < want {
@@ -162,7 +167,25 @@ async fn handle_x11_connection(
                 Ok(0) => break,
                 Ok(_) => {
                     let data = buf.split().freeze();
-                    if event_tx_clone
+                    let mut dead = false;
+                    if let Some(m) = &mut machine {
+                        units.clear();
+                        m.push(&data, &mut units);
+                        for unit in units.drain(..) {
+                            if event_tx_clone
+                                .send(X11ConnToRelay::Data {
+                                    display: disp,
+                                    connection_id,
+                                    data: unit,
+                                })
+                                .await
+                                .is_err()
+                            {
+                                dead = true;
+                                break;
+                            }
+                        }
+                    } else if event_tx_clone
                         .send(X11ConnToRelay::Data {
                             display: disp,
                             connection_id,
@@ -171,6 +194,9 @@ async fn handle_x11_connection(
                         .await
                         .is_err()
                     {
+                        dead = true;
+                    }
+                    if dead {
                         break;
                     }
                 }

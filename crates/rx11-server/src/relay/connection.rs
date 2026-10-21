@@ -34,6 +34,7 @@ pub(super) async fn handle_client(
         &mut transport,
         auth_token,
         ServerDefaults::HANDSHAKE_TIMEOUT,
+        &runtime,
     )
     .await?;
     let dataplane = DataPlane::new(handshake.features, handshake.compression, &runtime);
@@ -333,8 +334,17 @@ async fn send_session_ack(
                 "Session created: DISPLAY={} (client: {})",
                 disp, ctx.transport_id
             );
+            let recode = if ctx.dataplane.features.supports(Capability::X11Recode) {
+                Some(rx11_core::x11recode::RecodeSpec {
+                    codec: ctx.runtime.image_recode_codec,
+                    quality: ctx.runtime.image_recode_quality,
+                    min_bytes: ctx.runtime.image_recode_min_bytes,
+                })
+            } else {
+                None
+            };
             ctx.session_mgr
-                .register_x11_relay(disp, ctx.x11_event_tx.clone())
+                .register_x11_relay(disp, ctx.x11_event_tx.clone(), recode)
                 .await;
             SessionAckMessage {
                 display: disp,

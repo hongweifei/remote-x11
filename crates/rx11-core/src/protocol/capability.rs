@@ -28,16 +28,22 @@ pub enum Capability {
     /// are capabilities: unknown names are ignored, so a future clipboard or
     /// file channel ships as one variant + one name without a version bump.
     X11,
+    /// The x11 channel may re-encode large PutImage payloads in transit
+    /// (JPEG / lossless PNG). Advertised only when BOTH peers opt in via
+    /// `[runtime] image_recode` — it trades pixel exactness for bandwidth,
+    /// so it is never implicit.
+    X11Recode,
 }
 
 impl Capability {
     /// What this build can actually do. `FlowControl` is advertised but
     /// both sides must ignore its effect until semantics are decided.
-    pub const SUPPORTED: [Capability; 4] = [
+    pub const SUPPORTED: [Capability; 5] = [
         Capability::RequestResync,
         Capability::Incremental,
         Capability::FlowControl,
         Capability::X11,
+        Capability::X11Recode,
     ];
 
     pub fn name(self) -> &'static str {
@@ -46,6 +52,7 @@ impl Capability {
             Capability::Incremental => "incremental",
             Capability::FlowControl => "flow_control",
             Capability::X11 => "x11",
+            Capability::X11Recode => "x11_recode",
         }
     }
 
@@ -60,6 +67,16 @@ impl Capability {
     pub fn advertised() -> Vec<String> {
         Capability::SUPPORTED
             .iter()
+            .map(|c| c.name().to_string())
+            .collect()
+    }
+
+    /// Advertised list honoring opt-in gates: `x11_recode` (lossy in
+    /// transit) rides only when the runtime explicitly enables it.
+    pub fn advertised_for(runtime: &crate::config::RuntimeConfig) -> Vec<String> {
+        Capability::SUPPORTED
+            .iter()
+            .filter(|c| **c != Capability::X11Recode || runtime.image_recode)
             .map(|c| c.name().to_string())
             .collect()
     }
@@ -140,6 +157,22 @@ mod tests {
         assert_eq!(Capability::X11.name(), "x11");
         let f = Features::from_list(&list(&["x11", "incremental"]));
         assert!(f.supports(Capability::X11) && f.supports(Capability::Incremental));
+    }
+
+    #[test]
+    fn x11_recode_is_opt_in_on_the_wire() {
+        use crate::config::RuntimeConfig;
+        let off = Capability::advertised_for(&RuntimeConfig::default());
+        assert!(!off.iter().any(|c| c == "x11_recode"));
+        let rt = RuntimeConfig {
+            image_recode: true,
+            ..RuntimeConfig::default()
+        };
+        let on = Capability::advertised_for(&rt);
+        assert!(on.iter().any(|c| c == "x11_recode"));
+        // A peer that never opted in cannot be talked into it:
+        let f = Features::negotiate(&on, &off);
+        assert!(!f.supports(Capability::X11Recode));
     }
 
     #[test]

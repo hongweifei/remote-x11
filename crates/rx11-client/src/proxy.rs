@@ -13,10 +13,11 @@ use tracing::{debug, error};
 
 use rx11_core::config::BufferDefaults;
 use rx11_core::dataplane::DataPlane;
-use rx11_core::protocol::{ChannelCloseMessage, Frame};
+use rx11_core::protocol::{Capability, ChannelCloseMessage, Frame};
 use rx11_core::queue::OutboundSender;
 use rx11_core::stats::ConnectionStats;
 use rx11_core::types::ConnectionId;
+use rx11_core::x11recode::DownstreamExpander;
 
 /// Live local X connections: `connection_id -> (write channel, pump task)`.
 pub(crate) type X11ConnMap = HashMap<u32, (mpsc::Sender<bytes::Bytes>, JoinHandle<()>)>;
@@ -150,7 +151,24 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
             data = ctx.relay_rx.recv() => {
                 match data {
                     Some(data) => {
-                        if ctx.local_write.write_all(&data).await.is_err()
+                        // With `x11_recode` the downstream payloads are
+                        // framed units (raw spans / image containers);
+                        // the local X server must receive the ORIGINAL
+                        // request bytes. An unexpandable container means
+                        // bytes would be lost: fail the connection
+                        // (reconnect-with-resume rebuilds cleanly).
+                        let out = if ctx.dataplane.features.supports(Capability::X11Recode) {
+                            match DownstreamExpander::expand(data) {
+                                Some(b) => b,
+                                None => {
+                                    error!("Recode container unusable for {}; failing session", ctx.conn_id);
+                                    break;
+                                }
+                            }
+                        } else {
+                            data
+                        };
+                        if ctx.local_write.write_all(&out).await.is_err()
                             || ctx.local_write.flush().await.is_err()
                         {
                             break;

@@ -11,6 +11,7 @@
 //! - [`queue`] — byte-budgeted outbound frame queue (WAN latency bound)
 //! - [`config`] — centralized default constants
 //! - [`error`] — [`error::Rx11Error`] with retry classification
+//! - [`x11recode`] — protocol-aware PutImage re-encoding (x11 channel tier)
 
 pub mod auth;
 pub mod compress;
@@ -23,3 +24,4 @@ pub mod queue;
 pub mod stats;
 pub mod transport;
 pub mod types;
+pub mod x11recode;

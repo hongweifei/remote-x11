@@ -98,6 +98,13 @@ pub struct RuntimeConfig {
     /// in-flight bytes (queue + socket) stay near the link's patience
     /// budget. `None` leaves the OS autotuning in charge.
     pub tcp_send_buffer_bytes: Option<usize>,
+    /// Opt in to the `x11_recode` capability (re-encode large PutImage
+    /// payloads as JPEG / lossless PNG in transit). Off by default:
+    /// JPEG mode is lossy in pixels, so it must be a deliberate choice.
+    pub image_recode: bool,
+    pub image_recode_codec: crate::x11recode::RecodeCodec,
+    pub image_recode_quality: u8,
+    pub image_recode_min_bytes: usize,
 }
 
 impl Default for RuntimeConfig {
@@ -112,6 +119,10 @@ impl Default for RuntimeConfig {
             diff_min_savings_ratio: IncrementalDefaults::MIN_SAVINGS_RATIO,
             outbound_queue_bytes: BufferDefaults::OUTBOUND_QUEUE_BYTES,
             tcp_send_buffer_bytes: None,
+            image_recode: false,
+            image_recode_codec: crate::x11recode::RecodeCodec::Jpeg,
+            image_recode_quality: 80,
+            image_recode_min_bytes: 16 * 1024,
         }
     }
 }

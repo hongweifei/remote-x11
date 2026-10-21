@@ -30,6 +30,10 @@ pub struct RuntimeFileConfig {
     pub diff_min_savings_ratio: Option<f64>,
     pub outbound_queue_bytes: Option<usize>,
     pub tcp_send_buffer_bytes: Option<usize>,
+    pub image_recode: Option<bool>,
+    pub image_recode_codec: Option<String>,
+    pub image_recode_quality: Option<u8>,
+    pub image_recode_min_bytes: Option<usize>,
 }
 
 impl RuntimeFileConfig {
@@ -56,6 +60,22 @@ impl RuntimeFileConfig {
             tcp_send_buffer_bytes: self
                 .tcp_send_buffer_bytes
                 .or(defaults.tcp_send_buffer_bytes),
+            image_recode: self.image_recode.unwrap_or(defaults.image_recode),
+            image_recode_codec: match self.image_recode_codec.as_deref() {
+                Some("png") => rx11_core::x11recode::RecodeCodec::Png,
+                Some("jpeg") => rx11_core::x11recode::RecodeCodec::Jpeg,
+                Some(other) => {
+                    tracing::warn!("unknown image_recode_codec '{other}', keeping default");
+                    defaults.image_recode_codec
+                }
+                None => defaults.image_recode_codec,
+            },
+            image_recode_quality: self
+                .image_recode_quality
+                .unwrap_or(defaults.image_recode_quality),
+            image_recode_min_bytes: self
+                .image_recode_min_bytes
+                .unwrap_or(defaults.image_recode_min_bytes),
         }
     }
 }

@@ -7,6 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::auth;
 use crate::compress::CompressionAlgo;
+use crate::config::RuntimeConfig;
 use crate::error::{Result, Rx11Error};
 use crate::protocol::{
     AuthRequestMessage, AuthResponseMessage, Capability, ConnectionMode, Features, Frame,
@@ -61,6 +62,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     transport: &mut Rx11Transport<S>,
     auth_token: &str,
     timeout: Duration,
+    runtime: &RuntimeConfig,
 ) -> Result<HandshakeResult> {
     let hello_frame = recv_handshake_frame(transport, timeout, "Hello").await?;
 
@@ -86,7 +88,7 @@ pub async fn server_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     }
 
     let compression = CompressionAlgo::negotiate(&hello.compression_algos, &CompressionAlgo::ALL);
-    let features = Features::negotiate(&hello.capabilities, &Capability::advertised());
+    let features = Features::negotiate(&hello.capabilities, &Capability::advertised_for(runtime));
     let session_id = SessionId::new(uuid::Uuid::new_v4().to_string())?;
 
     if let Some(ref sid) = hello.resume_session_id {
@@ -154,6 +156,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
     auth_token: &Token,
     resume_session_id: Option<&SessionId>,
     timeout: Duration,
+    runtime: &RuntimeConfig,
 ) -> Result<HandshakeResult> {
     transport
         .send_frame(&Frame::Hello(HelloMessage {
@@ -161,7 +164,7 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
             mode: ConnectionMode::Client,
             resume_session_id: resume_session_id.cloned(),
             compression_algos: CompressionAlgo::ALL.to_vec(),
-            capabilities: Capability::advertised(),
+            capabilities: Capability::advertised_for(runtime),
         }))
         .await?;
 
@@ -212,6 +215,9 @@ pub async fn client_handshake<S: AsyncRead + AsyncWrite + Unpin>(
         session_id: hello_ack.session_id,
         compression: hello_ack.compression,
         resume_session_id: resume_session_id.cloned(),
-        features: Features::negotiate(&Capability::advertised(), &hello_ack.capabilities),
+        features: Features::negotiate(
+            &Capability::advertised_for(runtime),
+            &hello_ack.capabilities,
+        ),
     })
 }

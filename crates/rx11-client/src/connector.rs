@@ -139,6 +139,7 @@ impl LocalConnector {
             &token,
             resume_sid.as_ref(),
             ClientDefaults::TCP_CONNECT_TIMEOUT,
+            &self.runtime,
         )
         .await?;
         let compression = handshake.compression;

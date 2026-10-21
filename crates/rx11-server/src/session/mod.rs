@@ -13,6 +13,7 @@ use tracing::{info, warn};
 
 use rx11_core::config::ServerDefaults;
 use rx11_core::types::{ConnectionId, DisplayNumber, SessionId};
+use rx11_core::x11recode::RecodeSpec;
 
 use xauth::{xauth_add, xauth_remove};
 
@@ -36,6 +37,9 @@ pub struct Session {
     pub client_id: String,
 }
 
+/// Sink + optional protocol-recode policy for one display's relay leg.
+type RelayIngress = (mpsc::Sender<X11ConnToRelay>, Option<RecodeSpec>);
+
 struct ConnState {
     display: DisplayNumber,
     sender: mpsc::Sender<X11RelayToConn>,
@@ -52,7 +56,9 @@ struct ConnState {
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<u16, Arc<Session>>>>,
     x11_listener: Arc<RwLock<Option<Arc<dyn X11DisplayBinder>>>>,
-    conn_to_relay: Arc<RwLock<HashMap<u16, mpsc::Sender<X11ConnToRelay>>>>,
+    /// Per-display relay ingress: the frame sink plus the x11-recode
+    /// policy (if negotiated) the listener must apply to app requests.
+    conn_to_relay: Arc<RwLock<HashMap<u16, RelayIngress>>>,
     connections: Arc<Mutex<HashMap<u32, ConnState>>>,
     display_conns: Arc<Mutex<HashMap<u16, HashSet<u32>>>>,
     grace_tasks: Arc<Mutex<HashMap<u16, Arc<AtomicBool>>>>,
@@ -322,18 +328,19 @@ impl SessionManager {
         &self,
         disp: DisplayNumber,
         sender: mpsc::Sender<X11ConnToRelay>,
+        recode: Option<RecodeSpec>,
     ) {
-        self.conn_to_relay.write().await.insert(disp.get(), sender);
+        self.conn_to_relay
+            .write()
+            .await
+            .insert(disp.get(), (sender, recode));
     }
 
     pub async fn unregister_x11_relay(&self, disp: DisplayNumber) {
         self.conn_to_relay.write().await.remove(&disp.get());
     }
 
-    pub async fn get_x11_event_sender(
-        &self,
-        disp: DisplayNumber,
-    ) -> Option<mpsc::Sender<X11ConnToRelay>> {
+    pub async fn get_x11_relay_ingress(&self, disp: DisplayNumber) -> Option<RelayIngress> {
         self.conn_to_relay.read().await.get(&disp.get()).cloned()
     }
 
@@ -607,13 +614,13 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
         let disp = DisplayNumber::new(7).unwrap();
 
-        assert!(mgr.get_x11_event_sender(disp).await.is_none());
+        assert!(mgr.get_x11_relay_ingress(disp).await.is_none());
 
-        mgr.register_x11_relay(disp, tx).await;
-        assert!(mgr.get_x11_event_sender(disp).await.is_some());
+        mgr.register_x11_relay(disp, tx, None).await;
+        assert!(mgr.get_x11_relay_ingress(disp).await.is_some());
 
         mgr.unregister_x11_relay(disp).await;
-        assert!(mgr.get_x11_event_sender(disp).await.is_none());
+        assert!(mgr.get_x11_relay_ingress(disp).await.is_none());
     }
 
     #[tokio::test]

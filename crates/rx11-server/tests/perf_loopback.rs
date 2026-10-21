@@ -22,6 +22,7 @@ use tokio::task::JoinHandle;
 
 use rx11_client::connector::LocalConnector;
 use rx11_core::config::RuntimeConfig;
+use rx11_core::x11recode::RecodeCodec;
 use rx11_server::relay::RelayServer;
 
 const TOKEN: &str = "bench-token";
@@ -364,6 +365,125 @@ async fn s6_stream_pressure() {
     println!("[t={:.3}] [bench] s6 sent={sent} got={got} eof={eof}", tt());
     assert_eq!(got, sent, "stream stalled/dropped bytes");
     let _ = stack;
+}
+
+/// An X11-shaped byte stream: connection setup followed by `frames`
+/// ZPixmap PutImage requests (depth 24, 64x96 => 24 KiB pixels each).
+fn x_traffic(frames: usize, seed: u8) -> Vec<u8> {
+    let mut v = Vec::new();
+    // setup: 'l', major 11, name "MIT-MAGIC-COOKIE-1"(18->20 pad), auth 16B
+    v.extend_from_slice(&[b'l', 0]);
+    v.extend_from_slice(&11u16.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    let name = b"MIT-MAGIC-COOKIE-1";
+    let auth = [seed; 16];
+    v.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    v.extend_from_slice(&(auth.len() as u16).to_le_bytes());
+    v.extend_from_slice(name);
+    v.resize(10 + ((name.len() + 3) & !3), 0);
+    v.extend_from_slice(&auth);
+    v.resize(v.len() + ((4 - (auth.len() % 4)) % 4), 0);
+    for f in 0..frames {
+        let (w, h) = (64u16, 96u16);
+        let data_len = w as usize * h as usize * 4;
+        let total = 24 + data_len;
+        v.push(53);
+        v.push(2);
+        v.extend_from_slice(&[0, 0]);
+        v.extend_from_slice(&((total / 4) as u32).to_le_bytes());
+        v.extend_from_slice(&1u32.to_le_bytes());
+        v.extend_from_slice(&2u32.to_le_bytes());
+        v.extend_from_slice(&w.to_le_bytes());
+        v.extend_from_slice(&h.to_le_bytes());
+        v.push(0);
+        v.push(24);
+        v.extend_from_slice(&[0, 0]);
+        for i in 0..data_len / 4 {
+            let base = (seed.wrapping_add(f as u8).wrapping_mul(7)) as u32;
+            let px = (base + i as u32 * 65537).to_le_bytes();
+            v.extend_from_slice(&px);
+        }
+    }
+    v
+}
+
+fn recode_runtime(codec: RecodeCodec) -> RuntimeConfig {
+    RuntimeConfig {
+        image_recode: true,
+        image_recode_codec: codec,
+        image_recode_quality: 85,
+        image_recode_min_bytes: 4096,
+        ..RuntimeConfig::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "perf harness"]
+async fn s7_recode_end_to_end() {
+    // PNG tier: through relay+queues+dataplane, the echoed stream must be
+    // byte-identical to the X-shaped traffic we sent.
+    for (codec, name) in [(RecodeCodec::Png, "png"), (RecodeCodec::Jpeg, "jpeg")] {
+        let stack = start(recode_runtime(codec)).await;
+        let app = app_connect(stack.x11_port).await;
+        let traffic = x_traffic(24, 91);
+        let (mut rd, mut wr) = app.into_split();
+        let sent = traffic.clone();
+        let writer = tokio::spawn(async move {
+            wr.write_all(&sent).await.unwrap();
+            // park until reader is done so no FIN is sent early
+            std::future::pending::<()>().await;
+        });
+        let expect = traffic.len();
+        let reader = tokio::spawn(async move {
+            let mut got: Vec<u8> = Vec::with_capacity(expect);
+            let mut buf = vec![0u8; 65536];
+            while got.len() < expect {
+                let n = rd.read(&mut buf).await.unwrap();
+                assert_ne!(n, 0, "echo closed at {}", got.len());
+                got.extend_from_slice(&buf[..n]);
+            }
+            got
+        });
+        let got = tokio::time::timeout(Duration::from_secs(30), reader)
+            .await
+            .expect("recode echo stalled")
+            .unwrap();
+        writer.abort();
+        if codec == RecodeCodec::Png {
+            assert_eq!(got, traffic, "png tier must be byte-exact end to end");
+        } else {
+            assert_eq!(got.len(), traffic.len(), "jpeg must keep framing sizes");
+            assert_eq!(&got[..10], &traffic[..10], "setup survives");
+            // each PutImage header (24B) must be intact at its offsets
+            let mut pos = 0usize;
+            let mut headers = 0;
+            while pos + 24 <= got.len() {
+                if got[pos] == 53 && got[pos + 1] == 2 {
+                    assert_eq!(
+                        &got[pos..pos + 24],
+                        &traffic[pos..pos + 24],
+                        "header {headers} at {pos}"
+                    );
+                    let len_b32 = u32::from_le_bytes([
+                        got[pos + 4],
+                        got[pos + 5],
+                        got[pos + 6],
+                        got[pos + 7],
+                    ]) as usize
+                        * 4;
+                    pos += len_b32;
+                    headers += 1;
+                } else {
+                    pos += 1;
+                }
+            }
+            assert_eq!(headers, 24, "all PutImage requests present");
+        }
+        println!(
+            "[bench] s7.{name}: end-to-end recode integrity ok ({} B echoed)",
+            got.len()
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
