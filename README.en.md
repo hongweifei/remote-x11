@@ -344,19 +344,21 @@ Frame types:
 | SessionDestroy | 0x12 | Destroy session |
 | SessionResume | 0x13 | Resume an existing session |
 | SessionAutoCreate | 0x14 | Auto-assign display and create session |
+| X11Connect | 0x18 | X11 application connection notification |
+| X11Disconnect | 0x19 | X11 application disconnection notification |
+| IncrementalRequestFull | 0x1A | Ask peer to stop diffing and resend full frames (self-heal) |
 | DataX11 | 0x20 | X11 data frame (binary, not JSON) |
 | CompressedDataX11 | 0x21 | Compressed X11 data frame |
-| X11Connect | 0x22 | X11 application connection notification |
-| X11Disconnect | 0x23 | X11 application disconnection notification |
-| IncrementalDataX11 | 0x24 | X11 incremental diff frame (binary) |
-| CompressedIncrementalDataX11 | 0x25 | Compressed incremental diff frame |
-| IncrementalRequestFull | 0x26 | Ask peer to stop diffing and resend full frames (self-heal) |
+| IncrementalDataX11 | 0x22 | X11 incremental diff frame (binary) |
+| CompressedIncrementalDataX11 | 0x23 | Compressed incremental diff frame |
 | Heartbeat | 0x30 | Heartbeat (server-initiated) |
 | HeartbeatAck | 0x31 | Heartbeat response |
 | FlowControl | 0x40 | Flow control (reserved; currently logged only) |
 | Error | 0xFF | Error |
 
 The current protocol version is **1**, enforced twice: a frame-header version octet and `Hello.version`; any mismatch fails the handshake immediately.
+
+**Tag band convention**: `0x0x` handshake, `0x1x` JSON control frames (session/notify/request), `0x2x` binary data-plane frames (0x24+ reserved), `0x3x` keepalive, `0x4x` flow control, `0xFF` error. A unit test locks "only binary data frames may live in 0x2x", so new frames cannot be mis-banded.
 
 **Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
 feature names (`incremental`, `request_resync`, `flow_control`, …) and the server

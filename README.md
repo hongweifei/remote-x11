@@ -345,19 +345,21 @@ rx11 使用自定义二进制帧协议，每帧结构：
 | SessionDestroy | 0x12 | 销毁会话 |
 | SessionResume | 0x13 | 恢复已有的会话 |
 | SessionAutoCreate | 0x14 | 自动分配 Display 并创建会话 |
+| X11Connect | 0x18 | X11 应用连接通知 |
+| X11Disconnect | 0x19 | X11 应用断开通知 |
+| IncrementalRequestFull | 0x1A | 请求对端停止差分、回退全帧（自愈） |
 | DataX11 | 0x20 | X11 数据帧（二进制，非 JSON） |
 | CompressedDataX11 | 0x21 | 压缩的 X11 数据帧 |
-| X11Connect | 0x22 | X11 应用连接通知 |
-| X11Disconnect | 0x23 | X11 应用断开通知 |
-| IncrementalDataX11 | 0x24 | X11 增量差分帧（二进制） |
-| CompressedIncrementalDataX11 | 0x25 | 压缩后的增量差分帧 |
-| IncrementalRequestFull | 0x26 | 请求对端停止差分、回退全帧（自愈） |
+| IncrementalDataX11 | 0x22 | X11 增量差分帧（二进制） |
+| CompressedIncrementalDataX11 | 0x23 | 压缩后的增量差分帧 |
 | Heartbeat | 0x30 | 心跳（服务端发起） |
 | HeartbeatAck | 0x31 | 心跳响应 |
 | FlowControl | 0x40 | 流控（预留，当前仅记录日志） |
 | Error | 0xFF | 错误 |
 
 当前协议版本号为 **1**：帧头 Version 字节与 `Hello.version` 双层校验，任一不匹配握手立即失败。
+
+**编号分段约定**：`0x0x` 握手、`0x1x` JSON 控制帧（会话/通知/请求）、`0x2x` 数据面二进制帧（0x24 起预留）、`0x3x` 保活、`0x4x` 流控、`0xFF` 错误。有单元测试锁定"0x2x 段内只允许二进制数据帧"，新帧编号不得跨段。
 
 **能力协商（Capability Negotiation）**：`Hello.capabilities` / `HelloAck.capabilities`
 以字符串列表声明特性（`incremental`、`request_resync`、`flow_control`……），

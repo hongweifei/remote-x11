@@ -17,13 +17,16 @@ pub enum MessageType {
     SessionDestroy = 0x12,
     SessionResume = 0x13,
     SessionAutoCreate = 0x14,
+    // --- data-plane band: binary payloads (0x20-0x2F; 0x24+ reserved) ---
     DataX11 = 0x20,
     CompressedDataX11 = 0x21,
-    IncrementalDataX11 = 0x24,
-    CompressedIncrementalDataX11 = 0x25,
-    IncrementalRequestFull = 0x26,
-    X11Connect = 0x22,
-    X11Disconnect = 0x23,
+    IncrementalDataX11 = 0x22,
+    CompressedIncrementalDataX11 = 0x23,
+    // --- control band: JSON payloads (notification/request grouped with
+    //     session frames; kept out of the binary band) ---
+    X11Connect = 0x18,
+    X11Disconnect = 0x19,
+    IncrementalRequestFull = 0x1A,
     Heartbeat = 0x30,
     HeartbeatAck = 0x31,
     FlowControl = 0x40,
@@ -74,11 +77,11 @@ impl TryFrom<u8> for MessageType {
             0x14 => Ok(MessageType::SessionAutoCreate),
             0x20 => Ok(MessageType::DataX11),
             0x21 => Ok(MessageType::CompressedDataX11),
-            0x24 => Ok(MessageType::IncrementalDataX11),
-            0x25 => Ok(MessageType::CompressedIncrementalDataX11),
-            0x26 => Ok(MessageType::IncrementalRequestFull),
-            0x22 => Ok(MessageType::X11Connect),
-            0x23 => Ok(MessageType::X11Disconnect),
+            0x22 => Ok(MessageType::IncrementalDataX11),
+            0x23 => Ok(MessageType::CompressedIncrementalDataX11),
+            0x18 => Ok(MessageType::X11Connect),
+            0x19 => Ok(MessageType::X11Disconnect),
+            0x1A => Ok(MessageType::IncrementalRequestFull),
             0x30 => Ok(MessageType::Heartbeat),
             0x31 => Ok(MessageType::HeartbeatAck),
             0x40 => Ok(MessageType::FlowControl),
@@ -112,12 +115,16 @@ mod tests {
         );
         assert_eq!(MessageType::try_from(0x20).unwrap(), MessageType::DataX11);
         assert_eq!(
-            MessageType::try_from(0x24).unwrap(),
+            MessageType::try_from(0x22).unwrap(),
             MessageType::IncrementalDataX11
         );
         assert_eq!(
-            MessageType::try_from(0x25).unwrap(),
+            MessageType::try_from(0x23).unwrap(),
             MessageType::CompressedIncrementalDataX11
+        );
+        assert_eq!(
+            MessageType::try_from(0x18).unwrap(),
+            MessageType::X11Connect
         );
         assert_eq!(MessageType::try_from(0xFF).unwrap(), MessageType::Error);
     }
@@ -127,6 +134,29 @@ mod tests {
         assert!(MessageType::try_from(0x00).is_err());
         assert!(MessageType::try_from(0xFE).is_err());
         assert!(MessageType::try_from(0x50).is_err());
+    }
+
+    #[test]
+    fn test_tag_bands_follow_layout_convention() {
+        // The 0x20-0x2F band is exclusively binary data-plane payloads;
+        // every JSON control/keepalive/error frame lives outside it. This
+        // locks the numbering convention for future frame minting.
+        const DATA_BAND: std::ops::RangeInclusive<u8> = 0x20..=0x2F;
+        for mt in MessageType::ALL {
+            let byte = mt as u8;
+            let binary_payload = matches!(
+                mt,
+                MessageType::DataX11
+                    | MessageType::CompressedDataX11
+                    | MessageType::IncrementalDataX11
+                    | MessageType::CompressedIncrementalDataX11
+            );
+            assert_eq!(
+                DATA_BAND.contains(&byte),
+                binary_payload,
+                "{mt} misplaced in band"
+            );
+        }
     }
 
     #[test]
