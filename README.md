@@ -40,6 +40,7 @@
 - **Display 自动分配** — 默认由服务端自动分配可用的 Display 编号，需要时可手动指定
 - **数据压缩** — 支持 zstd/lz4/zlib 三种算法，自动协商，超过 256 字节的数据自动压缩，压缩后更大则回退
 - **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
+- **能力协商** — 增量/重同步/流控等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
 - **双向统计** — 客户端与服务端各自每 30 秒输出收发字节、压缩/增量节省量与活跃连接数
 - **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
 - **SSH 端口冲突检测** — 启动 SSH 隧道前自动检测本地端口是否被占用
@@ -232,6 +233,15 @@ rx11 config show   # 显示配置文件路径与当前内容
 # user = "myuser"
 # identity = "~/.ssh/id_rsa"
 # token, relay_port, x11, display 同样支持
+
+[runtime]
+# heartbeat_interval_secs = 30     服务端心跳周期
+# heartbeat_timeout_secs = 90      服务端判死静默客户端
+# client_read_timeout_secs = 100   客户端判死中继
+# compression_threshold = 256      低于此字节数的负载不压缩
+# diff_chunk_size = 4096           增量差分粒度
+# diff_min_block_size = 1024       低于此长度的帧不做差分
+# diff_min_savings_ratio = 0.1     差分最少需节省的比例
 ```
 
 使用 `rx11 config init` 生成带注释的模板文件。
@@ -315,11 +325,11 @@ rx11 client -r server:7000 -t <TOKEN>
 rx11 使用自定义二进制帧协议，每帧结构：
 
 ```
-┌──────────┬──────────┬────────────┬─────────────┐
-│ Magic    │ Type     │ Length     │ Payload     │
-│ 4 bytes  │ 1 byte   │ 4 bytes    │ N bytes     │
-│ RX11     │          │ (BE u32)   │             │
-└──────────┴──────────┴────────────┴─────────────┘
+┌──────────┬─────────┬──────────┬────────────┬─────────────┐
+│ Magic    │ Version │ Type     │ Length     │ Payload     │
+│ 4 bytes  │ 1 byte  │ 1 byte   │ 4 bytes    │ N bytes     │
+│ RX11     │ (u8=1)  │          │ (BE u32)   │             │
+└──────────┴─────────┴──────────┴────────────┴─────────────┘
 ```
 
 帧类型：
@@ -347,7 +357,13 @@ rx11 使用自定义二进制帧协议，每帧结构：
 | FlowControl | 0x40 | 流控（预留，当前仅记录日志） |
 | Error | 0xFF | 错误 |
 
-当前协议版本号为 **4**（`Hello.version`），版本不匹配时握手直接失败。
+当前协议版本号为 **1**：帧头 Version 字节与 `Hello.version` 双层校验，任一不匹配握手立即失败。
+
+**能力协商（Capability Negotiation）**：`Hello.capabilities` / `HelloAck.capabilities`
+以字符串列表声明特性（`incremental`、`request_resync`、`flow_control`……），
+服务端回复交集。未协商的能力两侧都不会使用（例如未声明 `incremental` 时对端
+永不产生增量帧）；未识别的能力名会被忽略——新增帧类型只需配合新能力名即可
+平滑上线，无需再整体升版本。
 
 控制帧的 Payload 使用 JSON 编码。X11 数据帧使用二进制编码，`DataX11` 帧格式：
 

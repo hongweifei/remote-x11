@@ -36,6 +36,7 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Graceful shutdown** — Sends `SessionDestroy` frame on Ctrl+C to clean up remote sessions; `rx11 run` forwards signals to child processes
 - **Data compression** — zstd/lz4/zlib with auto-negotiation; payloads over 256 bytes are compressed, falling back to raw when compression does not help
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
+- **Capability negotiation** — incremental/resync/flow-control features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
 - **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
 - **Multiple displays** — Run multiple independent GUI sessions simultaneously with the `-d` flag
@@ -231,6 +232,15 @@ Priority: **CLI args > env vars > config file > defaults**
 # user = "myuser"
 # identity = "~/.ssh/id_rsa"
 # token, relay_port, x11, display are also supported
+
+[runtime]
+# heartbeat_interval_secs = 30      server heartbeat period
+# heartbeat_timeout_secs = 90       server drops silent clients after this
+# client_read_timeout_secs = 100    client treats relay silence as death
+# compression_threshold = 256       payloads below this size skip compression
+# diff_chunk_size = 4096            incremental diff granularity
+# diff_min_block_size = 1024        frames shorter than this are never diffed
+# diff_min_savings_ratio = 0.1      minimum saved fraction for sending a diff
 ```
 
 Use `rx11 config init` to generate a commented template file.
@@ -314,11 +324,11 @@ After the 60-second grace period expires, the server automatically destroys the 
 rx11 uses a custom binary frame protocol. Each frame:
 
 ```
-┌──────────┬──────────┬────────────┬─────────────┐
-│ Magic    │ Type     │ Length     │ Payload     │
-│ 4 bytes  │ 1 byte   │ 4 bytes    │ N bytes     │
-│ RX11     │          │ (BE u32)   │             │
-└──────────┴──────────┴────────────┴─────────────┘
+┌──────────┬─────────┬──────────┬────────────┬─────────────┐
+│ Magic    │ Version │ Type     │ Length     │ Payload     │
+│ 4 bytes  │ 1 byte  │ 1 byte   │ 4 bytes    │ N bytes     │
+│ RX11     │ (u8=1)  │          │ (BE u32)   │             │
+└──────────┴─────────┴──────────┴────────────┴─────────────┘
 ```
 
 Frame types:
@@ -346,7 +356,13 @@ Frame types:
 | FlowControl | 0x40 | Flow control (reserved; currently logged only) |
 | Error | 0xFF | Error |
 
-The current protocol version is **4** (`Hello.version`); a version mismatch fails the handshake immediately.
+The current protocol version is **1**, enforced twice: a frame-header version octet and `Hello.version`; any mismatch fails the handshake immediately.
+
+**Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
+feature names (`incremental`, `request_resync`, `flow_control`, …) and the server
+replies with the intersection. Features outside the intersection are never used by
+either side; unrecognized names are ignored — shipping a new frame type later only
+requires minting a new capability name, not a protocol bump.
 
 Control frame payloads use JSON encoding. Binary `DataX11` frames look like:
 
