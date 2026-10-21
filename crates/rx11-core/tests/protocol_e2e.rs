@@ -80,8 +80,9 @@ async fn negotiated_session() -> (Session, Features, Option<CompressionAlgo>) {
 #[tokio::test]
 async fn handshake_negotiates_all_capabilities_and_compression() {
     let (_session, features, compression) = negotiated_session().await;
-    assert!(features.incremental);
-    assert!(features.request_resync);
+    assert!(features.supports(Capability::Incremental));
+    assert!(features.supports(Capability::RequestResync));
+    assert!(features.supports(Capability::X11));
     // The best mutual algorithm wins.
     assert_eq!(compression, Some(CompressionAlgo::Zstd));
 }
@@ -185,7 +186,8 @@ async fn client_recv(s: &mut Session) -> Frame {
 #[tokio::test]
 async fn data_plane_diff_and_self_heal_over_the_wire() {
     let (mut session, features, _compression) = negotiated_session().await;
-    assert!(features.incremental && features.request_resync);
+    assert!(features.supports(Capability::Incremental));
+    assert!(features.supports(Capability::RequestResync));
 
     let server_dp = test_dataplane(None);
     let client_dp = test_dataplane(None);
@@ -324,8 +326,8 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
 async fn feature_gated_dataplane_never_emits_diffs() {
     // Same caches, but Incremental not negotiated: every frame is plain or
     // compressed, matching what an older/feature-restricted peer would get.
-    let mut features = all_features();
-    features.incremental = false;
+    // Everything except Incremental.
+    let features = Features::from_list(&["request_resync".to_string(), "flow_control".to_string()]);
     let dp = DataPlane::new(features, None, &RuntimeConfig::default());
     let mut cache = ConnectionDataCache::new();
     let conn = ConnectionId::new(3);

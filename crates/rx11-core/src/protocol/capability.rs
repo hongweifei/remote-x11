@@ -6,30 +6,38 @@
 //! name, not a protocol version bump. Behavior gates on `Features`, never
 //! on "did a frame arrive" guessing.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
-/// Features implemented by this codebase. Extend by adding variants and
-/// wiring their `name()`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// Features implemented by this codebase. EXTENDING: add a variant here,
+/// register its name, and consume it via `Features::supports` — no other
+/// plumbing is required (the negotiation, wire form and gating all derive
+/// from this enum).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum Capability {
     /// Receiver of incremental diffs can ask the sender to fall back to
-    /// full frames (`IncrementalRequestFull`).
+    /// full frames (`StreamResyncRequest`).
     RequestResync,
-    /// Sender may emit `IncrementalDataX11` / `CompressedIncrementalDataX11`.
+    /// Sender may emit `IncrementalStreamData` / `CompressedIncrementalStreamData`.
     Incremental,
     /// Reserved: `FlowControl` semantics are not implemented yet; the bit
     /// exists so enabling it later does not require a wire change.
     FlowControl,
+    /// The `x11` channel kind may be opened via `ChannelOpen`. Channel kinds
+    /// are capabilities: unknown names are ignored, so a future clipboard or
+    /// file channel ships as one variant + one name without a version bump.
+    X11,
 }
 
 impl Capability {
     /// What this build can actually do. `FlowControl` is advertised but
     /// both sides must ignore its effect until semantics are decided.
-    pub const SUPPORTED: [Capability; 3] = [
+    pub const SUPPORTED: [Capability; 4] = [
         Capability::RequestResync,
         Capability::Incremental,
         Capability::FlowControl,
+        Capability::X11,
     ];
 
     pub fn name(self) -> &'static str {
@@ -37,6 +45,7 @@ impl Capability {
             Capability::RequestResync => "request_resync",
             Capability::Incremental => "incremental",
             Capability::FlowControl => "flow_control",
+            Capability::X11 => "x11",
         }
     }
 
@@ -63,52 +72,41 @@ impl fmt::Display for Capability {
 }
 
 /// Negotiated intersection of the two peers' capability lists, resolved once
-/// during the handshake and carried through the session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// during the handshake and carried through the session. A set, not a struct
+/// of bools: new capabilities join without touching this type.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Features {
-    pub request_resync: bool,
-    pub incremental: bool,
-    pub flow_control: bool,
+    caps: BTreeSet<Capability>,
 }
 
 impl Features {
     /// Intersection of two advertised lists; unknown names are ignored.
     pub fn negotiate(client: &[String], server: &[String]) -> Features {
-        let declared =
-            |list: &[String], cap: Capability| list.iter().any(|name| name == cap.name());
-        let both = |cap: Capability| declared(client, cap) && declared(server, cap);
+        let declared = |list: &[String], cap: Capability| list.iter().any(|n| n == cap.name());
         Features {
-            request_resync: both(Capability::RequestResync),
-            incremental: both(Capability::Incremental),
-            flow_control: both(Capability::FlowControl),
+            caps: Capability::SUPPORTED
+                .iter()
+                .copied()
+                .filter(|c| declared(client, *c) && declared(server, *c))
+                .collect(),
         }
     }
 
     pub fn from_list(list: &[String]) -> Features {
-        let has = |cap: Capability| list.iter().any(|name| name == cap.name());
         Features {
-            request_resync: has(Capability::RequestResync),
-            incremental: has(Capability::Incremental),
-            flow_control: has(Capability::FlowControl),
+            caps: list
+                .iter()
+                .filter_map(|name| Capability::parse(name))
+                .collect(),
         }
     }
 
     pub fn to_list(&self) -> Vec<String> {
-        let mut out = Vec::new();
-        for cap in Capability::SUPPORTED {
-            if self.supports(cap) {
-                out.push(cap.name().to_string());
-            }
-        }
-        out
+        self.caps.iter().map(|c| c.name().to_string()).collect()
     }
 
-    pub fn supports(self, cap: Capability) -> bool {
-        match cap {
-            Capability::RequestResync => self.request_resync,
-            Capability::Incremental => self.incremental,
-            Capability::FlowControl => self.flow_control,
-        }
+    pub fn supports(&self, cap: Capability) -> bool {
+        self.caps.contains(&cap)
     }
 }
 
@@ -125,9 +123,9 @@ mod tests {
         let client = list(&["incremental", "flow_control", "unknown_future"]);
         let server = list(&["incremental", "request_resync"]);
         let f = Features::negotiate(&client, &server);
-        assert!(f.incremental);
-        assert!(!f.request_resync);
-        assert!(!f.flow_control);
+        assert!(f.supports(Capability::Incremental));
+        assert!(!f.supports(Capability::RequestResync));
+        assert!(!f.supports(Capability::FlowControl));
     }
 
     #[test]
@@ -137,14 +135,22 @@ mod tests {
     }
 
     #[test]
+    fn channel_kinds_are_capabilities() {
+        // Opening a channel kind must ride on a capability name.
+        assert_eq!(Capability::X11.name(), "x11");
+        let f = Features::from_list(&list(&["x11", "incremental"]));
+        assert!(f.supports(Capability::X11) && f.supports(Capability::Incremental));
+    }
+
+    #[test]
     fn advertised_round_trips_through_parse() {
         let adv = Capability::advertised();
         for name in &adv {
             assert!(Capability::parse(name).is_some(), "unparseable: {name}");
         }
         let f = Features::from_list(&adv);
-        assert!(f.incremental && f.request_resync && f.flow_control);
-        assert_eq!(f.to_list().len(), 3);
+        assert_eq!(f.to_list().len(), Capability::SUPPORTED.len());
+        assert!(f.supports(Capability::X11));
     }
 
     #[test]

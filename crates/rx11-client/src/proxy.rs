@@ -67,7 +67,7 @@ pub(crate) async fn spawn_local_connection(
     let stats = Arc::clone(deps.stats);
     let conns = Arc::clone(deps.x11_connections);
     let seq = Arc::clone(deps.seq);
-    let dataplane = *deps.dataplane; // Copy into the spawned task's scope.
+    let dataplane = deps.dataplane.clone(); // Owned by the spawned task.
 
     let handle = tokio::spawn(async move {
         let ctx = ProxyContext {

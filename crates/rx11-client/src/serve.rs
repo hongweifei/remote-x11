@@ -10,7 +10,9 @@ use tracing::{debug, error, info, warn};
 
 use rx11_core::dataplane::{DataPlane, InboundOutcome};
 use rx11_core::incremental::ConnectionDataCache;
-use rx11_core::protocol::{Frame, IncrementalRequestFullMessage, SessionDestroyMessage};
+use rx11_core::protocol::{
+    Capability, Frame, IncrementalRequestFullMessage, SessionDestroyMessage,
+};
 use rx11_core::transport::Rx11TransportReadHalf;
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
@@ -79,7 +81,7 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
         | Frame::CompressedIncrementalDataX11(_)) => {
             // Copy the (small, Copy) policy so the cache borrow below stays
             // disjoint from the dataplane read.
-            let dataplane = *ctx.proxy.dataplane;
+            let dataplane = ctx.proxy.dataplane.clone();
             let outcome = dataplane.apply_inbound(frame, ctx.incremental_cache, ctx.proxy.stats);
             match outcome {
                 InboundOutcome::Payload {
@@ -102,7 +104,7 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
 /// Ask the relay to stop diffing this connection and resend full frames:
 /// our receive cache is out of sync, so every further diff would fail.
 async fn request_full_resend(ctx: &mut ServeCtx<'_>, conn_id: ConnectionId) {
-    if !ctx.dataplane().features.request_resync {
+    if !ctx.dataplane().features.supports(Capability::RequestResync) {
         warn!(
             "Diff desync for {} but resync capability not negotiated; frame dropped",
             conn_id
@@ -195,11 +197,7 @@ mod tests {
             let (_peer, _) = listener.accept().await.unwrap();
             let (read_half, write_half) = Rx11Transport::new(client).split();
             let (tx, rx) = mpsc::channel(16);
-            let features = Features {
-                incremental: true,
-                request_resync: true,
-                ..Default::default()
-            };
+            let features = Features::from_list(&["incremental".into(), "request_resync".into()]);
             Self {
                 read_half,
                 _write_half: write_half,
@@ -438,10 +436,7 @@ mod tests {
     async fn diff_disabled_ignores_incremental_frames() {
         // Peer sends diffs we never negotiated: dropped defensively.
         let mut h = Harness::new(None).await;
-        h.dataplane.features = Features {
-            request_resync: true, // intentionally no Incremental bit
-            ..Default::default()
-        };
+        h.dataplane.features = Features::from_list(&["request_resync".to_string()]);
         let _rx = h.register_local(conn(11)).await;
         {
             let mut ctx = h.ctx();

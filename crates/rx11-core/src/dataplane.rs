@@ -16,8 +16,8 @@ use crate::compress::CompressionAlgo;
 use crate::config::RuntimeConfig;
 use crate::incremental::ConnectionDataCache;
 use crate::protocol::{
-    BinaryMessageCodec, CompressedIncrementalX11DataMessage, CompressedX11DataMessage, Features,
-    Frame, IncrementalX11DataMessage, X11DataMessage,
+    BinaryMessageCodec, Capability, CompressedIncrementalX11DataMessage, CompressedX11DataMessage,
+    Features, Frame, IncrementalX11DataMessage, X11DataMessage,
 };
 use crate::stats::ConnectionStats;
 use crate::types::ConnectionId;
@@ -39,7 +39,7 @@ pub enum InboundOutcome {
 }
 
 /// Negotiated data-plane configuration for one relay session.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct DataPlane {
     pub features: Features,
     pub compression: Option<CompressionAlgo>,
@@ -119,7 +119,7 @@ impl DataPlane {
         stats: Option<&ConnectionStats>,
     ) -> Frame {
         let original_len = data.len();
-        let frame = match (self.features.incremental, cache) {
+        let frame = match (self.features.supports(Capability::Incremental), cache) {
             (true, Some(cache)) => {
                 let diff = cache.compute_incremental(connection_id, sequence_id, &data);
                 cache.update_cache(connection_id, sequence_id, &data);

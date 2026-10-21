@@ -222,7 +222,7 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             forward_to_x11(ctx, msg.connection_id, msg.data.to_vec()).await
         }
         Frame::IncrementalRequestFull(msg) => {
-            if !ctx.dataplane.features.request_resync {
+            if !ctx.dataplane.features.supports(Capability::RequestResync) {
                 warn!(
                     "Client {} sent IncrementalRequestFull but resync capability was not negotiated; ignoring",
                     ctx.transport_id
