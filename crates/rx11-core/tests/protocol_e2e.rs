@@ -89,6 +89,10 @@ async fn handshake_negotiates_all_capabilities_and_compression() {
     assert!(features.supports(Capability::Incremental));
     assert!(features.supports(Capability::RequestResync));
     assert!(features.supports(Capability::X11));
+    // Defaults are on: recode (lossless PNG tier) and audio negotiate with
+    // the stock RuntimeConfig — the kill switches are `= false`, not opt-in.
+    assert!(features.supports(Capability::X11Recode));
+    assert!(features.supports(Capability::AudioForward));
     // The best mutual algorithm wins — cross-frame streaming zstd since the
     // WAN round (it negotiates ahead of one-shot `zstd`).
     assert_eq!(compression, Some(CompressionAlgo::ZstdStream));

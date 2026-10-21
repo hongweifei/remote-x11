@@ -90,6 +90,14 @@ impl Drop for Stack {
 
 /// Bring up relay + client + echo sink; returns the app-side entry port.
 async fn start(runtime: RuntimeConfig) -> Stack {
+    // Transport scenarios never exercise audio: since the default flipped,
+    // pin it off here so no real `parec`/`paplay` desktop children spawn
+    // during timing runs (audio has its own e2e file with command
+    // overrides).
+    let runtime = RuntimeConfig {
+        audio_forward: false,
+        ..runtime
+    };
     let relay_port = free_port().await;
     let x11_port = free_port().await; // display 0 ⇒ base + 0
 

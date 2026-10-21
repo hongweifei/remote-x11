@@ -161,20 +161,20 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # tcp_send_buffer_bytes = 262144 # cap kernel SO_SNDBUF too, or the kernel
 #                                # buffer re-adds its own seconds of backlog
 #
-# Image/video pixel re-encoding on the x11 channel (opt-in; JPEG tier is
-# lossy, so BOTH ends must enable it explicitly):
-# image_recode = true            # recognize large PutImage requests
-# image_recode_codec = "jpeg"    # "jpeg" | "png" ("png" = lossless tier)
-# image_recode_quality = 80      # JPEG quality
+# Image/video pixel re-encoding on the x11 channel — ON by default, and the
+# default tier (PNG) is LOSSLESS: images shrink, pixels stay exact.
+# image_recode = true            # false on either end = byte-exact passthrough
+# image_recode_codec = "png"     # "png" (default, lossless) | "jpeg" (lossy — explicit choice only)
+# image_recode_quality = 80      # JPEG quality (when codec = "jpeg")
 # image_recode_min_bytes = 16384 # smaller images stay pixel-exact
 #
-# Desktop audio over the same link: the server records its output sink and
-# streams Opus (~2% of a 3 Mbit/s line) on a real-time lane; the client
-# plays locally. Set audio_forward = true on BOTH ends. Needs parec on the
-# server and paplay on the client (both ship with PulseAudio AND PipeWire).
-# No lip-sync with GL-rendered video; system sounds, music and alerts are
-# the use case.
-# audio_forward = false          # the switch itself (opt-in)
+# Desktop audio over the same link — ON by default: the server records its
+# output sink (parec) and streams Opus (~2% of a 3 Mbit/s line) on a
+# real-time lane; the client plays via paplay. Endpoints without a capture
+# or playback stack just stay silent. audio_forward = false on either end
+# disables it. No lip-sync with GL-rendered video; system sounds, music and
+# alerts are the use case.
+# audio_forward = true           # the switch (default on)
 # audio_bitrate_kbps = 64        # 32 = speech-grade, 64 = near-transparent
 # # Only when auto-detection misses your stack — full argv, verbatim:
 # # audio_record_command = ["parec", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--device=@DEFAULT_SINK@.monitor"]

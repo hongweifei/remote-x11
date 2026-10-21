@@ -108,18 +108,20 @@ pub struct RuntimeConfig {
     /// in-flight bytes (queue + socket) stay near the link's patience
     /// budget. `None` leaves the OS autotuning in charge.
     pub tcp_send_buffer_bytes: Option<usize>,
-    /// Opt in to the `x11_recode` capability (re-encode large PutImage
-    /// payloads as JPEG / lossless PNG in transit). Off by default:
-    /// JPEG mode is lossy in pixels, so it must be a deliberate choice.
+    /// Re-encode large PutImage payloads as PNG/JPEG in transit. ON by
+    /// default: the default tier (PNG) is lossless, so image traffic
+    /// shrinks while staying pixel exact. Set `false` on either end to
+    /// force byte-for-byte passthrough; the lossy JPEG tier is only
+    /// reached through an explicit `image_recode_codec = "jpeg"` choice.
     pub image_recode: bool,
     pub image_recode_codec: crate::x11recode::RecodeCodec,
     pub image_recode_quality: u8,
     pub image_recode_min_bytes: usize,
-    /// Opt in to the `audio_forward` capability: the server records its
-    /// default output sink (monitor), ships Opus packets down a real-time
-    /// lane, and the client plays them locally. Off by default — it
-    /// captures desktop audio, which must be a deliberate choice on both
-    /// ends.
+    /// ON by default: the server records its default output sink (monitor),
+    /// ships Opus packets down a real-time lane, and the client plays them
+    /// locally. Set `false` on either end to disable audio entirely. Where
+    /// no Pulse/PipeWire capture exists the probe warns and audio stays
+    /// inactive — it never fails the session.
     pub audio_forward: bool,
     /// Opus target bitrate in kbit/s (VBR). 64 ≈ transparent stereo music;
     /// 32 is fine for speech-heavy desktop sound.
@@ -144,11 +146,11 @@ impl Default for RuntimeConfig {
             diff_min_savings_ratio: IncrementalDefaults::MIN_SAVINGS_RATIO,
             outbound_queue_bytes: BufferDefaults::OUTBOUND_QUEUE_BYTES,
             tcp_send_buffer_bytes: None,
-            image_recode: false,
-            image_recode_codec: crate::x11recode::RecodeCodec::Jpeg,
+            image_recode: true,
+            image_recode_codec: crate::x11recode::RecodeCodec::Png,
             image_recode_quality: 80,
             image_recode_min_bytes: 16 * 1024,
-            audio_forward: false,
+            audio_forward: true,
             audio_bitrate_kbps: crate::audio::DEFAULT_BITRATE_KBPS,
             audio_record_command: None,
             audio_play_command: None,

@@ -29,15 +29,16 @@ pub enum Capability {
     /// file channel ships as one variant + one name without a version bump.
     X11,
     /// The x11 channel may re-encode large PutImage payloads in transit
-    /// (JPEG / lossless PNG). Advertised only when BOTH peers opt in via
-    /// `[runtime] image_recode` — it trades pixel exactness for bandwidth,
-    /// so it is never implicit.
+    /// (PNG default tier — lossless; JPEG via explicit codec choice).
+    /// Advertised by default; either peer opts OUT with
+    /// `[runtime] image_recode = false`. The lossy JPEG tier is never the
+    /// default, so default-on keeps the pixel-exactness promise.
     X11Recode,
     /// The `audio` channel kind may be opened: server-side capture of the
     /// default output sink, Opus-encoded, delivered on the real-time lane.
-    /// Advertised only when BOTH peers opt in via `[runtime] audio_forward`
-    /// — it streams whatever the server's desktop plays, so it is never
-    /// implicit.
+    /// Advertised by default; either peer opts OUT with
+    /// `[runtime] audio_forward = false`. Endpoints without a capture or
+    /// playback stack stay silent instead of failing.
     AudioForward,
 }
 
@@ -79,9 +80,10 @@ impl Capability {
             .collect()
     }
 
-    /// Advertised list honoring opt-in gates: capabilities that change
-    /// semantics destructively (recode is lossy, audio captures the
-    /// desktop) ride only when the runtime explicitly enables them.
+    /// Advertised list honoring the per-endpoint kill switches: recode and
+    /// audio ride by default (their default tiers are lossless / harmless),
+    /// and an explicit `false` in `[runtime]` removes the name from the
+    /// wire — a peer that disabled a capability can never be talked into it.
     pub fn advertised_for(runtime: &crate::config::RuntimeConfig) -> Vec<String> {
         Capability::SUPPORTED
             .iter()
@@ -173,39 +175,27 @@ mod tests {
     }
 
     #[test]
-    fn x11_recode_is_opt_in_on_the_wire() {
+    fn recode_and_audio_advertise_by_default_and_hide_on_explicit_off() {
         use crate::config::RuntimeConfig;
-        let off = Capability::advertised_for(&RuntimeConfig::default());
-        assert!(!off.iter().any(|c| c == "x11_recode"));
-        let rt = RuntimeConfig {
-            image_recode: true,
+        let def = Capability::advertised_for(&RuntimeConfig::default());
+        assert!(def.iter().any(|c| c == "x11_recode"), "recode default-on");
+        assert!(def.iter().any(|c| c == "audio_forward"), "audio default-on");
+        // Kill switches are independent, and a peer that disabled a
+        // capability can never be talked into it by the other side:
+        let recode_off = Capability::advertised_for(&RuntimeConfig {
+            image_recode: false,
             ..RuntimeConfig::default()
-        };
-        let on = Capability::advertised_for(&rt);
-        assert!(on.iter().any(|c| c == "x11_recode"));
-        // A peer that never opted in cannot be talked into it:
-        let f = Features::negotiate(&on, &off);
+        });
+        assert!(!recode_off.iter().any(|c| c == "x11_recode"));
+        assert!(recode_off.iter().any(|c| c == "audio_forward"));
+        let audio_off = Capability::advertised_for(&RuntimeConfig {
+            audio_forward: false,
+            ..RuntimeConfig::default()
+        });
+        assert!(audio_off.iter().any(|c| c == "x11_recode"));
+        assert!(!audio_off.iter().any(|c| c == "audio_forward"));
+        let f = Features::negotiate(&def, &recode_off);
         assert!(!f.supports(Capability::X11Recode));
-    }
-
-    #[test]
-    fn audio_forward_is_opt_in_and_independent_of_recode() {
-        use crate::config::RuntimeConfig;
-        let off = Capability::advertised_for(&RuntimeConfig::default());
-        assert!(!off.iter().any(|c| c == "audio_forward"));
-        // Enabling recode must NOT sneak audio onto the wire, and vice versa.
-        let recode_only = Capability::advertised_for(&RuntimeConfig {
-            image_recode: true,
-            ..RuntimeConfig::default()
-        });
-        assert!(!recode_only.iter().any(|c| c == "audio_forward"));
-        let audio_only = Capability::advertised_for(&RuntimeConfig {
-            audio_forward: true,
-            ..RuntimeConfig::default()
-        });
-        assert!(audio_only.iter().any(|c| c == "audio_forward"));
-        assert!(!audio_only.iter().any(|c| c == "x11_recode"));
-        let f = Features::negotiate(&audio_only, &audio_only);
         assert!(f.supports(Capability::AudioForward));
     }
 

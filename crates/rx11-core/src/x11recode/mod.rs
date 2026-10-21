@@ -7,7 +7,8 @@
 //! byte-diff or history-based compressor (every frame's pixels differ).
 //! Only recognizing the request makes re-encoding possible.
 //!
-//! Contract (capability-gated `x11_recode`, opt-in on BOTH ends):
+//! Contract (capability-gated `x11_recode`; on by default, either end can
+//! switch it off with `[runtime] image_recode = false`):
 //! - Downstream direction (app → relay → local X server): the server-side
 //!   [`DownstreamReencoder`] tracks X request framing over the byte stream
 //!   and emits *units*: `[kind u8] + body`; kind 0 = verbatim bytes, kind 1
