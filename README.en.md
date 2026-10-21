@@ -48,6 +48,7 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Auto display assignment** — Server automatically assigns available display numbers by default; manual override available
 - **Security hardening** — Session/connection ownership validation, auth data length limits, decompression size verification, frame sync recovery, read_buf limits for DoS prevention
 - **SSH port conflict detection** — Checks for local port conflicts before establishing SSH tunnels
+- **SSH tunnel auto-rebuild** — if the tunnel process dies or the health check gives up, a fresh tunnel is respawned on the same local port with exponential backoff (2s→30s, up to 8 attempts per drop) while the connector keeps retrying, so the session resumes transparently inside the server's grace window (`ssh.reconnect = false` restores fail-fast)
 
 ## Quick Start
 
@@ -116,6 +117,8 @@ DISPLAY=:0 xclock
 ### Mode 2: SSH Tunnel (Recommended)
 
 Automatically creates an SSH tunnel. No extra ports need to be opened, all data is encrypted.
+
+If the tunnel dies mid-session (link flaps, server restart), it is rebuilt automatically and the session resumes — no need to rerun the command. Rebuilds run unattended under BatchMode, so key auth (ssh-agent or a passphrase-free key) is required.
 
 ```bash
 # On your local machine, one command
@@ -236,6 +239,7 @@ Priority: **CLI args > env vars > config file > defaults**
 # port = 22
 # user = "myuser"
 # identity = "~/.ssh/id_rsa"
+# reconnect = true             # rebuild the tunnel when it dies (false = fail fast)
 # token, relay_port, x11, display are also supported
 
 [runtime]
@@ -474,7 +478,7 @@ remote-x11/
     │       ├── connector.rs      # Connection, session create/resume, reconnect backoff
     │       ├── serve.rs          # Relay receive loop and frame dispatch
     │       ├── proxy.rs          # Local X11 app connections and socket pumps
-    │       └── ssh.rs            # SSH tunnel client (health check)
+    │       └── ssh.rs            # SSH tunnel client (health check + auto-rebuild)
     └── rx11-cli/                 # Unified CLI entry point
         └── src/
             ├── main.rs           # Logging init + subcommand dispatch

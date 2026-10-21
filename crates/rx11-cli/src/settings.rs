@@ -127,6 +127,9 @@ pub struct SshConfig {
     pub relay_port: Option<u16>,
     pub x11: Option<String>,
     pub display: Option<u16>,
+    /// Rebuild the SSH tunnel automatically when it dies mid-session
+    /// (default true; false restores fail-fast: first death aborts `rx11 ssh`).
+    pub reconnect: Option<bool>,
 }
 
 /// Written by `rx11 config init`.
@@ -149,6 +152,10 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # port = 22
 # user = "myuser"
 # identity = "~/.ssh/id_rsa"
+# reconnect = true  # Rebuild the tunnel automatically when it dies mid-session.
+                    # Rebuilds run unattended under BatchMode, so key auth
+                    # (ssh-agent or a passphrase-free key) is required.
+                    # false = fail fast: the first death aborts `rx11 ssh`.
 
 [runtime]
 # heartbeat_interval_secs = 30   # server heartbeat period

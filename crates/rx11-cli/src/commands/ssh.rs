@@ -1,13 +1,64 @@
 //! `rx11 ssh` — connect through an SSH tunnel to the remote relay server.
+//!
+//! The tunnel runs under [`ssh::supervise`]: if the ssh child dies or the
+//! health check gives up, a replacement tunnel is spawned on the same local
+//! port with exponential backoff while the connector keeps retrying — so a
+//! link blip resumes the session instead of ending the command. Disable via
+//! `ssh.reconnect = false` in the config file to get the old fail-fast shape
+//! back.
 
 use rx11_client::connector::LocalConnector;
-use rx11_client::ssh::SshTunnel;
+use rx11_client::ssh::{self, SshTunnel, SupervisionEnd, TunnelDeath, TunnelHandle};
 use rx11_core::config::{ClientDefaults, SshDefaults};
 use rx11_core::protocol::DEFAULT_RELAY_PORT;
+use tracing::info;
 
 use crate::cli::SshArgs;
 use crate::settings::load_config;
 use crate::util::{detect_x11_server, wait_for_port, TOKEN_REQUIRED_MSG};
+
+/// Everything needed to (re)open the forward; owned so the rebuild closure
+/// is self-contained across tunnel deaths.
+#[derive(Clone)]
+struct TunnelSpec {
+    host: String,
+    port: u16,
+    user: Option<String>,
+    identity: Option<String>,
+    relay_port: u16,
+    local_bind_port: u16,
+}
+
+/// Spawn the tunnel and wait until the forwarded port accepts connections.
+/// A child that exits before the port opens (bad key/host, port clash) is
+/// reported immediately instead of burning the full READY_TIMEOUT.
+async fn open_tunnel(spec: &TunnelSpec) -> anyhow::Result<SshTunnel> {
+    let mut tunnel = SshTunnel::create(
+        &spec.host,
+        spec.port,
+        spec.user.as_deref(),
+        spec.relay_port,
+        spec.local_bind_port,
+        spec.identity.as_deref(),
+    )
+    .await?;
+    let local = tunnel.local_addr().to_owned();
+    let ready = tokio::select! {
+        r = wait_for_port(&local, SshDefaults::READY_TIMEOUT) => r,
+        status = tunnel.wait() => {
+            let _ = tunnel.kill().await;
+            let status = status?;
+            Err(anyhow::anyhow!(
+                "ssh exited before the tunnel came up: {status} (check host, port, and key auth)"
+            ))
+        }
+    };
+    if let Err(e) = ready {
+        let _ = tunnel.kill().await;
+        return Err(e.context("SSH tunnel failed to become ready"));
+    }
+    Ok(tunnel)
+}
 
 pub async fn ssh(args: SshArgs) -> anyhow::Result<()> {
     let SshArgs {
@@ -56,54 +107,70 @@ pub async fn ssh(args: SshArgs) -> anyhow::Result<()> {
         }
     }
 
-    let mut ssh_tunnel = SshTunnel::create(
-        &host,
+    let spec = TunnelSpec {
+        host,
         port,
-        user.as_deref(),
+        user,
+        identity,
         relay_port,
         local_bind_port,
-        identity.as_deref(),
-    )
-    .await?;
+    };
 
-    let local_addr = ssh_tunnel.local_addr().to_string();
-    if let Err(e) = wait_for_port(&local_addr, SshDefaults::READY_TIMEOUT).await {
-        let _ = ssh_tunnel.kill().await;
-        return Err(e.context("SSH tunnel failed to become ready"));
-    }
+    // The first tunnel comes up strictly: config-level failures (bad host,
+    // missing key) should surface immediately, not burn the rebuild budget.
+    let tunnel = open_tunnel(&spec).await?;
+    let local_addr = tunnel.local_addr().to_string();
 
     detect_x11_server(&x11).await;
+
+    let auto_reconnect = sc.reconnect.unwrap_or(true);
+    if auto_reconnect {
+        info!(
+            "SSH tunnel auto-rebuild enabled (up to {} attempts per drop, backoff {:?}..{:?})",
+            SshDefaults::REBUILD_MAX_ATTEMPTS,
+            SshDefaults::REBUILD_BASE_DELAY,
+            SshDefaults::REBUILD_MAX_DELAY
+        );
+    }
 
     let runtime = config.runtime.unwrap_or_default().to_runtime();
     let connector =
         LocalConnector::new(local_addr, token, x11, display, auto_display).with_runtime(runtime);
 
-    /// Which branch ended the session.
-    enum SessionEnd {
-        Connector(anyhow::Result<()>),
-        TunnelExit(anyhow::Result<std::process::ExitStatus>),
-        Unhealthy,
-    }
+    let rebuild_spec = spec.clone();
+    let end = ssh::supervise(
+        Box::new(tunnel),
+        connector.connect_and_serve(),
+        move || {
+            let spec = rebuild_spec.clone();
+            async move {
+                let t = open_tunnel(&spec).await?;
+                Ok(Box::new(t) as Box<dyn TunnelHandle>)
+            }
+        },
+        ssh::RebuildPolicy::default(),
+        auto_reconnect,
+    )
+    .await;
 
-    let dead = ssh_tunnel.dead_notify();
-    let outcome = tokio::select! {
-        r = connector.connect_and_serve() => SessionEnd::Connector(r),
-        status = ssh_tunnel.wait() => SessionEnd::TunnelExit(status),
-        _ = dead.notified() => SessionEnd::Unhealthy,
-    };
-
-    // Idempotent cleanup for every exit path (the health task's abort and
-    // child kill live inside SshTunnel::kill).
-    let _ = ssh_tunnel.kill().await;
-
-    match outcome {
-        SessionEnd::Connector(r) => r,
-        SessionEnd::TunnelExit(status) => {
-            anyhow::bail!("SSH tunnel exited with status: {:?}", status?)
-        }
-        SessionEnd::Unhealthy => {
-            anyhow::bail!("SSH tunnel health check failed; aborting session")
-        }
+    match end {
+        SupervisionEnd::Session(r) => r,
+        SupervisionEnd::TunnelDown(death) => match death {
+            TunnelDeath::Exit(status) => {
+                anyhow::bail!("SSH tunnel exited with status: {:?}", status?)
+            }
+            TunnelDeath::Unhealthy => {
+                anyhow::bail!("SSH tunnel health check failed; aborting session")
+            }
+        },
+        SupervisionEnd::RebuildExhausted {
+            attempts,
+            last_error,
+        } => anyhow::bail!(
+            "SSH tunnel could not be rebuilt after {} attempts: {} (check the network, or set ssh.reconnect = false to fail fast)",
+            attempts,
+            last_error
+        ),
     }
 }
 

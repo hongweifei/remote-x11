@@ -46,6 +46,15 @@ impl SshDefaults {
     pub const LOCAL_BIND_BASE: u16 = 17000;
     /// How long to wait for the forwarded local port to accept connections.
     pub const READY_TIMEOUT: Duration = Duration::from_secs(10);
+    /// First wait between tunnel rebuild attempts (doubling up to the cap).
+    /// Sized so a rebuild can still succeed inside the server's session-grace
+    /// window while the connector's own retry loop is running.
+    pub const REBUILD_BASE_DELAY: Duration = Duration::from_secs(2);
+    /// Ceiling of the rebuild backoff doubling.
+    pub const REBUILD_MAX_DELAY: Duration = Duration::from_secs(30);
+    /// Consecutive rebuild attempts (per tunnel death) before giving up;
+    /// a successful rebuild resets the budget for the next death.
+    pub const REBUILD_MAX_ATTEMPTS: u32 = 8;
 }
 
 impl BufferDefaults {
