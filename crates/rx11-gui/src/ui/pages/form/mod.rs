@@ -196,6 +196,10 @@ struct SolvedForm {
     solved: Solved,
     cards: Vec<NodeId>,
     rows: Vec<(&'static str, FieldKind, NodeId)>,
+    /// Bottom of the scrollable content: the last card's bottom plus the gap
+    /// that would follow another section. The hand-written version summed the
+    /// same trailing gap, and the scroll range must not shrink by it.
+    content_bottom: i32,
 }
 
 /// The form's layout tree: heading, the scrolling field column, the side column.
@@ -235,12 +239,18 @@ fn form_layout(spec: &FormSpec, x: i32, y: i32, w: i32, scroll: i32) -> SolvedFo
     // The side column is a sibling of the field column, so it does not scroll.
     let _side = layout.stack(body, Axis::Column, Size::Fixed(SIDE_W));
 
-    let mut solved = layout.solve(page);
+    let solved = layout.solve(page);
+    let content_bottom = cards
+        .last()
+        .map(|&id| solved.get(id).bottom() + SECTION_GAP)
+        .unwrap_or_else(|| solved.get(_header).bottom());
+    let mut solved = solved;
     solved.shift(-scroll);
     SolvedForm {
         solved,
         cards,
         rows,
+        content_bottom: content_bottom + scroll,
     }
 }
 
@@ -586,13 +596,11 @@ impl FormPage {
         {
             let mut s = self.st.borrow_mut();
             s.view_h = h - (page_y_start(y, L::PAD) - y);
-            let total: i32 = self
-                .spec
-                .sections
-                .iter()
-                .map(|sec| SECTION_HEAD + sec.fields.len() as i32 * ROW_H + 12 + SECTION_GAP)
-                .sum();
-            s.content_h = total;
+            // Content height comes from the layout tree, not from a second sum
+            // over the spec: the tree already knows how tall the column is, and
+            // two formulas for the same thing is how the scroll range drifts.
+            let content = form_layout(self.spec, x, y, w, 0);
+            s.content_h = content.content_bottom - page_y_start(y, L::PAD);
             let max = (s.content_h - s.view_h).max(0);
             s.scroll = s.scroll.clamp(0, max);
         }
@@ -948,5 +956,43 @@ mod tests {
         let (_, a) = geometry(&SPEC, 0, 0, 1000, 700, 0);
         let (_, b) = geometry(&SPEC, 0, 0, 1000, 700, 40);
         assert_eq!(a[0].row_y - b[0].row_y, 40);
+    }
+
+    /// The scrollable content height must equal the shipped sum: every card plus
+    /// the gap that follows it. The first version of the tree omitted the
+    /// trailing gap, which silently shrank the scroll range by `SECTION_GAP`.
+    #[test]
+    fn content_height_matches_the_shipped_formula() {
+        let shipped: i32 = SPEC
+            .sections
+            .iter()
+            .map(|sec| SECTION_HEAD + sec.fields.len() as i32 * ROW_H + 12 + SECTION_GAP)
+            .sum();
+        let solved = form_layout(&SPEC, 0, 0, 1000, 0);
+        assert_eq!(
+            solved.content_bottom - page_y_start(0, L::PAD),
+            shipped,
+            "content height is the sum of the cards plus their gaps"
+        );
+    }
+
+    /// Every row and card must sit inside the column the form scrolls, and the
+    /// rows must be exactly `ROW_H` apart.
+    #[test]
+    fn rows_tile_the_section_without_drift() {
+        let solved = form_layout(&SPEC, 0, 0, 1000, 0);
+        let card = solved.solved.get(solved.cards[0]);
+        let tops: Vec<i32> = solved
+            .rows
+            .iter()
+            .map(|&(_, _, id)| solved.solved.get(id).y)
+            .collect();
+        assert_eq!(tops[1] - tops[0], ROW_H);
+        assert_eq!(tops[0], card.y + SECTION_HEAD, "rows start under the head");
+        assert_eq!(
+            solved.solved.get(solved.rows.last().unwrap().2).bottom(),
+            card.bottom() - 12,
+            "the last row leaves the card's bottom air"
+        );
     }
 }
