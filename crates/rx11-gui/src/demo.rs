@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use crate::launcher::GuiDefaults;
 use crate::model::{
     Backend, Health, LogLevel, LogRecord, Role, SessionRowData, StartRequest, TrafficTotals,
 };
@@ -206,9 +207,17 @@ impl Backend for DemoBackend {
                     }
                 }
             };
+            // Direction matters to the operator: this product streams the
+            // remote screen *down* to the local client, so the bulk is the
+            // client's received bytes and the relay's sent bytes. The fixture
+            // used to have it backwards (client "uploading" 9 MB), which also
+            // contradicted the summary strip — `totals()` already advances
+            // `received` fast and `sent` slowly.
             let (sent, recv) = match f.role {
-                Role::Server => (1_284_913, 9_120_553),
-                Role::Client => (8_998_120, 1_275_400),
+                // Mirrored exactly: what the relay sends is what the client
+                // receives, so the two rows can be read against each other.
+                Role::Server => (9_120_553, 1_284_913),
+                Role::Client => (1_284_913, 9_120_553),
                 Role::Ssh => (0, 0),
             };
             out.push(SessionRowData {
@@ -352,29 +361,60 @@ fn stamp(n: u64) -> String {
     format!("{h:02}:{m:02}:{s:02}.{:03}", (n * 137) % 1000)
 }
 
-/// Seed the demo with a running server + client and a few log lines, so the
-/// console opens on a populated state rather than an empty one.
+/// How many sessions / log lines the demo should show.
+///
+/// The default fixtures are deliberately small — a screenshot of a two-session
+/// console is honest about what the demo is. But the scrollbars only appear once
+/// the lists overflow (the session table fits ~7 rows, the log well ~25), so
+/// exercising them by hand needs a bigger fixture:
+///
+/// ```text
+/// RX11_GUI_DEMO=1 RX11_GUI_DEMO_SESSIONS=12 RX11_GUI_DEMO_LOGS=200 rx11-gui
+/// ```
+///
+/// Values are clamped so a typo cannot spin the fixture generator.
+fn demo_count(key: &str, fallback: u64, max: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map(|n| n.clamp(1, max))
+        .unwrap_or(fallback)
+}
+
+/// Seed the demo with a running server + client, so the console opens on a
+/// populated state rather than an empty one.
+///
+/// `RX11_GUI_DEMO_SESSIONS` / `RX11_GUI_DEMO_LOGS` enlarge the fixture for
+/// testing the scrolling lists; the defaults are the delivery screenshots.
 pub fn seeded() -> DemoBackend {
     let b = DemoBackend::new();
     let defaults = DemoBackend::defaults();
-    b.log_seq.store(6, Ordering::Relaxed);
-    if let Ok(id) = b.start(StartRequest {
-        role: Role::Server,
-        values: defaults.clone(),
-    }) {
-        if let Ok(mut s) = b.sessions.lock() {
-            if let Some(f) = s.iter_mut().find(|f| f.id == id) {
-                f.started = Instant::now() - Duration::from_secs(192);
-            }
-        }
-    }
-    if let Ok(id) = b.start(StartRequest {
-        role: Role::Client,
-        values: defaults,
-    }) {
-        if let Ok(mut s) = b.sessions.lock() {
-            if let Some(f) = s.iter_mut().find(|f| f.id == id) {
-                f.started = Instant::now() - Duration::from_secs(188);
+    let sessions = demo_count("RX11_GUI_DEMO_SESSIONS", 2, 200);
+    let logs = demo_count(
+        "RX11_GUI_DEMO_LOGS",
+        6,
+        GuiDefaults::LOG_RING_CAPACITY as u64,
+    );
+    b.log_seq.store(logs, Ordering::Relaxed);
+
+    // Roles cycle so extra rows are visually distinguishable — otherwise a
+    // scrolled session table looks identical to an unscrolled one.
+    for i in 0..sessions {
+        let role = match i % 3 {
+            0 => Role::Server,
+            1 => Role::Client,
+            _ => Role::Ssh,
+        };
+        if let Ok(id) = b.start(StartRequest {
+            role,
+            values: defaults.clone(),
+        }) {
+            // Stagger the uptimes so the table does not read as one moment.
+            if let Ok(mut s) = b.sessions.lock() {
+                if let Some(f) = s.iter_mut().find(|f| f.id == id) {
+                    let age = 192u64.saturating_sub(i * 4);
+                    f.started = Instant::now() - Duration::from_secs(age);
+                }
             }
         }
     }

@@ -7,6 +7,8 @@
 //!   rx11-gui                  正常启动：读 `$HOME/.config/rx11/config.toml`，
 //!                             在进程内嵌入 server/client
 //!   RX11_GUI_DEMO=1 rx11-gui  演示模式：固定样例数据，不读写配置、不连网络
+//!     RX11_GUI_DEMO_SESSIONS=<n>  演示会话数（默认 2，上限 200）
+//!     RX11_GUI_DEMO_LOGS=<n>      演示日志条数（默认 6，上限 = 日志环容量）
 //!   RX11_GUI_PAGE=<页>        直开某一页：console|server|client|ssh|runtime|logs
 //!   RX11_GUI_SCALE=1.25 …     覆盖界面缩放（默认跟随 GDK_SCALE/QT_SCALE_FACTOR）
 
