@@ -1,0 +1,31 @@
+[package]
+name = "rx11-gui"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rx11-gui"
+path = "src/main.rs"
+
+[features]
+# 演示数据后端（`RX11_GUI_DEMO=1`）。默认打开：截图取证和 `cargo run` 都靠它，
+# 也让 CI 的 `--all-targets` 覆盖到这份代码。要一个只含真实数据层的精简构建：
+# `cargo build -p rx11-gui --no-default-features`。
+default = ["demo"]
+demo = []
+
+[dependencies]
+rx11-core = { path = "../rx11-core" }
+rx11-server = { path = "../rx11-server" }
+rx11-client = { path = "../rx11-client" }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+anyhow = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+toml_edit = "0.22"
+fltk = "1.5"
+# Direct binding needed for one call: `Fl_Group::draw_children`, which is the
+# only way to paint a group background and then its children from Rust.
+fltk-sys = "1.5"

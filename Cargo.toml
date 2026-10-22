@@ -4,6 +4,7 @@ members = [
     "crates/rx11-server",
     "crates/rx11-client",
     "crates/rx11-cli",
+    "crates/rx11-gui",
 ]
 resolver = "2"
 

@@ -17,6 +17,17 @@ jobs:
         with:
           components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
+      # The GUI crate bundles FLTK, so the build needs a C++ toolchain plus
+      # the X11/fontconfig development headers. Everything else in the
+      # workspace builds without them.
+      - name: FLTK build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build \
+            libx11-dev libxext-dev libxft-dev libxinerama-dev libxcursor-dev \
+            libxrender-dev libxfixes-dev libxrandr-dev libfontconfig1-dev \
+            libgl1-mesa-dev
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
