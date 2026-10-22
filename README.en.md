@@ -49,6 +49,7 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Security hardening** — Session/connection ownership validation, auth data length limits, decompression size verification, frame sync recovery, read_buf limits for DoS prevention
 - **SSH port conflict detection** — Checks for local port conflicts before establishing SSH tunnels
 - **SSH tunnel auto-rebuild** — if the tunnel process dies or the health check gives up, a fresh tunnel is respawned on the same local port with exponential backoff (2s→30s, up to 8 attempts per drop) while the connector keeps retrying, so the session resumes transparently inside the server's grace window (`ssh.reconnect = false` restores fail-fast)
+- **Native control console (`rx11-gui`, FLTK)** — one desktop window for starting and stopping all three roles (relay / client / SSH tunnel), watching a live link scope and traffic counters, editing every `[client]` / `[server]` / `[ssh]` / `[runtime]` knob, and reading the log. It shares the CLI's `config.toml` and preserves comments and unknown keys on write; the file is only touched when Save is pressed
 
 ## Quick Start
 
@@ -134,6 +135,26 @@ rx11 ssh -H <REMOTE_IP> -u <USERNAME> -t <TOKEN> -d 1
 ```
 
 ---
+
+## Graphical Console (rx11-gui)
+
+The repository also builds a native FLTK console that puts role control, the live link, configuration editing and the log in one window:
+
+```bash
+cargo run -p rx11-gui            # or target/release/rx11-gui
+```
+
+The window is four regions: a navigation rail (overview / server / client / SSH / runtime / logs), a top link band (`relay ⇄ client` with a pulse that moves with throughput), the working area, and a status bar showing the config path, an unsaved marker and the most recent notice.
+
+- **Start and stop all three roles** — relay, direct client and SSH tunnel run in-process (the console does not fork the `rx11` binary), so the figures come from the same counters the link uses rather than from parsed logs
+- **Link scope** — a 90-second envelope of both directions plus the compression savings ratio; hovering reads the exact rate at a point, and the axis snaps to 1/2/5 so three orders of magnitude stay legible
+- **Configuration editing** — four pages cover every `config.toml` field with validation messages; saving rewrites the file with `toml_edit` in place, keeping comments, key order and unknown keys, and nothing is written until Save is pressed
+- **Log panel** — level-coloured, searchable, exportable; events go to stderr and to a 4000-line ring in the window
+- **Display scaling** — follows `GDK_SCALE`/`QT_SCALE_FACTOR` by default, or an explicit `RX11_GUI_SCALE=1.25`, so type is rendered at device resolution instead of being stretched by the compositor
+
+Two switches exist for demos and for taking screenshots: `RX11_GUI_DEMO=1` opens the console on fixed sample data (no config reads or writes, no network), and `RX11_GUI_PAGE=logs` opens a specific page.
+
+The code is organised as six layers with one-way dependencies: `settings`/`launcher` (domain) → `model` (the cross-layer contract) → `theme`/`state`/`ui` (presentation) → `backend`/`demo` (port implementations) → `app` (composition root), with a one-line `main.rs`. UI and data layer speak only flat `key → string` values, so a page never learns the config schema and a new runtime knob costs one field declaration. The direction of those dependencies is asserted by `crates/rx11-gui/tests/architecture.rs` rather than agreed verbally. Structure, design rationale and verification notes: [`crates/rx11-gui/DESIGN.md`](crates/rx11-gui/DESIGN.md).
 
 ## Command Reference
 
