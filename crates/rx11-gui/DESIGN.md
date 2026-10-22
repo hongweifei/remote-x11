@@ -148,7 +148,7 @@ settings / launcher      领域与数据：config.toml 模型、进程内会话�
 | `model.rs` | 1 | `Backend` trait + `Role`/`Health`/`LogLevel` + 四个 DTO |
 | `theme/**` | 4 | `tokens`（唯一的设计令牌来源）/`fonts`/`draw`（唯一直接调 `fltk::draw` 的地方） |
 | `state.rs` | 1 | UI 线程独占的视图状态 |
-| `ui/**` | 9 | `mod`（`Page` 表面）/`chrome`/`action`/`controls`/`scope`/`shell`/`pages/*` |
+| `ui/**` | 16 | `mod`（`Page` 表面）/`layout`（声明式布局求解）/`chrome`/`action`/`controls`/`scope`/`shell`/`pages/*` |
 | `backend.rs` `demo.rs` | 2 | `Backend` 的两种实现 |
 | `app/**` | 3 | `mod`（外壳）/`actions`（动作翻译）/`tests` |
 
@@ -192,7 +192,43 @@ settings / launcher      领域与数据：config.toml 模型、进程内会话�
 
 **怎么证明"只搬家"**（这个 crate 在 git 里没有历史可回退，所以方法本身要写下来）：动手前把 `src/` 快照到 `/tmp`；改完做三件事——① item 普查（旧文件的每个 `fn/struct/enum/trait/const/static/impl` 名字在新树里还在，`impl` 按目标类型集合比，因为一个 `impl` 块可以合法地拆成两块）；② 归一化行级 diff（抹掉 `use`/`mod`/`pub use` 与 `pub(super)` 前缀后逐字节比对，**唯一允许的差异是可见性放宽**，注释行不在白名单里）；③ 门禁 + 测试函数名集合 diff。行为层再补一次 `cargo test --workspace`、一次隔离 HOME 的适配层端到端，以及截图的逐像素 A/B。
 
-### 6.5 演示数据的两个尺寸开关
+### 6.5 声明式布局（2026-10-22）
+
+界面过去是手算坐标：页面里到处是 `x + pad`、`y - L::STATUS_H`、`first_row_y + i * ROW_H`。这类代码反复出错，而且每次错的都是**同一类**毛病——同一块矩形在两个地方各算一遍，于是画出来的和点得到的不一致：
+
+| 症状 | 原因 |
+|---|---|
+| 滚完列表停在空白帧 | 滚动条按页面高度算可见行数，绘制按列表高度算 |
+| 滚轮判"不需要滚动" | 行数 helper 漏算了卡片以上的区域 |
+| 会话表滚动条画到窗口外 | helper 收的是卡片矩形，却按整页矩形解释 |
+| 最后一行会话画到卡片外 | 可用高度漏减了内边距 + 标题 + 表头 |
+| 日志井最后一行与滚动条戳出井外 | 行数与轨道长度各自减一串魔数 |
+
+修法不是"再仔细一点"，而是让这些矩形**只有一个来源**：`ui/layout.rs` 是一个一维布局求解器，页面把自己的版面描述成一棵树，求解一次，然后绘制、命中测试、滚动条、容量计算全部读同一组 `Rect`。
+
+```text
+Layout::column() / Layout::row()      创建根栈
+  .leaf(parent, Size)                 叶子：页面要绘制的区域
+  .stack(parent, Axis, Size)          子容器
+  .pad(id, Insets) / .gap(id, n)      内边距 / 子项间距
+  .lead(id, n)                        插在该子项之前的间距
+solve(Rect) -> Solved                 求解；solved.get(id) 取回矩形
+```
+
+尺寸三态：`Fixed(n)` 精确占据、`Hug(n)` 内容需要多少就多少（装不下时让位，这是它的契约而非错误）、`Fill(w)` 按权重瓜分剩余空间。子项**永远不会**越出容器：固定尺寸之和超出时，`Solved::overflow()` 报真、靠后的子项被压缩。这一条是有意的——"画到容器外面"正是这套东西要消灭的症状。
+
+页面文件里因此不再出现 `+ Metrics::…` 形式的坐标推算；`console/mod.rs`、`logs.rs`、`shell.rs` 里的手算坐标已清零。每个页面一个 `build_layout`，`Rect` 按语义命名（`session_card`、`row_area`、`column_rects`）。
+
+**判据（改版面时照做）**：几何函数是纯函数，不依赖 FLTK 绘制，所以能直接断言。`ui/layout.rs` 有 10 条不变量测试（子项不越界、权重分布、Hug 让位、容量），`console/geometry.rs` 把总览页的卡片栈**钉成具体数字**——它迁移前后必须逐像素等价，改坏了在测试里就红，不必等截图：
+
+```rust
+assert_eq!(solved.get(geometry.sessions), Rect::new(22, 510, 900, 182));
+assert_eq!(area.y, 588, "首行在卡片顶下方 78");
+```
+
+配置表单页（`form/`）**没有**改成布局树：它的 `geometry()` 已经是绘制与控件摆放的唯一来源，且四页共用一个声明式字段引擎，风险大于收益。这条是自觉的取舍，不是遗漏。
+
+### 6.6 演示数据的两个尺寸开关
 
 默认演示夹具很小（2 个会话 / 6 条日志），因为交付截图就该是"一个刚配置好的人看到的样子"。但滚动条只在列表溢出时出现（会话表放得下约 7 行、日志井约 25 行），所以手动验滚动需要更大的夹具：
 

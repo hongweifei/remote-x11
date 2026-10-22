@@ -18,9 +18,11 @@ use fltk::prelude::*;
 use crate::model::LogLevel;
 use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot};
+use crate::ui::chrome::{empty_state_in, page_header_in, PAGE_HEADER_H};
 use crate::ui::controls::{BtnKind, Button, Field};
+use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
 use crate::ui::scrollbar::{Hit, ScrollBar};
-use crate::ui::{page_header, Page, PageInput};
+use crate::ui::{Page, PageInput};
 
 /// 级别 → 颜色。颜色属于表现层，所以映射留在页面里：`model::LogLevel` 只管语义
 /// （严重度顺序 + 中文标签 + 三字母码）。
@@ -132,36 +134,100 @@ pub struct LogPage {
 /// Width reserved for the "搜索" caption in front of the search box.
 const SEARCH_LABEL_W: i32 = 44;
 
-/// Rows of log text that fit in the list area, derived from the page height.
-/// Where the log list sits on a page of this size: the well's inner rect.
+/// Height of the filter row: search box and its buttons.
+const FILTER_H: i32 = 34;
+
+/// Height of the per-level counts row.
+const COUNTS_H: i32 = 18;
+
+/// Vertical rhythm between the filter, counts and list: tighter than the gap
+/// between cards, because they read as one instrument panel.
+const SECTION_GAP: i32 = 8;
+
+/// Width of the action buttons on the filter row.
+const BUTTON_W: i32 = 96;
+
+/// Width of the level-filter button.
+const LEVEL_W: i32 = 120;
+
+/// Line height of one log row.
+const ROW_LINE_H: i32 = 20;
+
+/// Inset from the well's edge to the text block (the well is inset like a card).
+const WELL_PAD: Insets = Insets::xy(18, 16);
+
+/// Distance from the text block's top to the first line.
+const WELL_TOP_GAP: i32 = 4;
+
+/// The page's layout tree: heading, filter row, counts row, list well.
 ///
-/// Paint, hit testing and the scrollbar all derive from this, so the list you
-/// see, the list you can click and the bar beside it agree.
-fn list_rect(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    let pad = L::PAD;
-    let content_x = x + pad;
-    let content_w = w - pad * 2;
-    let bar_y = y + pad + 64 + 20;
-    let counts_y = bar_y + 42;
-    let list_y = counts_y + 26;
-    let list_h = (y + h - pad - list_y).max(60);
-    // NOTE: this must not call `card()` — that function *paints* the card, and
-    // calling it here would erase the rows the painter just drew. Same inner
-    // geometry, plain arithmetic.
-    (content_x + 18, list_y + 16, content_w - 36, list_h)
+/// Built once per paint and solved once; the painter, the widget placement and
+/// the pointer handler all read the same solved rectangles, which is what keeps
+/// the rows, the scrollbar and the hit testing from drifting apart.
+struct LogLayout {
+    layout: Layout,
+    header: NodeId,
+    field: NodeId,
+    level: NodeId,
+    export: NodeId,
+    clear: NodeId,
+    copy: NodeId,
+    counts: NodeId,
+    well: NodeId,
+}
+
+impl LogLayout {
+    fn solve(&self, page: Rect) -> Solved {
+        self.layout.solve(page)
+    }
+
+    /// The block log lines are drawn into: the well minus its card inset.
+    fn text_area(&self, solved: &Solved) -> Rect {
+        solved.get(self.well).inset(WELL_PAD)
+    }
+}
+
+fn build_layout() -> LogLayout {
+    let mut layout = Layout::column().pad(0, Insets::all(L::PAD));
+    let header = layout.leaf(0, Size::Fixed(PAGE_HEADER_H));
+    let body = layout.stack(0, Axis::Column, Size::Fill(1));
+    layout = layout.gap(body, SECTION_GAP);
+
+    // Filter row: search box, level button, then a tighter group of actions.
+    let filter = layout.stack(body, Axis::Row, Size::Fixed(FILTER_H));
+    layout = layout.gap(filter, 12);
+    let field = layout.leaf(filter, Size::Fill(1));
+    let level = layout.leaf(filter, Size::Fixed(LEVEL_W));
+    let actions = layout.stack(filter, Axis::Row, Size::Fixed(BUTTON_W * 3));
+    layout = layout.gap(actions, 8);
+    let export = layout.leaf(actions, Size::Fixed(BUTTON_W));
+    let clear = layout.leaf(actions, Size::Fixed(BUTTON_W));
+    let copy = layout.leaf(actions, Size::Fill(1));
+
+    let counts = layout.leaf(body, Size::Fixed(COUNTS_H));
+    let well = layout.leaf(body, Size::Fill(1));
+
+    LogLayout {
+        layout,
+        header,
+        field,
+        level,
+        export,
+        clear,
+        copy,
+        counts,
+        well,
+    }
 }
 
 /// How many log lines fit in a well of this outer height.
 ///
-/// Derived from the well's own height — the page height minus a pile of magic
-/// numbers used to overshoot, which drew the last line and the scrollbar past
-/// the well's bottom border. `list_rect` + `list_rows` are the only source.
-fn list_rows(list_h: i32) -> usize {
-    // 16 card padding top + 4 row inset + 16 padding bottom
-    ((list_h - 36) / ROW_LINE_H).max(1) as usize
+/// Derived from the well's own height so a tall or short page cannot overshoot:
+/// the row count and the scroll track length both come from here.
+fn list_rows(well_h: i32) -> usize {
+    // card padding 16 + top gap 4 + card padding 16
+    ((well_h - 36) / ROW_LINE_H).max(1) as usize
 }
-
-const ROW_LINE_H: i32 = 20;
 
 impl LogPage {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
@@ -261,10 +327,9 @@ impl LogPage {
         let page = self.page.clone();
         self.page.on_input(move |input| {
             let (px, py, pw, ph) = *rect.borrow();
-            let rows = {
-                let (_, _, _, list_h) = list_rect(px, py, pw, ph);
-                list_rows(list_h)
-            };
+            let geometry = build_layout();
+            let solved = geometry.solve(Rect::new(px, py, pw, ph));
+            let rows = list_rows(solved.get(geometry.well).h);
             match input {
                 PageInput::Wheel(dy) => {
                     if dy == 0 {
@@ -288,7 +353,7 @@ impl LogPage {
                     true
                 }
                 PageInput::Push(lx, ly) => {
-                    let Some(bar) = log_bar(px, py, pw, ph, &st.borrow()) else {
+                    let Some(bar) = log_bar(&geometry, &solved, &st.borrow()) else {
                         return false;
                     };
                     match bar.hit(lx + px, ly + py) {
@@ -321,7 +386,7 @@ impl LogPage {
                     let Some(grab) = st.borrow().thumb_grab else {
                         return false;
                     };
-                    let Some(bar) = log_bar(px, py, pw, ph, &st.borrow()) else {
+                    let Some(bar) = log_bar(&geometry, &solved, &st.borrow()) else {
                         return false;
                     };
                     let row = (bar.scroll_at(ly + py - grab) / ROW_LINE_H).max(0) as usize;
@@ -389,24 +454,18 @@ impl LogPage {
 
     fn layout(&self, x: i32, y: i32, w: i32, h: i32) {
         self.page.resize(x, y, w, h);
-        let pad = L::PAD;
-        let content_x = x + pad;
-        let content_w = w - pad * 2;
-        let bar_y = y + pad + 64 + 20;
-
-        // Filter row: search box on the left, controls on the right.
-        let btn_w = 96;
-        let filter_w = (content_w - btn_w * 3 - 24 - 120).max(160);
-        self.filter.resize(content_x, bar_y, filter_w, 34);
-        let mut bx = content_x + filter_w + 12;
-        self.level_min.resize(bx, bar_y, 120, 34);
-        bx += 132;
-        self.b_export.resize(bx, bar_y, btn_w, 34);
-        bx += btn_w + 8;
-        self.b_clear.resize(bx, bar_y, btn_w, 34);
-        bx += btn_w + 8;
-        self.b_copy
-            .resize(bx, bar_y, content_w - (bx - content_x), 34);
+        let geometry = build_layout();
+        let solved = geometry.solve(Rect::new(x, y, w, h));
+        let r = solved.get(geometry.field);
+        self.filter.resize(r.x, r.y, r.w, r.h);
+        let r = solved.get(geometry.level);
+        self.level_min.resize(r.x, r.y, r.w, r.h);
+        let r = solved.get(geometry.export);
+        self.b_export.resize(r.x, r.y, r.w, r.h);
+        let r = solved.get(geometry.clear);
+        self.b_clear.resize(r.x, r.y, r.w, r.h);
+        let r = solved.get(geometry.copy);
+        self.b_copy.resize(r.x, r.y, r.w, r.h);
     }
 }
 
@@ -415,9 +474,11 @@ impl LogPage {
 // ---------------------------------------------------------------------------
 
 /// Scroll bar for the log list, or `None` when the whole filtered view fits.
-fn log_bar(x: i32, y: i32, w: i32, h: i32, s: &LogState) -> Option<ScrollBar> {
-    let (ix, iy, iw, list_h) = list_rect(x, y, w, h);
-    let rows = list_rows(list_h);
+///
+/// Its track spans exactly the drawn rows, so it cannot poke past the well.
+fn log_bar(geometry: &LogLayout, solved: &Solved, s: &LogState) -> Option<ScrollBar> {
+    let text = geometry.text_area(solved);
+    let rows = list_rows(solved.get(geometry.well).h);
     let total = s.view.visible().len();
     // `scroll` counts from the top; in follow mode the view is pinned to the end.
     let first = if s.view.follow {
@@ -425,12 +486,10 @@ fn log_bar(x: i32, y: i32, w: i32, h: i32, s: &LogState) -> Option<ScrollBar> {
     } else {
         s.view.scroll.min(total.saturating_sub(1))
     };
-    // Track spans exactly the drawn rows, so it cannot poke past the well.
-    let _ = list_h;
     ScrollBar::new(
-        // In the well's right padding (18 units), clear of the log text.
-        ix + iw + 7,
-        iy + 4,
+        // In the well's right padding, clear of the text columns.
+        text.right() + 7,
+        text.y + WELL_TOP_GAP,
         (rows as i32 * ROW_LINE_H).max(20),
         total as i32 * ROW_LINE_H,
         rows as i32 * ROW_LINE_H,
@@ -440,13 +499,10 @@ fn log_bar(x: i32, y: i32, w: i32, h: i32, s: &LogState) -> Option<ScrollBar> {
 
 fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     th::fill(x, y, w, h, C::BG);
-    let pad = L::PAD;
-    let content_x = x + pad;
-    let content_w = w - pad * 2;
-    page_header(
-        content_x,
-        y + pad,
-        content_w,
+    let geometry = build_layout();
+    let solved = geometry.solve(Rect::new(x, y, w, h));
+    page_header_in(
+        solved.get(geometry.header),
         "日志",
         "本次运行的全部日志，按级别着色，可搜索",
     );
@@ -454,14 +510,21 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     let v = &s.view;
     let counts = v.counts();
     let visible = v.visible();
-    let bar_y = y + pad + 64 + 20;
 
     // Search caption sits on the input's own line, left of the box.
-    th::small("搜索", content_x, bar_y, SEARCH_LABEL_W - 8, 34, C::TEXT_2);
+    let field = solved.get(geometry.field);
+    th::small(
+        "搜索",
+        field.x,
+        field.y,
+        SEARCH_LABEL_W - 8,
+        FILTER_H,
+        C::TEXT_2,
+    );
 
     // Counts row: one figure per level, so the operator knows what a filter
     // would reveal before applying it. Right side carries the visible total.
-    let counts_y = bar_y + 42;
+    let counts_row = solved.get(geometry.counts);
     let levels = [
         LogLevel::Error,
         LogLevel::Warn,
@@ -469,16 +532,16 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
         LogLevel::Debug,
         LogLevel::Trace,
     ];
-    let mut cx = content_x;
+    let mut cx = counts_row.x;
     for lv in levels {
         let n = counts[lv as usize];
         let color = if n > 0 { level_color(lv) } else { C::TEXT_3 };
         th::mono(
             &format!("{} {}", lv.code(), n),
             cx,
-            counts_y,
+            counts_row.y,
             64,
-            18,
+            COUNTS_H,
             T::MICRO,
             color,
         );
@@ -488,28 +551,25 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     let shown = visible.len();
     th::text(
         &format!("显示 {shown} / 共 {}", v.entries.len()),
-        content_x,
-        counts_y,
-        content_w,
-        18,
+        counts_row.x,
+        counts_row.y,
+        counts_row.w,
+        COUNTS_H,
         th::ui_font(),
         T::MICRO,
         C::TEXT_3,
         fltk::enums::Align::Right,
     );
 
-    // List well geometry: one source for paint, hit testing and the scrollbar.
-    let (ix, iy, iw, list_h) = list_rect(x, y, w, h);
-    let (list_x, list_y, list_w) = (x + pad, iy - 16, w - pad * 2);
-    th::fill_round(list_x, list_y, list_w, list_h, L::RADIUS, C::SUNKEN);
-    th::stroke_round(list_x, list_y, list_w, list_h, L::RADIUS, C::LINE);
+    // The well and its text block both come from the solved tree.
+    let well = solved.get(geometry.well);
+    th::fill_round(well.x, well.y, well.w, well.h, L::RADIUS, C::SUNKEN);
+    th::stroke_round(well.x, well.y, well.w, well.h, L::RADIUS, C::LINE);
+    let text = geometry.text_area(&solved);
 
     if visible.is_empty() {
-        crate::ui::empty_state(
-            ix,
-            list_y + 20,
-            iw,
-            list_h - 40,
+        empty_state_in(
+            text,
             if v.entries.is_empty() {
                 "还没有日志"
             } else {
@@ -524,7 +584,7 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
         return;
     }
 
-    let rows = list_rows(list_h);
+    let rows = list_rows(well.h);
     // `scroll` is an offset from the top; when following, pin to the end.
     let start = if v.follow {
         visible.len().saturating_sub(rows)
@@ -533,7 +593,8 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     };
     let end = (start + rows).min(visible.len());
 
-    let mut ly = iy + 4;
+    let (ix, iw) = (text.x, text.w);
+    let mut ly = text.y + WELL_TOP_GAP;
     for &idx in &visible[start..end] {
         let e = &v.entries[idx];
         // Gutter: level code, then time, then target, then the message. The
@@ -569,18 +630,17 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     }
 
     // Scrollbar for the list well.
-    if let Some(bar) = log_bar(x, y, w, h, s) {
+    if let Some(bar) = log_bar(&geometry, &solved, s) {
         bar.paint(s.thumb_grab.is_some());
     }
 
-    // The scroll position is shown by the shared scrollbar above; this block
-    // used to paint a second, private indicator of its own, which made the page
-    // look like it had two bars. Only the paused-follow notice lives here.
+    // The scroll position is shown by the shared scrollbar above; only the
+    // paused-follow notice lives here.
     if visible.len() > rows && !v.follow {
         th::micro(
             "已暂停跟随 · 滚到底部恢复",
-            content_x + 16,
-            list_y + list_h - 20,
+            well.x + 16,
+            well.bottom() - 20,
             300,
             14,
             C::AMBER,
@@ -673,5 +733,46 @@ mod tests {
                 "h={h}: {rows} 行放不进井里"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// The filter row must keep its three columns: a search box that fills the
+    /// slack, the level button, and the action group pinned to the right.
+    #[test]
+    fn filter_row_gives_the_slack_to_the_search_box() {
+        let geometry = build_layout();
+        let solved = geometry.solve(Rect::new(0, 0, 1180, 714));
+        let field = solved.get(geometry.field);
+        let level = solved.get(geometry.level);
+        let export = solved.get(geometry.export);
+        let clear = solved.get(geometry.clear);
+        let copy = solved.get(geometry.copy);
+        assert_eq!(level.w, LEVEL_W);
+        assert_eq!(export.w, BUTTON_W);
+        assert_eq!(clear.w, BUTTON_W);
+        // The last action takes whatever is left of its group, so the group
+        // ends flush instead of leaving a sliver.
+        assert!(
+            copy.w > 0 && copy.w <= BUTTON_W,
+            "copy fills the group's remainder: {copy:?}"
+        );
+        assert!(field.w > 0);
+        assert!(
+            field.right() < level.x,
+            "search box must not overlap the level button: {field:?} {level:?}"
+        );
+        assert!(
+            level.right() < export.x,
+            "level button must sit left of the action group"
+        );
+        assert_eq!(
+            copy.right(),
+            solved.get(geometry.header).right(),
+            "the action group ends flush with the content edge"
+        );
     }
 }

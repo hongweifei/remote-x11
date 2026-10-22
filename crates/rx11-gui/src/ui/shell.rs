@@ -5,10 +5,11 @@
 //! right now (top bar), and what the program is doing on your behalf
 //! (status bar). Page-specific content never leaks in here.
 //!
-//! Layout is a three-band grid — 58px top bar, flexible content, 28px status
-//! bar — with a 236px rail down the left of the content band. Every value
-//! comes from [`crate::theme::L`] so the rail, the page padding and the
-//! status bar share one grid.
+//! Layout is a three-band grid — top bar, flexible content, status bar — with a
+//! rail down the left of the content band. Every band is a leaf of a solved
+//! [`crate::ui::layout`] tree, so the rail's rows, the page padding and the
+//! status bar all derive from one solve and the metric tokens in
+//! [`crate::theme::L`].
 //!
 //! The shell reports intent through [`crate::ui::action`]: the rail selects a
 //! page, the top bar fires a [`TopbarAction`], and both let `app` decide what
@@ -25,6 +26,7 @@ use crate::model::{Health, Role};
 use crate::state::{fmt_rate, fmt_uptime, AppState, Page};
 use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot, TopbarAction};
+use crate::ui::layout::{Insets, Layout, NodeId, Rect, Size, Solved};
 
 // ---------------------------------------------------------------------------
 // Rail
@@ -72,7 +74,9 @@ impl Rail {
         let sel = on_select.clone();
         wid.handle(move |w, ev| {
             let (_, my) = fltk::app::event_coords();
-            let idx = row_at(w.y(), my);
+            let geometry = build_rail_layout();
+            let solved = geometry.solve(Rect::new(w.x(), w.y(), w.w(), w.h()));
+            let idx = row_at(&geometry, &solved, my);
             match ev {
                 Event::Move | Event::Enter | Event::Drag => {
                     let mut s = st_ev.borrow_mut();
@@ -136,40 +140,98 @@ impl Rail {
     }
 }
 
-/// Rail row geometry: brand block, then rows, then a gap before the footer.
+/// Rail row geometry: brand block, one row per page, then the status band.
 const BRAND_H: i32 = 74;
 const ROW_H: i32 = 40;
 const ROW_GAP: i32 = 2;
 
-fn row_y(top: i32, idx: usize) -> i32 {
-    top + BRAND_H + idx as i32 * (ROW_H + ROW_GAP)
+/// The rail's layout tree: brand block, page rows, then the status band.
+///
+/// Solving this once is what keeps a row's hit target, its hover highlight and
+/// its label on the same rectangle — they used to be recomputed from
+/// `brand + index * (row + gap)` in three places.
+struct RailLayout {
+    layout: Layout,
+    brand: NodeId,
+    rows: Vec<NodeId>,
+    footer: NodeId,
 }
 
-fn row_at(top: i32, my: i32) -> Option<usize> {
-    for i in 0..Page::ALL.len() {
-        let y = row_y(top, i);
-        if my >= y && my < y + ROW_H {
-            return Some(i);
-        }
+impl RailLayout {
+    fn solve(&self, area: Rect) -> Solved {
+        self.layout.solve(area)
     }
-    None
+
+    /// The status band at the bottom of the rail, shared with the status bar.
+    fn footer_rect(&self, solved: &Solved) -> Rect {
+        solved.get(self.footer)
+    }
+}
+
+fn build_rail_layout() -> RailLayout {
+    let mut layout = Layout::column();
+    let brand = layout.leaf(0, Size::Fixed(BRAND_H));
+    // The gap sits *between* rows, not after the brand block, so every row
+    // except the first carries its own lead.
+    let mut rows = Vec::with_capacity(Page::ALL.len());
+    for i in 0..Page::ALL.len() {
+        let id = layout.leaf(0, Size::Fixed(ROW_H));
+        layout = layout.lead(id, if i == 0 { 0 } else { ROW_GAP });
+        rows.push(id);
+    }
+    // The trailing status band is pinned to the bottom by the fill spacer
+    // between the rows and itself.
+    let _spacer = layout.leaf(0, Size::Fill(1));
+    let footer = layout.leaf(0, Size::Fixed(L::STATUS_H));
+    RailLayout {
+        layout,
+        brand,
+        rows,
+        footer,
+    }
+}
+
+/// Which rail row is under `my`, using the solved tree.
+fn row_at(geometry: &RailLayout, solved: &Solved, my: i32) -> Option<usize> {
+    geometry
+        .rows
+        .iter()
+        .position(|&id| solved.get(id).contains(solved.get(id).x, my))
 }
 
 fn paint_rail(x: i32, y: i32, w: i32, h: i32, s: &RailState) {
     th::fill(x, y, w, h, C::PANEL);
     th::vline(x + w - 1, y, h, C::LINE);
 
+    let geometry = build_rail_layout();
+    let solved = geometry.solve(Rect::new(x, y, w, h));
+
     // Wordmark: the product name in the display face, with a one-line
     // descriptor. The amber dot is the only ornament in the shell, and it is
     // placed from the same line box the wordmark is drawn in — that is the
     // whole point of `LineBox`: the dot and the text cannot drift apart.
-    let word = th::LineBox::new(th::mono_font(), x + 36, y + 18, w - 50, 26, T::BRAND);
-    th::dot(x + 24, word.center_y(), 4, C::AMBER);
+    let brand = solved.get(geometry.brand);
+    let word = th::LineBox::new(
+        th::mono_font(),
+        brand.x + 36,
+        brand.y + 18,
+        brand.w - 50,
+        26,
+        T::BRAND,
+    );
+    th::dot(brand.x + 24, word.center_y(), 4, C::AMBER);
     th::line_text("rx11", &word, th::mono_font(), C::TEXT);
-    th::micro("远程 X11 中继控制台", x + 24, y + 46, w - 40, 16, C::TEXT_3);
+    th::micro(
+        "远程 X11 中继控制台",
+        brand.x + 24,
+        brand.y + 46,
+        brand.w - 40,
+        16,
+        C::TEXT_3,
+    );
 
     for (i, page) in Page::ALL.iter().enumerate() {
-        let ry = row_y(y, i);
+        let ry = solved.get(geometry.rows[i]).y;
         let selected = *page == s.page;
         let hovered = s.hover == Some(i);
 
@@ -260,13 +322,13 @@ fn paint_rail(x: i32, y: i32, w: i32, h: i32, s: &RailState) {
     // It used to sit at `y + h - 54` with an inset divider, which left the
     // caption floating ~40 device px above the status bar text with a dead
     // strip of panel underneath it.
-    let fy = y + h - L::STATUS_H;
-    th::hline(x, fy, w, C::LINE);
+    let footer = geometry.footer_rect(&solved);
+    th::hline(footer.x, footer.y, footer.w, C::LINE);
     th::micro(
         "版本 0.1.0 · 协议 v1",
-        x + 24,
-        fy,
-        w - 40,
+        footer.x + 24,
+        footer.y,
+        footer.w - 40,
         L::STATUS_H,
         C::TEXT_3,
     );
@@ -325,7 +387,8 @@ impl Topbar {
             let (mx, _) = fltk::app::event_coords();
             let hit = {
                 let s = st_ev.borrow();
-                hit_action(w.x(), w.w(), mx, &s.actions)
+                let rects = action_rects(Rect::new(w.x(), w.y(), w.w(), w.h()), &s.actions);
+                rects.iter().position(|r| r.contains(mx, r.y))
             };
             match ev {
                 Event::Move | Event::Enter => {
@@ -389,18 +452,46 @@ impl Topbar {
     }
 }
 
-fn hit_action(_x: i32, w: i32, mx: i32, actions: &[TopbarAction]) -> Option<usize> {
-    // Actions are right-aligned, laid out from the right edge inward.
-    let mut right = w - 20;
-    for (i, (label, _enabled, _)) in actions.iter().enumerate().rev() {
-        let bw = th::measure(label, th::ui_font(), T::SMALL) + 28;
-        let left = right - bw;
-        if mx >= left && mx <= right {
-            return Some(i);
+/// Gap between the action chips.
+const CHIP_GAP: i32 = 8;
+
+/// Inset of the action group from the top bar's right edge.
+const CHIP_MARGIN: i32 = 20;
+
+/// Height of an action chip, vertically centred in the bar.
+const CHIP_H: i32 = 28;
+
+/// The top bar's action chips, right-aligned.
+///
+/// Painting and hit testing both call this, so a chip's frame, its label and
+/// the area that fires it are the same rectangle. They used to be recomputed
+/// from `measure(label) + 28` in two places.
+fn action_rects(area: Rect, actions: &[TopbarAction]) -> Vec<Rect> {
+    let mut layout = Layout::row();
+    layout = layout.pad(
+        0,
+        Insets {
+            top: 0,
+            right: CHIP_MARGIN,
+            bottom: 0,
+            left: 0,
+        },
+    );
+    // A leading spacer pushes the chips against the right edge.
+    let _spacer = layout.leaf(0, Size::Fill(1));
+    let mut ids = Vec::with_capacity(actions.len());
+    for (i, (label, _, _)) in actions.iter().enumerate() {
+        let id = layout.leaf(
+            0,
+            Size::Fixed(th::measure(label, th::ui_font(), T::SMALL) + 28),
+        );
+        if i > 0 {
+            layout = layout.lead(id, CHIP_GAP);
         }
-        right = left - 8;
+        ids.push(id);
     }
-    None
+    let solved = layout.solve(area);
+    ids.iter().map(|&id| solved.get(id)).collect()
 }
 
 fn paint_topbar(x: i32, y: i32, w: i32, h: i32, s: &TopbarState) {
@@ -412,11 +503,11 @@ fn paint_topbar(x: i32, y: i32, w: i32, h: i32, s: &TopbarState) {
     let cx = x + (w - chain_w) / 2;
     paint_chain(cx, y, chain_w, h, &s.data);
 
-    // Right: action chips, laid out from the right edge inward.
-    let mut right = x + w - 20;
-    for (i, (label, enabled, _)) in s.actions.iter().enumerate().rev() {
-        let bw = th::measure(label, th::ui_font(), T::SMALL) + 28;
-        let left = right - bw;
+    // Right: action chips from the solved row, so the frame you click and the
+    // frame you see come from the same rectangles.
+    let bar = Rect::new(x, y, w, h);
+    for (i, rect) in action_rects(bar, &s.actions).iter().enumerate() {
+        let (label, enabled, _) = &s.actions[i];
         let hovered = s.hover == Some(i);
         let pressed = s.pressed == Some(i);
         let (fill, text, border) = if !*enabled {
@@ -429,20 +520,20 @@ fn paint_topbar(x: i32, y: i32, w: i32, h: i32, s: &TopbarState) {
             (C::PANEL, C::TEXT_2, C::LINE)
         };
         let dy = if pressed { 1 } else { 0 };
-        th::fill_round(left, y + 15 + dy, bw, 28, L::RADIUS, fill);
-        th::stroke_round(left, y + 15 + dy, bw, 28, L::RADIUS, border);
+        let chip_y = rect.center_y() - CHIP_H / 2 + dy;
+        th::fill_round(rect.x, chip_y, rect.w, CHIP_H, L::RADIUS, fill);
+        th::stroke_round(rect.x, chip_y, rect.w, CHIP_H, L::RADIUS, border);
         th::text(
             label,
-            left,
-            y + 15 + dy,
-            bw,
-            28,
+            rect.x,
+            chip_y,
+            rect.w,
+            CHIP_H,
             th::ui_font(),
             T::SMALL,
             text,
             Align::Center,
         );
-        right = left - 8;
     }
 }
 

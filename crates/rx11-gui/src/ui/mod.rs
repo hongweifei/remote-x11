@@ -1,17 +1,18 @@
 //! UI primitives and pages.
 //!
-//! Layout is deliberately manual: every region computes its own rectangles
-//! from the constants in [`crate::theme::L`] and paints onto one background
-//! canvas per page. FLTK's stock container widgets would each impose their
+//! Every region is placed by the declarative layout in [`layout`]: a page
+//! assembles a tree of stacks, solves it once per frame, and paints into the
+//! resulting rectangles. FLTK's stock container widgets would each impose their
 //! own border and padding, and fighting them costs more than the arithmetic.
 //! Interactive elements (text fields, drop-downs, buttons) are real widgets
-//! positioned on that canvas.
+//! positioned on that solved canvas.
 //!
 //! # Parts
 //!
 //! * [`action`] — the intent channel every control reports through;
 //! * [`chrome`] — the page skeleton (heading, card, statistic, empty state);
 //! * [`controls`] — the hand-drawn widgets;
+//! * [`layout`] — the stack solver every page places itself with;
 //! * [`scope`] — the link oscilloscope;
 //! * [`shell`] — the fixed frame: rail, top bar, status bar;
 //! * [`pages`] — one module per console page.
@@ -24,6 +25,7 @@
 pub mod action;
 pub mod chrome;
 pub mod controls;
+pub mod layout;
 pub mod pages;
 pub mod scope;
 pub mod scrollbar;
@@ -35,6 +37,7 @@ use fltk::widget::Widget;
 use crate::theme as th;
 
 pub use chrome::{card, card_title, empty_state, page_header, stat};
+pub use layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
 
 /// Pointer input a scrollable page receives from its background widget.
 #[derive(Debug, Clone, Copy)]
