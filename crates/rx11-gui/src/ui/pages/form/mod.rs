@@ -196,10 +196,32 @@ struct SolvedForm {
     solved: Solved,
     cards: Vec<NodeId>,
     rows: Vec<(&'static str, FieldKind, NodeId)>,
+    /// The side column's rect. It is a sibling of the field column, so it stays
+    /// put while the fields scroll; its x is what the buttons and the validation
+    /// card align to, and one leaf for it means those callers cannot compute it
+    /// differently.
+    side: NodeId,
     /// Bottom of the scrollable content: the last card's bottom plus the gap
     /// that would follow another section. The hand-written version summed the
     /// same trailing gap, and the scroll range must not shrink by it.
     content_bottom: i32,
+}
+
+impl SolvedForm {
+    /// The side column's rect, from the tree rather than recomputed by each
+    /// caller. The buttons and the validation card both align to it.
+    fn side_rect(&self) -> Rect {
+        self.solved.get(self.side)
+    }
+
+    /// A row's rect by its TOML key, for widgets that sit on a specific field
+    /// (the identity picker). Returns `None` when the spec has no such row.
+    fn row_rect(&self, key_suffix: &str) -> Option<Rect> {
+        self.rows
+            .iter()
+            .find(|&&(key, _, _)| key.ends_with(key_suffix))
+            .map(|&(_, _, id)| self.solved.get(id))
+    }
 }
 
 /// The form's layout tree: heading, the scrolling field column, the side column.
@@ -237,7 +259,7 @@ fn form_layout(spec: &FormSpec, x: i32, y: i32, w: i32, scroll: i32) -> SolvedFo
         cards.push(card);
     }
     // The side column is a sibling of the field column, so it does not scroll.
-    let _side = layout.stack(body, Axis::Column, Size::Fixed(SIDE_W));
+    let side = layout.stack(body, Axis::Column, Size::Fixed(SIDE_W));
 
     let solved = layout.solve(page);
     let content_bottom = cards
@@ -250,6 +272,7 @@ fn form_layout(spec: &FormSpec, x: i32, y: i32, w: i32, scroll: i32) -> SolvedFo
         solved,
         cards,
         rows,
+        side,
         content_bottom: content_bottom + scroll,
     }
 }
@@ -593,23 +616,21 @@ impl FormPage {
 
     fn layout(&self, x: i32, y: i32, w: i32, h: i32) {
         self.page.resize(x, y, w, h);
+        let solved = form_layout(self.spec, x, y, w, 0);
         {
             let mut s = self.st.borrow_mut();
             s.view_h = h - (page_y_start(y, L::PAD) - y);
-            // Content height comes from the layout tree, not from a second sum
-            // over the spec: the tree already knows how tall the column is, and
-            // two formulas for the same thing is how the scroll range drifts.
-            let content = form_layout(self.spec, x, y, w, 0);
-            s.content_h = content.content_bottom - page_y_start(y, L::PAD);
+            s.content_h = solved.content_bottom - page_y_start(y, L::PAD);
             let max = (s.content_h - s.view_h).max(0);
             s.scroll = s.scroll.clamp(0, max);
         }
 
-        let pad = L::PAD;
-        let content_x = x + pad;
-        let content_w = w - pad * 2;
-        let side_x = content_x + content_w - SIDE_W;
-        let sy = page_y_start(y, pad) + 4;
+        // The side column's x comes from the tree: the same rectangle the
+        // validation card is painted into, so the buttons and the card cannot
+        // drift to different left edges.
+        let side = solved.side_rect();
+        let side_x = side.x;
+        let sy = page_y_start(y, L::PAD) + 4;
         let half = (SIDE_W - 8) / 2;
         self.save.resize(side_x, sy, half, 32);
         self.reload.resize(side_x + half + 8, sy, half, 32);
@@ -617,11 +638,11 @@ impl FormPage {
         if let Some(p) = &self.pick_file {
             // Sits on the path field it fills, right-aligned inside it.
             let scroll = self.st.borrow().scroll;
-            let (_, rows) = geometry(self.spec, x, y, w, h, scroll);
-            if let Some(g) = rows.iter().find(|r| r.key.ends_with("identity")) {
-                let input_w = (content_w - SIDE_W - L::GAP) - 36 - LABEL_COL;
-                let input_x = content_x + 18 + LABEL_COL;
-                p.resize(input_x + input_w - 104, g.input_y + 4, 104, 26);
+            let solved = form_layout(self.spec, x, y, w, scroll);
+            if let Some(row) = solved.row_rect("identity") {
+                let input_x = row.x + LABEL_COL;
+                let input_w = row.w - LABEL_COL;
+                p.resize(input_x + input_w - 104, row.y + 4, 104, 26);
             }
         }
 
@@ -843,11 +864,16 @@ fn paint(spec: &FormSpec, rect: PageRect, s: &FormState, origin_x: i32) {
     if let Some(bar) = scroll_bar(rect, s) {
         bar.paint(s.thumb_grab.is_some());
     }
-    paint_side(spec, rect, s, content_x, content_w);
+    paint_side(
+        spec,
+        rect,
+        s,
+        form_layout(spec, origin_x, y, w, 0).side_rect(),
+    );
 }
 
-fn paint_side(spec: &FormSpec, rect: Rect, s: &FormState, content_x: i32, content_w: i32) {
-    let side_x = content_x + content_w - SIDE_W;
+fn paint_side(spec: &FormSpec, rect: Rect, s: &FormState, side: Rect) {
+    let side_x = side.x;
     let top = page_y_start(rect.y, L::PAD) + 4;
 
     // Validation / unsaved state.
@@ -910,89 +936,4 @@ fn paint_side(spec: &FormSpec, rect: Rect, s: &FormState, content_x: i32, conten
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    static FIELDS: &[FieldSpec] = &[
-        FieldSpec {
-            key: "server.listen",
-            label: "监听",
-            hint: "IP:PORT",
-            kind: FieldKind::Text,
-        },
-        FieldSpec {
-            key: "server.x11_port",
-            label: "X11 端口",
-            hint: "默认 6000",
-            kind: FieldKind::Number,
-        },
-    ];
-    static SECTIONS: &[SectionSpec] = &[SectionSpec {
-        title: "服务端",
-        note: "默认",
-        fields: FIELDS,
-    }];
-    static SPEC: FormSpec = FormSpec {
-        title: "服务端",
-        subtitle: "测试用",
-        sections: SECTIONS,
-        role: Some(FormRole::Server),
-        start_label: "启动中继",
-    };
-
-    #[test]
-    fn geometry_stacks_sections_without_gaps() {
-        let (sections, rows) = geometry(&SPEC, 0, 0, 1000, 700, 0);
-        assert_eq!(sections.len(), 1);
-        assert_eq!(rows.len(), 2);
-        // Second row is exactly one row height below the first.
-        assert_eq!(rows[1].row_y - rows[0].row_y, ROW_H);
-        // Section is tall enough for its head plus every row.
-        assert_eq!(sections[0].h, SECTION_HEAD + 2 * ROW_H + 12);
-    }
-
-    #[test]
-    fn geometry_offsets_follow_scroll() {
-        let (_, a) = geometry(&SPEC, 0, 0, 1000, 700, 0);
-        let (_, b) = geometry(&SPEC, 0, 0, 1000, 700, 40);
-        assert_eq!(a[0].row_y - b[0].row_y, 40);
-    }
-
-    /// The scrollable content height must equal the shipped sum: every card plus
-    /// the gap that follows it. The first version of the tree omitted the
-    /// trailing gap, which silently shrank the scroll range by `SECTION_GAP`.
-    #[test]
-    fn content_height_matches_the_shipped_formula() {
-        let shipped: i32 = SPEC
-            .sections
-            .iter()
-            .map(|sec| SECTION_HEAD + sec.fields.len() as i32 * ROW_H + 12 + SECTION_GAP)
-            .sum();
-        let solved = form_layout(&SPEC, 0, 0, 1000, 0);
-        assert_eq!(
-            solved.content_bottom - page_y_start(0, L::PAD),
-            shipped,
-            "content height is the sum of the cards plus their gaps"
-        );
-    }
-
-    /// Every row and card must sit inside the column the form scrolls, and the
-    /// rows must be exactly `ROW_H` apart.
-    #[test]
-    fn rows_tile_the_section_without_drift() {
-        let solved = form_layout(&SPEC, 0, 0, 1000, 0);
-        let card = solved.solved.get(solved.cards[0]);
-        let tops: Vec<i32> = solved
-            .rows
-            .iter()
-            .map(|&(_, _, id)| solved.solved.get(id).y)
-            .collect();
-        assert_eq!(tops[1] - tops[0], ROW_H);
-        assert_eq!(tops[0], card.y + SECTION_HEAD, "rows start under the head");
-        assert_eq!(
-            solved.solved.get(solved.rows.last().unwrap().2).bottom(),
-            card.bottom() - 12,
-            "the last row leaves the card's bottom air"
-        );
-    }
-}
+mod tests;
