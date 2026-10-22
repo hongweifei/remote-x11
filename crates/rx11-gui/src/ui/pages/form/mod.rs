@@ -26,7 +26,12 @@ use crate::ui::action::{emit_action, set_handler, ActionSlot};
 /// One field's live widgets, in creation order.
 type WidgetList = Rc<RefCell<Vec<(&'static str, FieldWidget)>>>;
 use crate::ui::controls::{BtnKind, Button, Field, Select, Switch};
-use crate::ui::{card, card_title, page_header, Page};
+mod scroll;
+
+use scroll::{apply_scroll, place_fields, row_fits, scroll_band, scroll_bar};
+
+use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::{card, card_title, page_header, Page, PageInput};
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -210,6 +215,9 @@ struct FormState {
     /// Viewport height.
     view_h: i32,
     hover_row: Option<usize>,
+    /// While dragging the scrollbar: how far below the thumb's top edge the
+    /// pointer grabbed it. `None` when not dragging.
+    thumb_grab: Option<i32>,
 }
 
 /// A settings page: a scrolling field form on the left, an action column on
@@ -244,6 +252,7 @@ impl FormPage {
             content_h: 0,
             view_h: h,
             hover_row: None,
+            thumb_grab: None,
         }));
         let on_action: ActionSlot<FormAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -394,7 +403,7 @@ impl FormPage {
             rect,
         };
         page.layout(x, y, w, h);
-        page.install_wheel();
+        page.install_input();
         page
     }
 
@@ -562,91 +571,82 @@ impl FormPage {
         place_fields(self.spec, &self.widgets, &self.st, &self.rect);
     }
 
-    /// Mouse-wheel scrolling. The form is taller than the window on the
-    /// runtime page (20 fields), and the scroll offset was already threaded
-    /// through `geometry`/`place_fields` — only the input was missing, so
-    /// everything below the fold used to be unreachable.
-    fn install_wheel(&self) {
+    /// Wheel, track-click and thumb-drag input for the field column.
+    ///
+    /// The form is taller than the window on the runtime page (20 fields), and
+    /// `scroll` was already threaded through `geometry`/`place_fields` — only
+    /// the input was missing, so everything below the fold used to be
+    /// unreachable. A wheel is invisible, so the bar is both the affordance and
+    /// the second way to use it: drag the thumb, or click the track to page.
+    fn install_input(&self) {
         let spec = self.spec;
         let widgets = self.widgets.clone();
         let st = self.st.clone();
         let rect = self.rect.clone();
         let page = self.page.clone();
-        self.page.on_wheel(move |dy| {
-            if dy == 0 {
-                return;
-            }
-            let (cur, max) = {
-                let s = st.borrow();
-                (s.scroll, (s.content_h - s.view_h).max(0))
+
+        self.page.on_input(move |input| {
+            let page_rect = {
+                let r = *rect.borrow();
+                Rect {
+                    x: r.0,
+                    y: r.1,
+                    w: r.2,
+                    h: r.3,
+                }
             };
-            if max == 0 {
-                return;
+            let bar = scroll_bar(page_rect, &st.borrow());
+            let scrollable = bar.is_some();
+            match input {
+                PageInput::Wheel(dy) => {
+                    if dy == 0 || !scrollable {
+                        return false;
+                    }
+                    let cur = st.borrow().scroll;
+                    // A notch is FLTK's `dy`; move about one and a half rows.
+                    apply_scroll(spec, &widgets, &st, &rect, &page, cur + dy * ROW_H * 3 / 2);
+                    true
+                }
+                PageInput::Push(px, py) => {
+                    let Some(bar) = bar else { return false };
+                    // `PageInput` is page-relative; the bar lives in the same
+                    // absolute space as the painters.
+                    match bar.hit(px + page_rect.x, py + page_rect.y) {
+                        Some(Hit::Thumb { grab }) => {
+                            st.borrow_mut().thumb_grab = Some(grab);
+                            page.redraw();
+                            true
+                        }
+                        Some(Hit::Track { dir }) => {
+                            // Click above/below the thumb pages by one viewport,
+                            // the usual scrollbar convention.
+                            let (cur, view) = {
+                                let s = st.borrow();
+                                (s.scroll, s.view_h)
+                            };
+                            apply_scroll(spec, &widgets, &st, &rect, &page, cur + dir * view);
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                PageInput::Drag(_px, py) => {
+                    let Some(grab) = st.borrow().thumb_grab else {
+                        return false;
+                    };
+                    let Some(bar) = bar else { return false };
+                    apply_scroll(spec, &widgets, &st, &rect, &page, bar.scroll_at(py - grab));
+                    true
+                }
+                PageInput::Release => {
+                    let was = st.borrow_mut().thumb_grab.take();
+                    if was.is_some() {
+                        page.redraw();
+                    }
+                    was.is_some()
+                }
             }
-            // One wheel notch is FLTK's `dy`; scale it so a notch moves about
-            // one and a half rows.
-            let next = (cur + dy * ROW_H * 3 / 2).clamp(0, max);
-            if next == cur {
-                return;
-            }
-            st.borrow_mut().scroll = next;
-            place_fields(spec, &widgets, &st, &rect);
-            page.redraw();
         });
-    }
-}
-
-/// Reposition the field widgets for the current scroll offset.
-///
-/// A free function rather than a method so the wheel handler (which cannot
-/// borrow `self`) can call the same code.
-fn place_fields(
-    spec: &'static FormSpec,
-    widgets: &WidgetList,
-    st: &Rc<RefCell<FormState>>,
-    rect: &Rc<RefCell<(i32, i32, i32, i32)>>,
-) {
-    let (x0, y0, ww, hh) = *rect.borrow();
-    let scroll = st.borrow().scroll;
-    let (_, rows) = geometry(spec, x0, y0, ww, hh, scroll);
-    let input_x = x0 + L::PAD + 18 + LABEL_COL;
-    let input_w = (ww - L::PAD * 2 - SIDE_W - L::GAP) - 36 - LABEL_COL;
-    // Same band paint uses: only a row whose text *and* input fit is shown.
-    let (_, band_top, _, band_h) = scroll_band(x0, y0, ww, hh);
-    let band_bottom = band_top + band_h;
-    for (key, widget) in widgets.borrow().iter() {
-        let Some(geom) = rows.iter().find(|r| r.key == *key) else {
-            continue;
-        };
-        // Widgets outside the viewport are hidden rather than moved, so
-        // FLTK never draws them over the header or the side column.
-        let on_screen = row_fits(geom, band_top, band_bottom);
-        match widget {
-            FieldWidget::Text(f) => {
-                f.resize(input_x, geom.input_y, input_w, geom.input_h);
-                set_widget_visible(f.input(), on_screen);
-            }
-            FieldWidget::Toggle(sw) => {
-                sw.resize(input_x, geom.input_y + 2);
-                set_widget_visible(sw.widget(), on_screen);
-            }
-            FieldWidget::Select(sel) => {
-                sel.resize(input_x, geom.input_y, input_w.min(320), geom.input_h);
-                set_widget_visible(sel.widget(), on_screen);
-            }
-        }
-    }
-}
-
-fn set_widget_visible<W: WidgetExt>(mut w: W, on: bool) {
-    if on {
-        w.show();
-        // A widget that was hidden (scrolled out of view, or the page was not
-        // on screen yet) carries no damage when it comes back, so FLTK skips
-        // it during a partial repaint and its contents stay invisible.
-        w.redraw();
-    } else {
-        w.hide();
     }
 }
 
@@ -662,25 +662,6 @@ fn mark_dirty(st: &Rc<RefCell<FormState>>, key: &str) {
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
-
-/// The band of the page that scrolls, in absolute coordinates.
-///
-/// Paint clips to it and `place_fields` only shows a widget whose whole row
-/// fits inside it — the two must agree, or a row's text is clipped away while
-/// its input widget still pokes out over the page header.
-fn scroll_band(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
-    let pad = L::PAD;
-    let top = y + pad + 84;
-    let bottom = y + h - pad;
-    let left = x + pad;
-    let width = (w - pad * 2 - SIDE_W - L::GAP + 16).max(40);
-    (left, top, width, bottom - top)
-}
-
-/// Whether a whole row (input through hint) sits inside the scroll band.
-fn row_fits(g: &RowGeom, top: i32, bottom: i32) -> bool {
-    g.input_y >= top && g.hint_y + 16 <= bottom
-}
 
 /// One page rectangle, so the paint helpers take geometry as a unit.
 #[derive(Clone, Copy)]
@@ -790,35 +771,13 @@ fn paint(spec: &FormSpec, rect: Rect, s: &FormState, origin_x: i32) {
     }
     th::pop_clip();
 
-    paint_scrollbar(s, content_x, content_w, clip_top, clip_bottom);
-    paint_side(spec, rect, s, content_x, content_w);
-}
-
-/// A slim scroll indicator beside the field column.
-///
-/// The form scrolls with the wheel, but a wheel is invisible: without an
-/// affordance nobody discovers that the runtime page (20 fields, ~1516 units
-/// of content in a 714-unit viewport) continues below the fold. The bar is
-/// drawn only when there is something to scroll, so pages that fit stay clean.
-fn paint_scrollbar(s: &FormState, content_x: i32, content_w: i32, top: i32, bottom: i32) {
-    let view_h = (bottom - top).max(1);
-    let track_h = view_h;
-    let max_scroll = (s.content_h - view_h).max(0);
-    if max_scroll == 0 {
-        return;
+    // `content_x`/`content_w` are only needed for the side column now; the bar
+    // derives its own geometry from the page rect.
+    let _ = (content_x, content_w);
+    if let Some(bar) = scroll_bar(rect, s) {
+        bar.paint(s.thumb_grab.is_some());
     }
-    let main_w = content_w - SIDE_W - L::GAP;
-    let bar_x = content_x + main_w + 5;
-    let bar_w = 4;
-    th::fill_round(bar_x, top, bar_w, track_h, bar_w / 2, C::RAISED);
-
-    // Thumb length is the visible fraction; keep a floor so it stays grabbable
-    // to the eye even with 20 fields of content.
-    let thumb_h = (track_h as i64 * view_h as i64 / s.content_h.max(1) as i64).max(24) as i32;
-    let thumb_h = thumb_h.min(track_h);
-    let span = (track_h - thumb_h).max(0);
-    let thumb_y = top + (span as i64 * s.scroll as i64 / max_scroll as i64) as i32;
-    th::fill_round(bar_x, thumb_y, bar_w, thumb_h, bar_w / 2, C::TEXT_3);
+    paint_side(spec, rect, s, content_x, content_w);
 }
 
 fn paint_side(spec: &FormSpec, rect: Rect, s: &FormState, content_x: i32, content_w: i32) {

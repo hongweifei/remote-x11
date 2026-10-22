@@ -25,7 +25,8 @@ use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot};
 use crate::ui::controls::{BtnKind, Button};
 use crate::ui::scope::{Scope, ScopeData};
-use crate::ui::{card, card_title, page_header, Page};
+use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::{card, card_title, page_header, Page, PageInput};
 
 /// The background painter: page rect in, pixels out.
 type Painter = Box<dyn FnMut(i32, i32, i32, i32)>;
@@ -107,6 +108,12 @@ struct ConsoleState {
     rows: Vec<RowHit>,
     hover_stop: Option<usize>,
     pressed_stop: Option<usize>,
+    /// First visible session row. The launcher keeps every session; the table
+    /// is windowed onto them, so this is a row index, not a pixel offset.
+    scroll: usize,
+    /// While dragging the table's scrollbar: pointer offset below the thumb's
+    /// top edge. `None` when not dragging.
+    thumb_grab: Option<i32>,
 }
 
 /// The overview page.
@@ -131,6 +138,8 @@ impl ConsolePage {
             rows: Vec::new(),
             hover_stop: None,
             pressed_stop: None,
+            scroll: 0,
+            thumb_grab: None,
         }));
         let on_action: ActionSlot<ConsoleAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -233,7 +242,78 @@ impl ConsolePage {
             rect,
         };
         page.layout(x, y, w, h);
+        page.install_input();
         page
+    }
+
+    /// Wheel and scrollbar input for the session table.
+    ///
+    /// The table is the only scrolling surface on this page, so the wheel works
+    /// anywhere on it; the bar sits at the table's right edge and is draggable.
+    fn install_input(&self) {
+        let st = self.st.clone();
+        let rect = self.rect.clone();
+        let page = self.page.clone();
+        self.page.on_input(move |input| {
+            let (px, py, pw, ph) = *rect.borrow();
+            let scrollable = {
+                let s = st.borrow();
+                s.data.sessions.len() > visible_session_rows(px, py, pw, ph, s.data.sessions.len())
+            };
+            match input {
+                PageInput::Wheel(dy) => {
+                    if dy == 0 || !scrollable {
+                        return false;
+                    }
+                    let step = if dy > 0 { 1 } else { -1 };
+                    let cur = st.borrow().scroll as i32;
+                    let max = max_session_scroll(px, py, pw, ph, &st.borrow());
+                    st.borrow_mut().scroll = (cur + step).clamp(0, max) as usize;
+                    page.redraw();
+                    true
+                }
+                PageInput::Push(lx, ly) => {
+                    let (card_x, card_y, card_w, card_h) =
+                        sessions_rect(px, py, pw, ph, st.borrow().data.sessions.len());
+                    let Some(bar) = session_bar(card_x, card_y, card_w, card_h, &st.borrow())
+                    else {
+                        return false;
+                    };
+                    match bar.hit(lx + px, ly + py) {
+                        Some(Hit::Thumb { grab }) => {
+                            st.borrow_mut().thumb_grab = Some(grab);
+                            page.redraw();
+                            true
+                        }
+                        Some(Hit::Track { dir }) => {
+                            let max = max_session_scroll(px, py, pw, ph, &st.borrow());
+                            let cur = st.borrow().scroll as i32;
+                            st.borrow_mut().scroll = (cur + dir * 3).clamp(0, max) as usize;
+                            page.redraw();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                PageInput::Drag(_lx, ly) => {
+                    let Some(grab) = st.borrow().thumb_grab else {
+                        return false;
+                    };
+                    let (card_x, card_y, card_w, card_h) =
+                        sessions_rect(px, py, pw, ph, st.borrow().data.sessions.len());
+                    let Some(bar) = session_bar(card_x, card_y, card_w, card_h, &st.borrow())
+                    else {
+                        return false;
+                    };
+                    let next = rows_for(bar.scroll_at(ly + py - grab));
+                    let max = max_session_scroll(px, py, pw, ph, &st.borrow());
+                    st.borrow_mut().scroll = next.min(max.max(0) as usize);
+                    page.redraw();
+                    true
+                }
+                PageInput::Release => st.borrow_mut().thumb_grab.take().is_some(),
+            }
+        });
     }
 
     pub fn on_action<F: Fn(ConsoleAction) + 'static>(&self, f: F) {
@@ -301,27 +381,133 @@ impl ConsolePage {
         // button centred on the value at y+140 (see `paint_right_column`).
         self.copy_token.resize(bx + bw - 42, by + 83, 42, 22);
 
+        // Session rows: geometry only. `sessions_rect` is the single source for
+        // where the card sits and how tall it is, so hit testing agrees with
+        // paint even as the card shrinks to fit its rows.
         cy += Metrics::BAND_H + L::GAP;
-
-        // Session rows: geometry only, derived from the same constants paint
-        // uses. Kept here so a data change refreshes hit testing too.
-        let first_row_y = cy + 16 + 34 + 28;
+        let _ = cy;
+        let (_, sy, _, sh) = sessions_rect(x, y, w, h, self.st.borrow().data.sessions.len());
+        let (first_row_y, fit) = session_rows(sy, sh);
         let ix = content_x + 18;
         let iw = content_w - 36;
         let stop_w = 54;
         let mut rows = Vec::new();
-        for (i, row) in self.st.borrow().data.sessions.iter().enumerate() {
-            let ry = first_row_y + i as i32 * Metrics::ROW_H;
-            if ry + Metrics::ROW_H > y + h - 8 {
-                break;
-            }
+        let (start, end, list) = {
+            let st = self.st.borrow();
+            (
+                st.scroll,
+                st.data.sessions.len().min(st.scroll + fit),
+                st.data.sessions.clone(),
+            )
+        };
+        for (slot, i) in (start..end).enumerate() {
+            let ry = first_row_y + slot as i32 * Metrics::ROW_H;
             rows.push(RowHit {
-                session_id: row.id,
-                stop: (ix + iw - stop_w, ry + 10, stop_w, 24),
+                session_id: list[i].id,
+                stop: (ix + iw - stop_w, ry + (Metrics::ROW_H - 24) / 2, stop_w, 24),
             });
         }
         self.st.borrow_mut().rows = rows;
     }
+}
+
+/// Where the session card sits on a page of this size.
+///
+/// The only place this geometry is decided: paint, layout, the scrollbar and
+/// the pointer handler all call it, so they cannot drift apart.
+fn sessions_rect(x: i32, y: i32, w: i32, h: i32, rows: usize) -> (i32, i32, i32, i32) {
+    let pad = L::PAD;
+    let content_x = x + pad;
+    let content_w = w - pad * 2;
+    let mut cy = header_bottom(y, pad) + Metrics::SUMMARY_H + L::GAP;
+    cy += Metrics::BAND_H + L::GAP;
+    let available = (h - (cy - y) - pad).max(120);
+    // The card is as tall as its rows need, and only grows to the available
+    // height when the list overflows (then it scrolls). Stretching it to the
+    // page bottom always left a big empty well under two rows.
+    // At least two rows tall: the empty state needs room to breathe, and it
+    // keeps the card from jumping around as sessions start and stop.
+    let needed = card_chrome_h() + rows.max(2) as i32 * Metrics::ROW_H;
+    let list_h = available.min(needed);
+    (content_x, cy, content_w, list_h)
+}
+
+/// Everything in the session card above the first row, plus the bottom padding:
+/// card padding + title row + column headers + header gap + 8.
+fn card_chrome_h() -> i32 {
+    // padding 16 + title 20 + headers 34 + gap 28 + bottom padding 8
+    16 + 20 + 34 + 28 + 8
+}
+
+/// Gap between the traffic numbers and the action column. Without it the
+/// right-aligned numbers end exactly where the 停止 button starts, and the two
+/// read as one crowded blob.
+const COL_GAP: i32 = 16;
+
+/// Height of a row's two text lines (headline + detail). The row itself is
+/// `Metrics::ROW_H`; the difference is split above and below so the block is
+/// centred in the row instead of hugging its top edge.
+const ROW_CONTENT_H: i32 = 34;
+
+/// First row's y and how many rows fit, given the session **card** rect.
+///
+/// Takes the card rect (not the header line) so the arithmetic can subtract the
+/// card's padding, the title row and the column headers. Getting this wrong
+/// does not fail to compile — it draws the last row past the card's bottom edge,
+/// over the status bar.
+fn session_rows(card_y: i32, card_h: i32) -> (i32, usize) {
+    // First row starts right below the card's chrome; the same constant is what
+    // `sessions_rect` adds when it sizes the card, so the two agree.
+    let first_row_y = card_y + 78;
+    let room = (card_y + card_h - 8 - first_row_y).max(Metrics::ROW_H);
+    (first_row_y, (room / Metrics::ROW_H).max(1) as usize)
+}
+
+/// Number of session rows the table can show at this page size and row count.
+fn visible_session_rows(x: i32, y: i32, w: i32, h: i32, rows: usize) -> usize {
+    let (_, cy, _, list_h) = sessions_rect(x, y, w, h, rows);
+    session_rows(cy, list_h).1
+}
+
+/// Highest first-row index that still fills the table.
+fn max_session_scroll(x: i32, y: i32, w: i32, h: i32, s: &ConsoleState) -> i32 {
+    let fit = visible_session_rows(x, y, w, h, s.data.sessions.len()) as i32;
+    (s.data.sessions.len() as i32 - fit).max(0)
+}
+
+/// Pixel scroll from a bar drag → first visible row.
+fn rows_for(scroll_px: i32) -> usize {
+    (scroll_px / Metrics::ROW_H).max(0) as usize
+}
+
+/// Scroll bar for the session table, or `None` when every row fits.
+fn session_bar(
+    card_x: i32,
+    card_y: i32,
+    card_w: i32,
+    card_h: i32,
+    s: &ConsoleState,
+) -> Option<ScrollBar> {
+    // Takes the session CARD rect — the same rectangle `paint_sessions` draws
+    // into. It used to be handed that rect but interpret it as the page rect,
+    // which put the bar ~100 units below the window.
+    //
+    // Not `card()`: that function paints the card, erasing the rows above.
+    let (ix, iw) = (card_x + 18, card_w - 36);
+    let (first_row_y, fit) = session_rows(card_y, card_h);
+    let total = s.data.sessions.len() as i32;
+    // Sit in the card's 18-unit right padding, not on top of the content: the
+    // last column here is the 停止 button, and an inside-the-content bar lands
+    // on it.
+    let _ = (ix, iw);
+    ScrollBar::new(
+        card_x + card_w - 11,
+        first_row_y,
+        (card_y + card_h - 8 - first_row_y).max(20),
+        total * Metrics::ROW_H,
+        fit as i32 * Metrics::ROW_H,
+        s.scroll as i32 * Metrics::ROW_H,
+    )
 }
 
 fn header_bottom(page_y: i32, pad: i32) -> i32 {
@@ -353,10 +539,10 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &ConsoleState) {
     let left_w = content_w - Metrics::RIGHT_W - L::GAP;
     paint_scope_card(content_x, cy, left_w, d);
     paint_right_column(content_x + left_w + L::GAP, cy, d);
-    cy += Metrics::BAND_H + L::GAP;
 
-    let list_h = (h - (cy - y) - pad).max(120);
-    paint_sessions(content_x, cy, content_w, list_h, s);
+    // Card rect from the same helper the hit testing and the scrollbar use.
+    let (sx, sy, sw, sh) = sessions_rect(x, y, w, h, d.sessions.len());
+    paint_sessions(sx, sy, sw, sh, s);
 }
 
 fn paint_summary(x: i32, y: i32, w: i32, d: &ConsoleData) {
@@ -544,7 +730,7 @@ fn paint_sessions(x: i32, y: i32, w: i32, h: i32, s: &ConsoleState) {
     );
     th::divider(ix, header_y + 20, iw);
 
-    let first_row_y = header_y + 28;
+    let (first_row_y, fit) = session_rows(y, h);
     if d.sessions.is_empty() {
         crate::ui::empty_state(
             ix,
@@ -557,16 +743,15 @@ fn paint_sessions(x: i32, y: i32, w: i32, h: i32, s: &ConsoleState) {
         return;
     }
 
-    for (i, row) in d.sessions.iter().enumerate() {
-        let ry = first_row_y + i as i32 * Metrics::ROW_H;
-        if ry + Metrics::ROW_H > y + h - 8 {
-            break;
-        }
+    let end = d.sessions.len().min(s.scroll + fit);
+    for (slot, i) in (s.scroll..end).enumerate() {
+        let row = &d.sessions[i];
+        let ry = first_row_y + slot as i32 * Metrics::ROW_H;
         paint_session_row(ix, ry, row, role_w, health_w, obj_w, traffic_w);
-        if let Some(r) = s.rows.get(i) {
+        if let Some(r) = s.rows.get(slot) {
             let (sx, sy, sw, sh) = r.stop;
-            let hovered = s.hover_stop == Some(i);
-            let pressed = s.pressed_stop == Some(i);
+            let hovered = s.hover_stop == Some(slot);
+            let pressed = s.pressed_stop == Some(slot);
             let (fill, text) = if pressed {
                 (th::mix(C::BAD, C::PANEL, 0.34), C::BAD)
             } else if hovered {
@@ -595,6 +780,10 @@ fn paint_sessions(x: i32, y: i32, w: i32, h: i32, s: &ConsoleState) {
             );
         }
     }
+
+    if let Some(bar) = session_bar(x, y, w, h, s) {
+        bar.paint(s.thumb_grab.is_some());
+    }
 }
 
 /// 健康状态 → 颜色。颜色属于表现层，所以映射留在页面里（`model::Health` 只管
@@ -618,6 +807,9 @@ fn paint_session_row(
     obj_w: i32,
     traffic_w: i32,
 ) {
+    // Centre the two-line block in the row. It used to hang from the row's top
+    // edge, so the 停止 button (centred in ROW_H) sat visibly low against it.
+    let y = y + (Metrics::ROW_H - ROW_CONTENT_H) / 2;
     th::small(row.role.label(), x, y, role_w, 20, C::TEXT);
 
     let health_x = x + role_w;
@@ -640,13 +832,15 @@ fn paint_session_row(
     }
 
     let tr_x = obj_x + obj_w;
+    // Keep the numbers clear of the action column.
+    let tr_w = (traffic_w - COL_GAP).max(40);
     let (sent, recv) = (row.sent.unwrap_or(0), row.received.unwrap_or(0));
     if sent > 0 || recv > 0 {
         th::mono_right(
             &format!("↓ {}", fmt_bytes(recv)),
             tr_x,
             y,
-            traffic_w,
+            tr_w,
             18,
             T::MICRO,
             C::TEXT_2,
@@ -655,21 +849,13 @@ fn paint_session_row(
             &format!("↑ {}", fmt_bytes(sent)),
             tr_x,
             y + 17,
-            traffic_w,
+            tr_w,
             18,
             T::MICRO,
             C::TEXT_3,
         );
     } else if let Some(up) = row.uptime {
-        th::mono_right(
-            &fmt_uptime(up),
-            tr_x,
-            y + 8,
-            traffic_w,
-            18,
-            T::MICRO,
-            C::TEXT_3,
-        );
+        th::mono_right(&fmt_uptime(up), tr_x, y + 8, tr_w, 18, T::MICRO, C::TEXT_3);
     }
 }
 

@@ -26,6 +26,7 @@ pub mod chrome;
 pub mod controls;
 pub mod pages;
 pub mod scope;
+pub mod scrollbar;
 pub mod shell;
 
 use fltk::prelude::*;
@@ -34,6 +35,20 @@ use fltk::widget::Widget;
 use crate::theme as th;
 
 pub use chrome::{card, card_title, empty_state, page_header, stat};
+
+/// Pointer input a scrollable page receives from its background widget.
+#[derive(Debug, Clone, Copy)]
+pub enum PageInput {
+    /// Wheel delta; positive scrolls down.
+    Wheel(i32),
+    /// Button pressed at page-relative `(x, y)` — add the page origin to get
+    /// the same coordinate space the painters use.
+    Push(i32, i32),
+    /// Pointer moved with the button held, page-relative.
+    Drag(i32, i32),
+    /// Button released.
+    Release,
+}
 
 /// A page surface: an FLTK group whose first child paints the background.
 ///
@@ -80,23 +95,32 @@ impl Page {
         g.end();
     }
 
-    /// Install a mouse-wheel handler on the page background.
+    /// Install the pointer input handler for a scrollable page.
     ///
     /// The background widget covers the whole page and is the bottom-most
-    /// child, so it is what receives a wheel event unless a control above it
-    /// (an input, a button) consumes it first. `f` gets FLTK's wheel delta;
-    /// positive is "wheel towards the user", i.e. scroll down.
-    pub fn on_wheel<F>(&self, f: F)
+    /// child, so it receives input that no control above it consumed. Only one
+    /// handler can live on a widget, so wheel, drag and release are delivered
+    /// through one closure — see [`PageInput`].
+    pub fn on_input<F>(&self, f: F)
     where
-        F: Fn(i32) + 'static,
+        F: Fn(PageInput) -> bool + 'static,
     {
         let mut bg = self.bg.clone();
-        bg.handle(move |_, ev| {
-            if ev == fltk::enums::Event::MouseWheel {
-                f(fltk::app::event_dy_value());
-                true
-            } else {
-                false
+        bg.handle(move |w, ev| {
+            let (bx, by) = (w.x(), w.y());
+            let at = || (fltk::app::event_x() - bx, fltk::app::event_y() - by);
+            match ev {
+                fltk::enums::Event::MouseWheel => f(PageInput::Wheel(fltk::app::event_dy_value())),
+                fltk::enums::Event::Push => {
+                    let (x, y) = at();
+                    f(PageInput::Push(x, y))
+                }
+                fltk::enums::Event::Drag => {
+                    let (x, y) = at();
+                    f(PageInput::Drag(x, y))
+                }
+                fltk::enums::Event::Released => f(PageInput::Release),
+                _ => false,
             }
         });
     }

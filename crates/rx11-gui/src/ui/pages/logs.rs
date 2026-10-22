@@ -19,7 +19,8 @@ use crate::model::LogLevel;
 use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot};
 use crate::ui::controls::{BtnKind, Button, Field};
-use crate::ui::{card, page_header, Page};
+use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::{page_header, Page, PageInput};
 
 /// 级别 → 颜色。颜色属于表现层，所以映射留在页面里：`model::LogLevel` 只管语义
 /// （严重度顺序 + 中文标签 + 三字母码）。
@@ -110,6 +111,9 @@ pub enum LogAction {
 
 struct LogState {
     view: LogView,
+    /// While dragging the list's scrollbar: pointer offset below the thumb's
+    /// top edge.
+    thumb_grab: Option<i32>,
 }
 
 /// The log page.
@@ -129,8 +133,32 @@ pub struct LogPage {
 const SEARCH_LABEL_W: i32 = 44;
 
 /// Rows of log text that fit in the list area, derived from the page height.
-fn visible_rows(h: i32) -> usize {
-    ((h - L::PAD * 2 - 64 - 20 - 78) / ROW_LINE_H).max(1) as usize
+/// Where the log list sits on a page of this size: the well's inner rect.
+///
+/// Paint, hit testing and the scrollbar all derive from this, so the list you
+/// see, the list you can click and the bar beside it agree.
+fn list_rect(x: i32, y: i32, w: i32, h: i32) -> (i32, i32, i32, i32) {
+    let pad = L::PAD;
+    let content_x = x + pad;
+    let content_w = w - pad * 2;
+    let bar_y = y + pad + 64 + 20;
+    let counts_y = bar_y + 42;
+    let list_y = counts_y + 26;
+    let list_h = (y + h - pad - list_y).max(60);
+    // NOTE: this must not call `card()` — that function *paints* the card, and
+    // calling it here would erase the rows the painter just drew. Same inner
+    // geometry, plain arithmetic.
+    (content_x + 18, list_y + 16, content_w - 36, list_h)
+}
+
+/// How many log lines fit in a well of this outer height.
+///
+/// Derived from the well's own height — the page height minus a pile of magic
+/// numbers used to overshoot, which drew the last line and the scrollbar past
+/// the well's bottom border. `list_rect` + `list_rows` are the only source.
+fn list_rows(list_h: i32) -> usize {
+    // 16 card padding top + 4 row inset + 16 padding bottom
+    ((list_h - 36) / ROW_LINE_H).max(1) as usize
 }
 
 const ROW_LINE_H: i32 = 20;
@@ -139,6 +167,7 @@ impl LogPage {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         let st = Rc::new(RefCell::new(LogState {
             view: LogView::default(),
+            thumb_grab: None,
         }));
         let on_action: ActionSlot<LogAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -217,7 +246,104 @@ impl LogPage {
             rect,
         };
         page.layout(x, y, w, h);
+        page.install_input();
         page
+    }
+
+    /// Wheel and scrollbar input for the log list.
+    ///
+    /// Scrolling up leaves "follow" mode (the list stops jumping to the newest
+    /// line); scrolling back to the bottom re-arms it, which is the behaviour a
+    /// tail -f reader expects.
+    fn install_input(&self) {
+        let st = self.st.clone();
+        let rect = self.rect.clone();
+        let page = self.page.clone();
+        self.page.on_input(move |input| {
+            let (px, py, pw, ph) = *rect.borrow();
+            let rows = {
+                let (_, _, _, list_h) = list_rect(px, py, pw, ph);
+                list_rows(list_h)
+            };
+            match input {
+                PageInput::Wheel(dy) => {
+                    if dy == 0 {
+                        return false;
+                    }
+                    let mut s = st.borrow_mut();
+                    let total = s.view.visible().len();
+                    if total <= rows {
+                        return false;
+                    }
+                    let cur = if s.view.follow {
+                        total - rows
+                    } else {
+                        s.view.scroll.min(total - 1)
+                    };
+                    let next = (cur as i32 + dy).clamp(0, (total - rows) as i32) as usize;
+                    s.view.follow = next + rows >= total;
+                    s.view.scroll = next;
+                    drop(s);
+                    page.redraw();
+                    true
+                }
+                PageInput::Push(lx, ly) => {
+                    let Some(bar) = log_bar(px, py, pw, ph, &st.borrow()) else {
+                        return false;
+                    };
+                    match bar.hit(lx + px, ly + py) {
+                        Some(Hit::Thumb { grab }) => {
+                            st.borrow_mut().thumb_grab = Some(grab);
+                            page.redraw();
+                            true
+                        }
+                        Some(Hit::Track { dir }) => {
+                            let mut s = st.borrow_mut();
+                            let total = s.view.visible().len();
+                            let cur = if s.view.follow {
+                                total - rows
+                            } else {
+                                s.view.scroll
+                            };
+                            let next = (cur as i32 + dir * rows as i32)
+                                .clamp(0, (total - rows) as i32)
+                                as usize;
+                            s.view.follow = false;
+                            s.view.scroll = next;
+                            drop(s);
+                            page.redraw();
+                            true
+                        }
+                        None => false,
+                    }
+                }
+                PageInput::Drag(_lx, ly) => {
+                    let Some(grab) = st.borrow().thumb_grab else {
+                        return false;
+                    };
+                    let Some(bar) = log_bar(px, py, pw, ph, &st.borrow()) else {
+                        return false;
+                    };
+                    let row = (bar.scroll_at(ly + py - grab) / ROW_LINE_H).max(0) as usize;
+                    {
+                        let mut s = st.borrow_mut();
+                        let total = s.view.visible().len();
+                        let max = total.saturating_sub(rows);
+                        s.view.follow = false;
+                        s.view.scroll = row.min(max);
+                    }
+                    page.redraw();
+                    true
+                }
+                PageInput::Release => {
+                    let was = st.borrow_mut().thumb_grab.take();
+                    if was.is_some() {
+                        page.redraw();
+                    }
+                    was.is_some()
+                }
+            }
+        });
     }
 
     pub fn on_action<F: Fn(LogAction) + 'static>(&self, f: F) {
@@ -226,12 +352,11 @@ impl LogPage {
 
     /// Replace the tail, keeping the filter, level and follow state.
     pub fn set_view(&self, view: LogView) {
-        let level = view.min_level;
-        let filter = view.filter.clone();
+        // Only the entries come from the app each tick. Level, filter, scroll
+        // and follow are the operator's, not the poller's: overwriting them made
+        // a wheel scroll snap back half a second later.
         let mut s = self.st.borrow_mut();
-        s.view = view;
-        s.view.min_level = level;
-        s.view.filter = filter;
+        s.view.entries = view.entries;
         drop(s);
         self.filter.set_value(&self.st.borrow().view.filter);
         // The list scrolls itself; keep the newest line in view.
@@ -288,6 +413,30 @@ impl LogPage {
 // ---------------------------------------------------------------------------
 // Painting
 // ---------------------------------------------------------------------------
+
+/// Scroll bar for the log list, or `None` when the whole filtered view fits.
+fn log_bar(x: i32, y: i32, w: i32, h: i32, s: &LogState) -> Option<ScrollBar> {
+    let (ix, iy, iw, list_h) = list_rect(x, y, w, h);
+    let rows = list_rows(list_h);
+    let total = s.view.visible().len();
+    // `scroll` counts from the top; in follow mode the view is pinned to the end.
+    let first = if s.view.follow {
+        total.saturating_sub(rows)
+    } else {
+        s.view.scroll.min(total.saturating_sub(1))
+    };
+    // Track spans exactly the drawn rows, so it cannot poke past the well.
+    let _ = list_h;
+    ScrollBar::new(
+        // In the well's right padding (18 units), clear of the log text.
+        ix + iw + 7,
+        iy + 4,
+        (rows as i32 * ROW_LINE_H).max(20),
+        total as i32 * ROW_LINE_H,
+        rows as i32 * ROW_LINE_H,
+        first as i32 * ROW_LINE_H,
+    )
+}
 
 fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     th::fill(x, y, w, h, C::BG);
@@ -349,13 +498,11 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
         fltk::enums::Align::Right,
     );
 
-    let list_y = counts_y + 26;
-
-    // List well.
-    let list_h = (y + h - pad - list_y).max(60);
-    let (ix, iy, iw) = card(content_x, list_y, content_w, list_h);
-    th::fill_round(content_x, list_y, content_w, list_h, L::RADIUS, C::SUNKEN);
-    th::stroke_round(content_x, list_y, content_w, list_h, L::RADIUS, C::LINE);
+    // List well geometry: one source for paint, hit testing and the scrollbar.
+    let (ix, iy, iw, list_h) = list_rect(x, y, w, h);
+    let (list_x, list_y, list_w) = (x + pad, iy - 16, w - pad * 2);
+    th::fill_round(list_x, list_y, list_w, list_h, L::RADIUS, C::SUNKEN);
+    th::stroke_round(list_x, list_y, list_w, list_h, L::RADIUS, C::LINE);
 
     if visible.is_empty() {
         crate::ui::empty_state(
@@ -377,7 +524,7 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
         return;
     }
 
-    let rows = visible_rows(h);
+    let rows = list_rows(list_h);
     // `scroll` is an offset from the top; when following, pin to the end.
     let start = if v.follow {
         visible.len().saturating_sub(rows)
@@ -421,35 +568,23 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
         ly += ROW_LINE_H;
     }
 
-    // Scroll indicator: position within the filtered list.
-    if visible.len() > rows {
-        let total = visible.len();
-        let frac = if total > rows {
-            start as f64 / (total - rows) as f64
-        } else {
-            0.0
-        };
-        let track_h = list_h - 24;
-        let thumb_h = ((track_h as f64) * rows as f64 / total as f64).max(24.0) as i32;
-        let thumb_y = list_y + 12 + ((track_h - thumb_h) as f64 * frac) as i32;
-        th::fill_round(
-            content_x + content_w - 8,
-            thumb_y,
-            3,
-            thumb_h,
-            1,
-            th::mix(C::TEXT_3, C::SUNKEN, 0.7),
+    // Scrollbar for the list well.
+    if let Some(bar) = log_bar(x, y, w, h, s) {
+        bar.paint(s.thumb_grab.is_some());
+    }
+
+    // The scroll position is shown by the shared scrollbar above; this block
+    // used to paint a second, private indicator of its own, which made the page
+    // look like it had two bars. Only the paused-follow notice lives here.
+    if visible.len() > rows && !v.follow {
+        th::micro(
+            "已暂停跟随 · 滚到底部恢复",
+            content_x + 16,
+            list_y + list_h - 20,
+            300,
+            14,
+            C::AMBER,
         );
-        if !v.follow {
-            th::micro(
-                "已暂停跟随 · 滚到底部恢复",
-                content_x + 16,
-                list_y + list_h - 20,
-                300,
-                14,
-                C::AMBER,
-            );
-        }
     }
 }
 
@@ -522,7 +657,21 @@ mod tests {
 
     #[test]
     fn visible_rows_never_returns_zero() {
-        assert!(visible_rows(100) >= 1);
-        assert!(visible_rows(2000) > visible_rows(400));
+        assert!(list_rows(100) >= 1);
+        assert!(list_rows(2000) > list_rows(400));
+    }
+
+    /// The drawn rows must fit inside the well: overshooting here draws the last
+    /// line over the well's bottom border (which is exactly what happened).
+    #[test]
+    fn rows_always_fit_the_well() {
+        for h in [60, 120, 200, 400, 518, 900, 1400] {
+            let rows = list_rows(h) as i32;
+            assert!(rows >= 1, "h={h}: 至少一行");
+            assert!(
+                rows * ROW_LINE_H <= (h - 36).max(ROW_LINE_H),
+                "h={h}: {rows} 行放不进井里"
+            );
+        }
     }
 }
