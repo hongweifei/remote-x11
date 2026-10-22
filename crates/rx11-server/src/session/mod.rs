@@ -38,6 +38,17 @@ pub struct Session {
     pub client_id: String,
 }
 
+/// Read-only view of one live session, for embedders that render their own
+/// session list (the GUI console polls [`SessionManager::snapshot`] every
+/// frame). Deliberately excludes the xauth cookie: nothing outside the
+/// handshake path needs it, and a display list is not a credential store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionInfo {
+    pub display: u16,
+    pub session_id: String,
+    pub client_id: String,
+}
+
 /// Sink + optional protocol-recode policy + the relay's outbound handle
 /// (the real-time lane is how pumps report resume edges without waiting
 /// for the data path to come unblocked) for one display's relay leg.
@@ -231,6 +242,26 @@ impl SessionManager {
             .get(&disp.get())
             .map(|s| s.client_id == client_id)
             .unwrap_or(false)
+    }
+
+    /// Every live session, sorted by display number. A read-lock snapshot for
+    /// embedders (the GUI session list); never holds the lock while the caller
+    /// renders. Ordering is the caller-facing contract: `Vec` is cheap to sort
+    /// here because the map is small and the ordering must not depend on hash
+    /// iteration order.
+    pub async fn snapshot(&self) -> Vec<SessionInfo> {
+        let sessions = self.sessions.read().await;
+        let mut out: Vec<SessionInfo> = sessions
+            .values()
+            .map(|s| SessionInfo {
+                display: s.display.get(),
+                session_id: s.id.as_str().to_string(),
+                client_id: s.client_id.clone(),
+            })
+            .collect();
+        drop(sessions);
+        out.sort_by_key(|s| s.display);
+        out
     }
 
     pub async fn owns_connection(&self, conn_id: ConnectionId, client_id: &str) -> bool {
@@ -721,6 +752,57 @@ mod tests {
         assert_eq!(resumed.client_id, "client-2");
         // Resuming must cancel and remove the pending grace task.
         assert!(!mgr.grace_tasks.lock().await.contains_key(&15));
+    }
+
+    #[tokio::test]
+    async fn snapshot_lists_sessions_sorted_by_display() {
+        let mgr = test_manager();
+        mgr.set_x11_listener(Arc::new(MockBinder)).await;
+
+        // Insert out of order: the snapshot contract is display-ascending.
+        for (disp, client) in [(12u16, "client-c"), (3, "client-a"), (7, "client-b")] {
+            mgr.create_session(
+                DisplayNumber::new(disp).unwrap(),
+                "auth".into(),
+                vec![1],
+                client.into(),
+            )
+            .await
+            .unwrap();
+        }
+
+        let snapshot = mgr.snapshot().await;
+        let displays: Vec<u16> = snapshot.iter().map(|s| s.display).collect();
+        assert_eq!(displays, vec![3, 7, 12]);
+        assert_eq!(snapshot[0].client_id, "client-a");
+        assert_eq!(snapshot[1].client_id, "client-b");
+        assert_eq!(snapshot[2].client_id, "client-c");
+        // The id must be the real session id, not a display placeholder.
+        assert!(!snapshot[0].session_id.is_empty());
+        assert_ne!(snapshot[0].session_id, snapshot[1].session_id);
+    }
+
+    #[tokio::test]
+    async fn snapshot_is_empty_without_sessions_and_tracks_destroy() {
+        let (mgr, session) = seeded_manager(31, "client-1").await;
+        assert_eq!(mgr.snapshot().await.len(), 1);
+
+        mgr.destroy_session(session.display).await;
+        assert!(mgr.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn snapshot_reflects_resume_owner_change() {
+        let (mgr, session) = seeded_manager(32, "old-client").await;
+
+        mgr.try_resume_session(&session.id, "new-client".into())
+            .await
+            .unwrap();
+
+        let snapshot = mgr.snapshot().await;
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].client_id, "new-client");
+        assert_eq!(snapshot[0].session_id, session.id.as_str());
     }
 
     #[tokio::test]

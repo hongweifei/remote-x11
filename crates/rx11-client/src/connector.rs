@@ -1,13 +1,19 @@
 //! Client connector: establishes the relay connection (handshake, session
 //! creation or resume), runs the proxy receive loop and reconnects with
 //! exponential backoff on transient failures.
+//!
+//! Lifecycle/observability seam for embedders: [`LocalConnector::handle`]
+//! hands out a [`ConnectorHandle`] over the same state, so a GUI can render
+//! the phase/display/session and call [`ConnectorHandle::stop`] without
+//! owning the future returned by [`LocalConnector::connect_and_serve`].
 
-use std::sync::atomic::AtomicU32;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rand::RngExt;
 use tokio::net::TcpStream;
+use tokio::sync::{watch, Notify};
 use tracing::{error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
@@ -31,6 +37,160 @@ const X11_AUTH_NAME: &str = "MIT-MAGIC-COOKIE-1";
 /// Ceiling of the exponential backoff doubling (`base * 2^cap`).
 const MAX_BACKOFF_EXPONENT: u32 = 10;
 
+/// Where a connector currently is in its connect → serve → retry cycle.
+///
+/// `Default` is [`ConnectorPhase::Stopped`]: a connector that was never
+/// started has not failed, it simply is not running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ConnectorPhase {
+    /// Opening the TCP connection to the relay.
+    Connecting,
+    /// TCP is up; negotiating the handshake and creating/resuming a session.
+    Handshaking,
+    /// Session established, relaying X11 traffic.
+    Serving,
+    /// An attempt failed with a retriable error; waiting out the backoff.
+    Reconnecting,
+    /// Finished cleanly (normal end of session or an explicit stop).
+    #[default]
+    Stopped,
+    /// Finished with a fatal error (non-retriable, or retries exhausted).
+    Failed,
+}
+
+/// Point-in-time snapshot of a connector, cheap to clone and to render.
+#[derive(Debug, Clone, Default)]
+pub struct ConnectorState {
+    pub phase: ConnectorPhase,
+    /// Display of the current (or last) session.
+    pub display: Option<u16>,
+    pub session_id: Option<String>,
+    /// 1-based retry counter of the current backoff cycle (0 while the first
+    /// attempt is in flight).
+    pub reconnect_attempt: u32,
+    /// Negotiated compression algorithm, `None` when the peer disabled it.
+    pub compression: Option<String>,
+    /// Negotiated capability names, sorted (`Features::to_list`).
+    pub features: Vec<String>,
+    /// Message of the most recent failure; cleared once an attempt reaches
+    /// [`ConnectorPhase::Serving`] again.
+    pub last_error: Option<String>,
+}
+
+impl ConnectorState {
+    /// True while the connector is doing work (i.e. not stopped/failed).
+    pub fn is_running(&self) -> bool {
+        matches!(
+            self.phase,
+            ConnectorPhase::Connecting
+                | ConnectorPhase::Handshaking
+                | ConnectorPhase::Serving
+                | ConnectorPhase::Reconnecting
+        )
+    }
+}
+
+/// Shared connector lifecycle state: one instance per [`LocalConnector`],
+/// created in [`LocalConnector::new`] and shared by every handle clone.
+struct ConnectorControl {
+    state: Mutex<ConnectorState>,
+    /// Stop request; checked at every loop boundary and awaited during
+    /// backoff so a sleeping retry wakes up immediately.
+    stop_requested: AtomicBool,
+    stop: Notify,
+    /// Flipped once `connect_and_serve` has returned (for any reason).
+    done_tx: watch::Sender<bool>,
+    done_rx: watch::Receiver<bool>,
+}
+
+impl ConnectorControl {
+    fn new() -> Self {
+        let (done_tx, done_rx) = watch::channel(false);
+        Self {
+            state: Mutex::new(ConnectorState::default()),
+            stop_requested: AtomicBool::new(false),
+            stop: Notify::new(),
+            done_tx,
+            done_rx,
+        }
+    }
+
+    fn state(&self) -> ConnectorState {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Apply `update` under the state lock. Callers must not hold the guard
+    /// across an await, so this is the only mutation entry point.
+    fn update(&self, update: impl FnOnce(&mut ConnectorState)) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        update(&mut state);
+    }
+
+    fn request_stop(&self) {
+        self.stop_requested.store(true, Ordering::SeqCst);
+        self.stop.notify_one();
+    }
+
+    fn is_stop_requested(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+
+    async fn notified(&self) {
+        self.stop.notified().await;
+    }
+
+    fn mark_done(&self) {
+        let _ = self.done_tx.send(true);
+    }
+}
+
+/// Cheap, cloneable control/observation handle of one [`LocalConnector`].
+#[derive(Clone)]
+pub struct ConnectorHandle {
+    control: Arc<ConnectorControl>,
+}
+
+impl ConnectorHandle {
+    /// Snapshot of the current phase, display, session and negotiated
+    /// settings. Synchronous and lock-scoped (never held across an await).
+    pub fn state(&self) -> ConnectorState {
+        self.control.state()
+    }
+
+    /// Ask the connector to stop. Synchronous, non-blocking and idempotent.
+    ///
+    /// A backoff sleep wakes up immediately; a live session is torn down at
+    /// its next loop boundary, so the phase becomes [`ConnectorPhase::Stopped`]
+    /// shortly after — poll [`Self::state`] / [`Self::is_running`] (or await
+    /// [`Self::wait_stopped`]) instead of assuming it already is.
+    pub fn stop(&self) {
+        self.control.request_stop();
+    }
+
+    pub fn is_running(&self) -> bool {
+        self.control.state().is_running()
+    }
+
+    /// Resolve once `connect_and_serve` has returned (cleanly or not).
+    pub async fn wait_stopped(&self) {
+        let mut rx = self.control.done_rx.clone();
+        loop {
+            if *rx.borrow_and_update() {
+                return;
+            }
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 pub struct LocalConnector {
     relay_addr: String,
     auth_token: String,
@@ -41,6 +201,10 @@ pub struct LocalConnector {
     retry_base_delay: Duration,
     retry_max_delay: Duration,
     runtime: RuntimeConfig,
+    /// One stats instance for the whole connector lifetime: counters
+    /// accumulate across reconnects instead of resetting with every session.
+    stats: Arc<ConnectionStats>,
+    control: Arc<ConnectorControl>,
 }
 
 impl LocalConnector {
@@ -61,6 +225,8 @@ impl LocalConnector {
             retry_base_delay: ClientDefaults::RETRY_BASE_DELAY,
             retry_max_delay: ClientDefaults::RETRY_MAX_DELAY,
             runtime: RuntimeConfig::default(),
+            stats: Arc::new(ConnectionStats::new()),
+            control: Arc::new(ConnectorControl::new()),
         }
     }
 
@@ -70,12 +236,77 @@ impl LocalConnector {
         self
     }
 
+    /// The connector's lifetime statistics, shared by every session it runs.
+    pub fn stats(&self) -> Arc<ConnectionStats> {
+        self.stats.clone()
+    }
+
+    /// Observation/control handle over this connector's state. Cheap to
+    /// clone; safe to move to another thread.
+    pub fn handle(&self) -> ConnectorHandle {
+        ConnectorHandle {
+            control: self.control.clone(),
+        }
+    }
+
+    /// Start `connect_and_serve` on the current Tokio runtime and return its
+    /// handle immediately.
+    ///
+    /// Requires a runtime context; without one the connector is left in
+    /// [`ConnectorPhase::Failed`] with `last_error` set instead of panicking.
+    pub fn spawn(self: Arc<Self>) -> ConnectorHandle {
+        let handle = self.handle();
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            self.control.update(|state| {
+                state.phase = ConnectorPhase::Failed;
+                state.last_error = Some("no Tokio runtime context for spawn()".to_string());
+            });
+            self.control.mark_done();
+            return handle;
+        };
+        rt.spawn(async move {
+            if let Err(e) = self.connect_and_serve().await {
+                error!("Connector stopped with error: {}", e);
+            }
+        });
+        handle
+    }
+
     /// Run connect/serve cycles, retrying retriable failures while carrying
     /// the session id over for resume attempts.
+    ///
+    /// Signature and error semantics are unchanged; the only addition is that
+    /// the final phase is published on the handle ([`ConnectorPhase::Stopped`]
+    /// on success, [`ConnectorPhase::Failed`] on error).
     pub async fn connect_and_serve(&self) -> anyhow::Result<()> {
+        let result = self.run_cycles().await;
+        match &result {
+            Ok(()) => self.control.update(|state| {
+                state.phase = ConnectorPhase::Stopped;
+            }),
+            Err(e) => self.control.update(|state| {
+                state.phase = ConnectorPhase::Failed;
+                state.last_error = Some(e.to_string());
+            }),
+        }
+        self.control.mark_done();
+        result
+    }
+
+    async fn run_cycles(&self) -> anyhow::Result<()> {
         let mut attempt: u32 = 0;
         let mut last_session_id: Option<String> = None;
         loop {
+            if self.control.is_stop_requested() {
+                info!("Connector stop requested, exiting");
+                return Ok(());
+            }
+
+            self.control.update(|state| {
+                state.phase = ConnectorPhase::Connecting;
+                state.reconnect_attempt = attempt;
+            });
+
             // Clone, not take: a failed establish (transport never came up)
             // must not consume the id — every later attempt keeps trying to
             // resume the same session until one succeeds and overwrites it.
@@ -89,22 +320,58 @@ impl LocalConnector {
             };
 
             if !is_retriable(&e) {
+                self.control.update(|state| {
+                    state.last_error = Some(e.to_string());
+                });
                 return Err(e);
             }
 
             attempt += 1;
             if attempt > self.max_retries {
                 error!("Max reconnection attempts ({}) reached", self.max_retries);
+                self.control.update(|state| {
+                    state.last_error = Some(e.to_string());
+                });
                 return Err(e);
             }
+
+            // Publish the failure before sleeping so a UI never shows
+            // "Serving" while the connector is actually backing off.
+            self.control.update(|state| {
+                state.phase = ConnectorPhase::Reconnecting;
+                state.reconnect_attempt = attempt;
+                state.last_error = Some(e.to_string());
+            });
 
             let delay = self.calculate_backoff(attempt);
             warn!(
                 "Connection lost ({}), reconnecting in {:?} (attempt {}/{})",
                 e, delay, attempt, self.max_retries
             );
-            tokio::time::sleep(delay).await;
+            if self.sleep_or_stop(delay).await {
+                info!("Connector stop requested during backoff, exiting");
+                return Ok(());
+            }
         }
+    }
+
+    /// Sleep for `delay`, returning early with `true` when a stop was
+    /// requested. A pre-armed stop permit resolves immediately.
+    async fn sleep_or_stop(&self, delay: Duration) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(delay) => self.control.is_stop_requested(),
+            _ = self.stop_signal() => true,
+        }
+    }
+
+    /// Resolve when a stop is requested, including the case where the request
+    /// arrived before this future was created (the `Notify` permit is either
+    /// still armed or the flag is already set).
+    async fn stop_signal(&self) {
+        if self.control.is_stop_requested() {
+            return;
+        }
+        self.control.notified().await;
     }
 
     fn calculate_backoff(&self, attempt: u32) -> Duration {
@@ -131,6 +398,9 @@ impl LocalConnector {
         .await
         .map_err(|_| anyhow::anyhow!("TCP connect to {} timed out", self.relay_addr))??;
         let mut transport = Rx11Transport::connect_tcp(stream, self.runtime.tcp_send_buffer_bytes)?;
+        self.control.update(|state| {
+            state.phase = ConnectorPhase::Handshaking;
+        });
 
         let resume_sid = resume_session_id
             .map(|s| SessionId::new(s.to_string()))
@@ -236,8 +506,20 @@ impl LocalConnector {
             self.establish(resume_session_id, saved_session_id).await?;
         let (mut read_half, write_half) = transport.split();
 
+        // Publish the established session before the first byte moves: this
+        // is what a dashboard shows as "serving :N".
+        self.control.update(|state| {
+            state.phase = ConnectorPhase::Serving;
+            state.display = Some(actual_display.get());
+            state.session_id = saved_session_id.clone();
+            state.compression = dataplane.compression.map(|a| a.as_str().to_string());
+            state.features = dataplane.features.to_list();
+            state.last_error = None;
+        });
+
         let x11_connections = new_shared_conns();
-        let stats = Arc::new(ConnectionStats::new());
+        // Lifetime stats: shared across reconnect cycles by design.
+        let stats = self.stats.clone();
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
         let mut audio_outlet: Option<crate::audioout::AudioOutlet> = None;
@@ -291,7 +573,12 @@ impl LocalConnector {
                 audio: &mut audio_outlet,
                 flow: &mut flow,
             };
-            serve(&mut ctx).await
+            tokio::select! {
+                result = serve(&mut ctx) => result,
+                // A stop request tears the live session down at this boundary;
+                // the transport halves and pumps are dropped/aborted below.
+                _ = self.stop_signal() => Ok(()),
+            }
         };
 
         stats_logger.abort();
@@ -336,6 +623,7 @@ fn is_retriable(err: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
 
     fn connector() -> LocalConnector {
         LocalConnector::new(
@@ -345,6 +633,41 @@ mod tests {
             None,
             true,
         )
+    }
+
+    /// Connector aimed at a port that is bound then released, so connects
+    /// are refused immediately (the `rx11-cli` util-test pattern) with fast
+    /// backoff, keeping the retry loop observable without real network waits.
+    async fn fast_retry_connector() -> LocalConnector {
+        let addr = {
+            let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            l.local_addr().unwrap()
+        };
+        let mut c = LocalConnector::new(
+            addr.to_string(),
+            "token".into(),
+            "127.0.0.1:6000".into(),
+            None,
+            true,
+        );
+        c.max_retries = 1000;
+        c.retry_base_delay = Duration::from_millis(20);
+        c.retry_max_delay = Duration::from_millis(40);
+        c
+    }
+
+    /// Poll `pred` until it holds or `timeout` elapses.
+    async fn wait_until(timeout: Duration, mut pred: impl FnMut() -> bool) -> bool {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if pred() {
+                return true;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
     }
 
     #[test]
@@ -387,5 +710,107 @@ mod tests {
             "bad frame".into()
         ))));
         assert!(!is_retriable(&anyhow::anyhow!("unrelated error")));
+    }
+
+    #[test]
+    fn fresh_connector_reports_stopped_and_not_running() {
+        let c = connector();
+        let handle = c.handle();
+        let state = handle.state();
+        assert_eq!(state.phase, ConnectorPhase::Stopped);
+        assert!(!handle.is_running());
+        assert_eq!(state.reconnect_attempt, 0);
+        assert!(state.display.is_none() && state.session_id.is_none());
+        assert!(state.last_error.is_none());
+    }
+
+    #[test]
+    fn handle_shares_state_with_the_connector() {
+        let c = connector();
+        let a = c.handle();
+        let b = c.handle();
+        c.control.update(|state| {
+            state.phase = ConnectorPhase::Serving;
+            state.display = Some(7);
+        });
+        assert_eq!(a.state().phase, ConnectorPhase::Serving);
+        assert_eq!(b.state().display, Some(7));
+        assert!(a.is_running() && b.is_running());
+    }
+
+    #[test]
+    fn stats_arc_is_created_once_per_connector() {
+        let c = connector();
+        let first = c.stats();
+        let second = c.stats();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "stats must survive reconnects as one instance"
+        );
+        first.add_bytes_sent(1234);
+        assert_eq!(second.totals().bytes_sent, 1234);
+    }
+
+    #[tokio::test]
+    async fn stop_makes_a_retrying_connector_exit() {
+        let connector = Arc::new(fast_retry_connector().await);
+        let handle = connector.clone().spawn();
+
+        // Reach the backoff phase: connects are refused, retries begin.
+        assert!(
+            wait_until(Duration::from_secs(5), || {
+                handle.state().phase == ConnectorPhase::Reconnecting
+            })
+            .await,
+            "connector should be retrying, got {:?}",
+            handle.state()
+        );
+        let retrying = handle.state();
+        assert!(retrying.reconnect_attempt >= 1);
+        assert!(retrying.last_error.is_some(), "failure must be published");
+
+        handle.stop();
+        tokio::time::timeout(Duration::from_secs(5), handle.wait_stopped())
+            .await
+            .expect("stop must interrupt the backoff sleep");
+        assert_eq!(handle.state().phase, ConnectorPhase::Stopped);
+        assert!(!handle.is_running());
+    }
+
+    #[tokio::test]
+    async fn stop_before_start_is_honored() {
+        let connector = Arc::new(fast_retry_connector().await);
+        let handle = connector.handle();
+        handle.stop();
+        let result = connector.connect_and_serve().await;
+        assert!(result.is_ok(), "a pre-stopped connector exits cleanly");
+        assert_eq!(handle.state().phase, ConnectorPhase::Stopped);
+    }
+
+    #[tokio::test]
+    async fn non_retriable_failure_lands_in_failed_phase() {
+        // An invalid token fails validation before any network I/O, which is
+        // a non-retriable protocol error.
+        let mut c = fast_retry_connector().await;
+        c.auth_token = String::new();
+        let result = c.connect_and_serve().await;
+        assert!(result.is_err(), "empty token must fail");
+        let state = c.handle().state();
+        assert_eq!(state.phase, ConnectorPhase::Failed);
+        assert!(state.last_error.is_some());
+        assert!(!c.handle().is_running());
+    }
+
+    #[test]
+    fn spawn_without_runtime_fails_instead_of_panicking() {
+        let c = Arc::new(connector());
+        let handle = c.clone().spawn();
+        let state = handle.state();
+        assert_eq!(state.phase, ConnectorPhase::Failed);
+        assert!(state
+            .last_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("runtime"));
     }
 }

@@ -51,6 +51,28 @@ impl Savings {
     }
 }
 
+/// Lifetime totals of one [`ConnectionStats`], copied out as a plain value so
+/// embedders (the GUI console, monitors) can render without touching atomics
+/// one by one. `uptime` is measured from the moment the stats object was
+/// created, so a connector that reuses one stats instance across reconnects
+/// reports the whole process lifetime, not the last session's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StatsTotals {
+    pub bytes_sent: u64,
+    pub bytes_received: u64,
+    pub x11_connections_active: u32,
+    pub compression_saved: u64,
+    pub compression_frames: u64,
+    pub incremental_saved: u64,
+    pub incremental_frames: u64,
+    pub incremental_fallback: u64,
+    pub incremental_compression_saved: u64,
+    pub incremental_compression_frames: u64,
+    pub flow_advertised: u64,
+    pub flow_enforced: u64,
+    pub uptime: Duration,
+}
+
 pub struct ConnectionStats {
     bytes_sent: Counter,
     bytes_received: Counter,
@@ -144,6 +166,28 @@ impl ConnectionStats {
                 .fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| v.checked_sub(1));
         if prev.is_err() {
             tracing::warn!("x11_connections_active underflow detected");
+        }
+    }
+
+    /// Copy every lifetime counter out at once. `summary()` keeps rendering
+    /// its own sections (it distinguishes total vs period); this is the
+    /// machine-readable view for embedders that draw their own dashboard.
+    pub fn totals(&self) -> StatsTotals {
+        let s = self.snapshot(false);
+        StatsTotals {
+            bytes_sent: s.bytes_sent,
+            bytes_received: s.bytes_received,
+            x11_connections_active: self.x11_connections_active.load(Ordering::Relaxed),
+            compression_saved: s.compression_saved,
+            compression_frames: s.compression_frames,
+            incremental_saved: s.incremental_saved,
+            incremental_frames: s.incremental_frames,
+            incremental_fallback: s.incremental_fallback,
+            incremental_compression_saved: s.incremental_compression_saved,
+            incremental_compression_frames: s.incremental_compression_frames,
+            flow_advertised: self.flow_advertised.load_total(),
+            flow_enforced: self.flow_enforced.load_total(),
+            uptime: self.start_time.elapsed(),
         }
     }
 
@@ -488,5 +532,87 @@ mod tests {
     #[test]
     fn test_format_duration_days() {
         assert_eq!(format_duration(Duration::from_secs(90061)), "1d1h1m1s");
+    }
+
+    #[test]
+    fn totals_mirrors_lifetime_counters() {
+        let stats = ConnectionStats::new();
+        stats.add_bytes_sent(100);
+        stats.add_bytes_received(200);
+        stats.add_compression_saved(50);
+        stats.add_incremental_saved(30);
+        stats.add_incremental_full_fallback();
+        stats.add_incremental_compression_saved(10);
+        stats.add_flow_advertised();
+        stats.add_flow_enforced();
+        stats.add_flow_enforced();
+        stats.inc_x11_connections();
+        // A reporting-period reset must not move the lifetime totals.
+        stats.reset_period();
+
+        let t = stats.totals();
+        assert_eq!(t.bytes_sent, 100);
+        assert_eq!(t.bytes_received, 200);
+        assert_eq!(t.x11_connections_active, 1);
+        assert_eq!(t.compression_saved, 50);
+        assert_eq!(t.compression_frames, 1);
+        assert_eq!(t.incremental_saved, 30);
+        assert_eq!(t.incremental_frames, 1);
+        assert_eq!(t.incremental_fallback, 1);
+        assert_eq!(t.incremental_compression_saved, 10);
+        assert_eq!(t.incremental_compression_frames, 1);
+        assert_eq!(t.flow_advertised, 1);
+        assert_eq!(t.flow_enforced, 2);
+        assert!(
+            t.uptime < Duration::from_secs(60),
+            "uptime tracks the start"
+        );
+    }
+
+    #[test]
+    fn totals_of_fresh_stats_is_all_zero() {
+        let mut t = ConnectionStats::new().totals();
+        // Uptime is measured, not zero, even right after construction.
+        assert!(t.uptime < Duration::from_secs(60));
+        t.uptime = Duration::ZERO;
+        assert_eq!(t, StatsTotals::default());
+    }
+
+    /// The dashboard reads `totals()`, but `summary()` is what the CLI logs:
+    /// pin its exact rendering so a refactor cannot silently change either.
+    #[test]
+    fn summary_rendering_is_byte_stable() {
+        let stats = ConnectionStats::new();
+        stats.add_bytes_sent(4096);
+        stats.add_bytes_received(1024);
+        stats.add_compression_saved(100);
+        stats.add_incremental_saved(30);
+        stats.add_incremental_full_fallback();
+        stats.add_incremental_compression_saved(10);
+
+        let summary = stats.summary();
+        let body: Vec<&str> = summary
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("Uptime:"))
+            .collect();
+        assert_eq!(
+            body.join("\n"),
+            concat!(
+                " 0 active X11 connections\n",
+                "  Total:\n",
+                "    Sent: 4.0 KB\n",
+                "    Recv: 1.0 KB\n",
+                "    Compressed (full): 1 frames, saved 100 B\n",
+                "    Incremental: 1 frames, saved 30 B, 1 fallbacks\n",
+                "    Compressed (incremental): 1 frames, saved 10 B\n",
+                "  Period:\n",
+                "    Sent: 4.0 KB\n",
+                "    Recv: 1.0 KB\n",
+                "    Compressed (full): 1 frames, saved 100 B\n",
+                "    Incremental: 1 frames, saved 30 B, 1 fallbacks\n",
+                "    Compressed (incremental): 1 frames, saved 10 B"
+            )
+        );
+        assert!(summary.contains("Uptime: "));
     }
 }
