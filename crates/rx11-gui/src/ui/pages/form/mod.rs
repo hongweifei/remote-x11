@@ -22,16 +22,17 @@ use fltk::prelude::*;
 
 use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot};
+use crate::ui::chrome::{card, card_title, page_header, PAGE_HEADER_H};
+use crate::ui::controls::{BtnKind, Button, Field, Select, Switch};
+use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
+use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::{Page, PageInput};
 
 /// One field's live widgets, in creation order.
 type WidgetList = Rc<RefCell<Vec<(&'static str, FieldWidget)>>>;
-use crate::ui::controls::{BtnKind, Button, Field, Select, Switch};
 mod scroll;
 
 use scroll::{apply_scroll, place_fields, row_fits, scroll_band, scroll_bar};
-
-use crate::ui::scrollbar::{Hit, ScrollBar};
-use crate::ui::{card, card_title, page_header, Page, PageInput};
 
 // ---------------------------------------------------------------------------
 // Spec
@@ -140,8 +141,11 @@ struct SectionGeom {
     h: i32,
 }
 
-/// Compute every rectangle for a form at a given scroll offset. Both drawing
-/// and widget placement consume this, so they cannot drift apart.
+/// Compute every rectangle for a form at a given scroll offset.
+///
+/// Drawing and widget placement both consume this, so they cannot drift apart:
+/// the tree is solved once and reshaped here for the callers. Scrolling is a
+/// translation of the solved rectangles, not a second layout.
 fn geometry(
     spec: &FormSpec,
     x: i32,
@@ -150,43 +154,100 @@ fn geometry(
     _h: i32,
     scroll: i32,
 ) -> (Vec<SectionGeom>, Vec<RowGeom>) {
-    let pad = L::PAD;
-    let content_x = x + pad;
-    let content_w = w - pad * 2;
-    let main_w = content_w - SIDE_W - L::GAP;
-    let mut cy = page_y_start(y, pad) - scroll;
-    let mut sections = Vec::new();
-    let mut rows = Vec::new();
-    for (si, s) in spec.sections.iter().enumerate() {
-        let card_h = SECTION_HEAD + s.fields.len() as i32 * ROW_H + 12;
-        sections.push(SectionGeom {
-            index: si,
-            y: cy,
-            h: card_h,
-        });
-        let inner_x = content_x + 18;
-        let mut fy = cy + SECTION_HEAD;
-        for f in s.fields {
-            rows.push(RowGeom {
-                key: f.key,
-                input_y: fy,
-                input_h: if f.kind == FieldKind::Toggle { 20 } else { 32 },
-                label_y: fy + 6,
+    let solved = form_layout(spec, x, y, w, scroll);
+    let sections = solved
+        .cards
+        .iter()
+        .enumerate()
+        .map(|(index, &id)| {
+            let r = solved.solved.get(id);
+            SectionGeom {
+                index,
+                y: r.y,
+                h: r.h,
+            }
+        })
+        .collect();
+    let rows = solved
+        .rows
+        .iter()
+        .map(|&(key, kind, id)| {
+            let ry = solved.solved.get(id).y;
+            RowGeom {
+                key,
+                input_y: ry,
+                input_h: if kind == FieldKind::Toggle { 20 } else { 32 },
+                label_y: ry + 6,
                 // The hint hugs the input it belongs to. It used to sit at
                 // `fy + 36`, which put 18 device px between the input and the
-                // hint but only 11 between the hint and the *next* row — the
-                // hint read as belonging to the row below it. `fy + 31` flips
-                // that: a small gap above, a larger one below.
-                hint_y: fy + 31,
-                row_y: fy,
-            });
-            fy += ROW_H;
-        }
-        let _ = (inner_x, main_w);
-        cy += card_h + SECTION_GAP;
-    }
+                // hint but only 11 between the hint and the *next* row — so the
+                // hint read as belonging to the row below it. `+31` flips that:
+                // a small gap above, a larger one below.
+                hint_y: ry + 31,
+                row_y: ry,
+            }
+        })
+        .collect();
     (sections, rows)
 }
+
+/// A solved form: the rectangles plus which leaf each section and row came from.
+struct SolvedForm {
+    solved: Solved,
+    cards: Vec<NodeId>,
+    rows: Vec<(&'static str, FieldKind, NodeId)>,
+}
+
+/// The form's layout tree: heading, the scrolling field column, the side column.
+///
+/// The only place a form's coordinates are decided. `geometry` reshapes this for
+/// its callers; `place_fields` and the pointer handler read the same rectangles.
+///
+/// The field column is solved against a tall virtual page (a form is taller than
+/// the window), then translated by `scroll`. Sections are separated by
+/// [`SECTION_GAP`] *between* cards only — the first card starts flush under the
+/// heading, which is what the hand-written version did.
+fn form_layout(spec: &FormSpec, x: i32, y: i32, w: i32, scroll: i32) -> SolvedForm {
+    let page = Rect::new(x, y, w, PAGE_HEADER_H + FORM_VIRTUAL_H);
+    let mut layout = Layout::column().pad(0, Insets::all(L::PAD));
+    let _header = layout.leaf(0, Size::Fixed(PAGE_HEADER_H));
+    let body = layout.stack(0, Axis::Row, Size::Fill(1));
+    layout = layout.gap(body, L::GAP);
+    let column = layout.stack(body, Axis::Column, Size::Fill(1));
+
+    let mut cards = Vec::new();
+    let mut rows = Vec::new();
+    for (index, s) in spec.sections.iter().enumerate() {
+        let card_h = SECTION_HEAD + s.fields.len() as i32 * ROW_H + 12;
+        let card = layout.leaf(column, Size::Fixed(card_h));
+        if index > 0 {
+            layout = layout.lead(card, SECTION_GAP);
+        }
+        let inner = layout.stack(card, Axis::Column, Size::Fill(1));
+        layout = layout.pad(inner, Insets::xy(18, 0));
+        let _head = layout.leaf(inner, Size::Fixed(SECTION_HEAD));
+        for f in s.fields {
+            let id = layout.leaf(inner, Size::Fixed(ROW_H));
+            rows.push((f.key, f.kind, id));
+        }
+        cards.push(card);
+    }
+    // The side column is a sibling of the field column, so it does not scroll.
+    let _side = layout.stack(body, Axis::Column, Size::Fixed(SIDE_W));
+
+    let mut solved = layout.solve(page);
+    solved.shift(-scroll);
+    SolvedForm {
+        solved,
+        cards,
+        rows,
+    }
+}
+
+/// Height the field column is solved against. A form is taller than any window,
+/// so the tree is laid out at its natural height and the visible window is taken
+/// by clipping; a value larger than any real form is enough.
+const FORM_VIRTUAL_H: i32 = 4096;
 
 fn page_y_start(page_y: i32, pad: i32) -> i32 {
     // Heading block (64) + rule + 20px of air, matching `page_header`.
@@ -664,16 +725,13 @@ fn mark_dirty(st: &Rc<RefCell<FormState>>, key: &str) {
 // ---------------------------------------------------------------------------
 
 /// One page rectangle, so the paint helpers take geometry as a unit.
-#[derive(Clone, Copy)]
-struct Rect {
-    x: i32,
-    y: i32,
-    w: i32,
-    h: i32,
-}
+///
+/// This *is* [`crate::ui::layout::Rect`] — the type the layout tree hands out —
+/// so a rectangle never has to be converted between two shapes.
+type PageRect = Rect;
 
-fn paint(spec: &FormSpec, rect: Rect, s: &FormState, origin_x: i32) {
-    let Rect { x, y, w, h } = rect;
+fn paint(spec: &FormSpec, rect: PageRect, s: &FormState, origin_x: i32) {
+    let (x, y, w, h) = (rect.x, rect.y, rect.w, rect.h);
     th::fill(x, y, w, h, C::BG);
     let pad = L::PAD;
     let content_x = x + pad;

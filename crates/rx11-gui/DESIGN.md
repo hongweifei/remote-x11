@@ -217,16 +217,19 @@ solve(Rect) -> Solved                 求解；solved.get(id) 取回矩形
 
 尺寸三态：`Fixed(n)` 精确占据、`Hug(n)` 内容需要多少就多少（装不下时让位，这是它的契约而非错误）、`Fill(w)` 按权重瓜分剩余空间。子项**永远不会**越出容器：固定尺寸之和超出时，`Solved::overflow()` 报真、靠后的子项被压缩。这一条是有意的——"画到容器外面"正是这套东西要消灭的症状。
 
-页面文件里因此不再出现 `+ Metrics::…` 形式的坐标推算；`console/mod.rs`、`logs.rs`、`shell.rs` 里的手算坐标已清零。每个页面一个 `build_layout`，`Rect` 按语义命名（`session_card`、`row_area`、`column_rects`）。
+页面文件里因此不再出现 `+ Metrics::…` 形式的坐标推算；`console/mod.rs`、`logs.rs`、`form/mod.rs`、`shell.rs` 里的手算坐标已清零。每个页面一个 `build_layout`（表单页是 `form_layout`），`Rect` 按语义命名（`session_card`、`row_area`、`column_rects`）。
 
-**判据（改版面时照做）**：几何函数是纯函数，不依赖 FLTK 绘制，所以能直接断言。`ui/layout.rs` 有 10 条不变量测试（子项不越界、权重分布、Hug 让位、容量），`console/geometry.rs` 把总览页的卡片栈**钉成具体数字**——它迁移前后必须逐像素等价，改坏了在测试里就红，不必等截图：
+滚动统一表达为**求解一次再平移**：表单页按内容的自然高度求解，`Solved::shift(-scroll)` 平移整棵树。滚动因此不会退化成第二套布局——正是这套东西要消灭的那种重复。
+
+**判据（改版面时照做）**：几何函数是纯函数，不依赖 FLTK 绘制，所以能直接断言。`ui/layout.rs` 有 11 条不变量测试（子项不越界、权重分布、Hug 让位、容量、平移保持相对几何），`console/geometry.rs` 把总览页的卡片栈**钉成具体数字**——它迁移前后必须逐像素等价，改坏了在测试里就红，不必等截图：
 
 ```rust
 assert_eq!(solved.get(geometry.sessions), Rect::new(22, 510, 900, 182));
 assert_eq!(area.y, 588, "首行在卡片顶下方 78");
 ```
 
-配置表单页（`form/`）**没有**改成布局树：它的 `geometry()` 已经是绘制与控件摆放的唯一来源，且四页共用一个声明式字段引擎，风险大于收益。这条是自觉的取舍，不是遗漏。
+表单页的 `geometry(spec, x, y, w, h, scroll)` **签名不变**：内部改走布局树，返回的 `SectionGeom`/`RowGeom` 数值与手算版一致，所以绘制与控件摆放的调用点一行未改。判据是四页截图逐区域 A/B——字段行、提示行、侧栏位置全部 AE=0。
+
 
 ### 6.6 演示数据的两个尺寸开关
 

@@ -421,6 +421,18 @@ impl Solved {
         self.rects[id]
     }
 
+    /// Move every solved rectangle down by `dy`.
+    ///
+    /// This is how scrolling is expressed: the tree is solved once against the
+    /// full content height, then the result is translated. Re-solving per scroll
+    /// tick would be a second layout, which is exactly what this module exists
+    /// to prevent.
+    pub fn shift(&mut self, dy: i32) {
+        for rect in self.rects.iter_mut() {
+            rect.y += dy;
+        }
+    }
+
     /// True when the tree asked for more space than its container had, i.e.
     /// some children were squeezed. Pages are designed to fit; this exists so a
     /// test can assert they do.
@@ -616,5 +628,27 @@ mod tests {
         assert_eq!(shifted, Rect::new(0, 50, 1000, 100));
         assert!(shifted.intersects(viewport));
         assert!(!shifted.inside(viewport), "partly visible is not inside");
+    }
+
+    /// `Solved::shift` moves the whole solution, so a scrolled page keeps the
+    /// relative geometry it was solved with.
+    #[test]
+    fn shift_translates_every_rectangle_together() {
+        let mut l = Layout::column().gap(0, 10);
+        let a = l.leaf(0, Size::Fixed(100));
+        let b = l.leaf(0, Size::Fixed(50));
+        let mut solved = l.solve(Rect::new(20, 30, 400, 300));
+        let before = (solved.get(a), solved.get(b));
+        solved.shift(-40);
+        let after = (solved.get(a), solved.get(b));
+        assert_eq!(after.0.y, before.0.y - 40);
+        assert_eq!(after.1.y, before.1.y - 40);
+        assert_eq!(
+            after.1.y - after.0.y,
+            before.1.y - before.0.y,
+            "the gap between rows is preserved"
+        );
+        assert_eq!(after.0.x, before.0.x, "only y moves");
+        assert_eq!(after.0.h, before.0.h);
     }
 }
