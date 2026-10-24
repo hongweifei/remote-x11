@@ -150,7 +150,7 @@ settings / launcher      领域与数据：config.toml 模型、进程内会话�
 | `model.rs` | 1 | `Backend` trait + `Role`/`Health`/`LogLevel` + 四个 DTO |
 | `theme/**` | 4 | `tokens`（唯一的设计令牌来源）/`fonts`/`draw`（唯一直接调 `fltk::draw` 的地方） |
 | `state.rs` | 1 | UI 线程独占的视图状态 |
-| `ui/**` | 18 | `mod`（`Page` 表面）/`layout`（声明式布局求解）/`chrome`/`action`/`controls`/`scope`/`scrollbar`/`shell`/`pages/*`（总览拆出 `console/{mod,geometry,scroll,tests}.rs`，表单拆出 `form/{mod,scroll,tests}.rs`，日志拆出 `logs/{mod,state}.rs`） |
+| `ui/**` | 20 | `mod`（`Page` 表面）/`kit`（交互基座：指针/键盘状态机、锚点拖拽、命中筛）/`layout`（声明式布局求解）/`chrome`/`action`/`controls`（骑在 kit 上的自绘控件）/`scope`/`scrollbar`（滚动条 + 两表共用的行窗口算术）/`shell`/`pages/*`（总览拆出 `console/{mod,geometry,scroll,tests}.rs`，表单拆出 `form/{mod,scroll,tests}.rs`，日志拆出 `logs/{mod,state}.rs`） |
 | `backend.rs` `demo.rs` | 2 | `Backend` 的两种实现 |
 | `app/**` | 3 | `mod`（外壳）/`actions`（动作翻译）/`tests` |
 
@@ -259,6 +259,59 @@ RX11_GUI_DEMO=1 RX11_GUI_DEMO_SESSIONS=12 RX11_GUI_DEMO_LOGS=200 \
 
 **验收装置与判据**（`target/follow/`，2026-10-23 建立）：Δ 端点表（指针位移对比滑块位移）**不可判别**——行量化与像素跟随都落在 ±2px 容差内，只作旁证。可判别量是 **1px 台阶扫描**：按住滑块后指针每步 1 设备像素、共 40 步，数滑块墨迹的平台数与跳幅。基线（改动前二进制）：40 步 → 24 个平台、16 步零位移、跳幅至 3px。改动后复跑：**总位移 40px（增益 1.0、零累积滞后）、跳幅 ≤2px**；剩余每 5 步一个零位移是事件流的设备↔逻辑像素量化（见 §5 第 13 条），已不是实现的台阶。样本判据全程生效：按住墨迹 487/337 亮度对、按住不动位移 ≤3px、跳幅 >8px 整轮作废；本轮 Δ 表与细扫描各一轮干净样本（`sweeps_used = 1`），隔离 HOME 建在 `target/` 下、用后即删。
 
+### 6.8 交互基座 ui/kit：自绘控件共用一套状态机（2026-10-24）
+
+用户问：FLTK 有成套控件与布局容器，为什么全自绘？自绘的东西为什么没封装成可复用组件？
+答案分两半，都落进了代码：
+
+**为什么不用 stock 控件与容器（记录理由）。** 这套绑定（fltk-rs 1.5.23 / FLTK 1.4.5）给的是：
+`button/input/output/browser/table/valuator/misc(Tooltip)` 控件族、`Pack/Flex/Grid/Scroll/Tabs`
+容器、原生文件选择器，以及自绘控件的官方机制——**没有 C++ 子类化，惯用法就是包一个 `Widget`
+装 `draw`/`handle` 闭包**。不采纳 stock 控件的理由：可换肤面只有颜色/内置边框槽/字体，画不出
+圆角、发丝描边、悬停混色（§2 的视觉语言）；`Fl_Scroll` 整组平移 + stock 滚动条与像素跟手的锚点
+模型、半行裁切互斥；容器各带边距会破坏「一个矩形只有一个几何源」。真实控件留在四处：
+`DoubleWindow`、`Group`（页表面）、`Input`（文本编辑）、`Choice`（弹菜单）——重实现代价大于换肤
+代价的才交给 FLTK。批评真正成立的欠账是三件：**交互状态机遍地手写**（Enter/Leave/Push/Drag/
+Released 手写共 8 份）、**行窗口算术两表各一份**、**键盘可达性缺失**（自绘按钮 `clear_visible_focus`、
+无 tooltip、无快捷键）。本节就是这三件欠账的收口。
+
+**基座形状。** `ui/kit.rs` 三件套：`Interactive<S>`（在绑定惯用机制上的一台状态机——hover/press/
+focus 由基座维护，**翻转即强制重绘，构造上不可能忘记**；`Enter/Move/Leave/Push/Drag/Released/
+Wheel/KeyDown/Shortcut` 归一为 `Touch`，控件只回 `Hand`）；`ListSieve`（行列表的"按下与抬起同
+一行才算点击"，rail、topbar、会话表「停止」行共用）；`Grip`（锚点模型滚动拖拽 + `on_key` 键盘
+滚动，三页此前逐字复制三遍）。`Copy` 的状态（`Grip`/`ListSieve`）从页面 `RefCell` 里取出来跑完
+事件再写回，绕开"处理器持借用再进控件"的自死锁。迁移后**控件层不再有各自的手写事件机**：按钮、
+开关、rail、topbar、示波器全部骑在 `Interactive`/`ListSieve` 上；仍匹配原始 `Event` 的只剩两个
+「借用面」——页面背景（`ui/mod.rs` 的 `Page::on_input`，把事件归一成 `PageInput`）和会话表所在页组
+（`console/mod.rs`，子控件没消费的事件落到它），且它们都汇入同一个 `Grip`/`ListSieve`，不是再各造
+一套。
+
+**坐标约定（一条 FLTK 事实）。** `Fl_Group.cxx:95` 的 `send()` 只对**子窗口**平移事件坐标，
+普通子控件的 `handle` 里 `Fl::event_x()` 保持**窗口相对**——和绘制者是同一个空间。旧的
+`PageInput` 把指针换算成页相对、每页再各加回原点（表单页就因此错位过一整页，`d2c943c` 修的），
+现在整棵树一个约定：**事件坐标就是绘制坐标**，任何控件不许换算原点。顺带修掉 topbar 手写的
+命中判定 `r.contains(mx, r.y)`——它拿矩形自己的 y 当指针 y，纵向完全不看。
+
+**键盘可达性（照 FLTK 语义补齐）。** `Fl.cxx`：键盘事件发给 `Fl::focus()` 并沿父链冒泡；
+`Fl_Group` 的 Tab 遍历对每个子控件调 `take_focus()`，普通控件接受焦点的唯一方式是其
+`handle(Focus)` 返回真值（`Fl_Widget.cxx:150`）。基座据此实现：可聚焦控件保留 `visible_focus`
+（默认 Tab 可达，rail/topbar/scope 显式退出）；焦点环画一条琥珀发丝（琥珀=可操作，与 §2 规则
+一致）；**Enter/Space 与鼠标共用同一条 `Touch::Click` 激活路径**，控件只写一个激活口；滚动页
+背景可聚焦，方向键=一行、Page=一屏、Home/End=两端（`Grip::on_key`）；rail 支持 `Alt+1..6` 切页
+（快捷键走 `FL_SHORTCUT`，不需要 Tab 逐站走到）；tooltip 用 `set_tooltip` 挂在 FLTK 自己的计时器
+上，`theme::init` 把 tooltip 底色/字色/字体/延时并进设计语言。
+
+**行窗口算术共用。** 「像素偏移 → 行窗口」的除法式此前在日志井与会话表各抄一份（同功能两套实现，
+第三条布局基准的红线），收进 `scrollbar.rs` 的 `list_max_scroll`/`list_row_window`（纯几何、无
+FLTK 调用），两页按各自行高一行委托、页面测试继续钉自己的数字。委托时暴露并修掉会话表轨道一处
+不同源：注释声称"轨道横跨所画的行"，代码传的是求解高度 `area.h`——带内非整行余量会漏进轨道，
+现改为 `fit*ROW_H`，绘制带、按钮可见带、轨道、视口严格同矩形。
+
+**验收**：`target/follow/kbd_smoke.sh`（隔离 HOME、release 二进制）五项全过——K1 方向键滚动、
+K2 Home 顶/End 底、K3 PageUp 一屏、K4 Alt+6 切页、K5 六次 Tab 落在级别按钮 Enter 触发（切换后
+标签与行集同帧变化）；改坐标制后复跑 1px 台阶扫描无回归（40 步全走、`quanta=[1,2]`、零滞后、
+`sweeps_used=1`，§6.7 判据）。未做：tooltip 的界面截图取证（逻辑单点、随 GUI 冒烟可见）。
+
 ## 7. 验证证据
 
 以下是**最近一次**结构重构（第 6.4 节）之后重跑的记录；历史数字不往下传，要引用就重跑。
@@ -278,6 +331,8 @@ RX11_GUI_DEMO=1 RX11_GUI_DEMO_SESSIONS=12 RX11_GUI_DEMO_LOGS=200 \
 | 缺必填项路径 | 隔离 HOME 无 token，点"启动中继" | 状态栏红字 `启动服务端失败：未配置 server.token（服务端 token）`，不崩、不写盘 |
 | 滚动跟手（§6.7，2026-10-24） | `target/follow/thumb_probe.sh <改动后二进制> after --mode fine`（1px 台阶扫描，判据见 §6.7） | 基线 40 步 → 24 平台、16 零步、跳幅至 3px；改动后**总位移 40px、增益 1.0、跳幅 ≤2px**，剩余每 5 步 1 个零位移为事件流的设备↔逻辑像素量化（非实现台阶）；Δ 表四档误差均 1.0 设备像素（旁证，不可判别）；样本判据全过（`sweeps_used=1`，隔离 HOME 建在 `target/` 下、用后即删） |
 | 未读提示（§6.7，2026-10-24） | `logs/state.rs` 单元测试 + demo 截图 `target/gui-shots/scroll-logs-paused.png` | 离开底部→冻结水位、新行计数、回底清零、截断随移、筛选隐藏不计——五条测试钉住；demo 夹具不产生新行，截图为 N=0 分支（`已暂停跟随 · 滚到底部恢复`），N>0 分支的界面截图需真实后端，见 §8 |
+| 键盘可达性（§6.8，2026-10-24） | `target/follow/kbd_smoke.sh <release 二进制>`（xdotool 真键 + 整窗像素差） | 5/5：方向键滚动 AE≈2.95 万、Home/End 两端 AE≈305（回底）、PageUp 一屏 AE≈3 万、`Alt+6` 切页 AE≈7 万、六次 Tab 后 Enter 触发级别按钮 AE≈2.77 万；隔离 HOME 无残留 |
+| 跟手复验（§6.8 换坐标制之后，2026-10-24） | `target/follow/thumb_probe.sh <最终 release 二进制> kit2-fine --mode fine` | 40 步全部产生位移（`quanta=[1,2]`，无零位移死步）、总位移 40 设备像素、`max_lag_device=0`、`sweeps_used=1`——与 §6.7 验收同级，无回归 |
 
 截图（演示数据、1.25 倍缩放、**标记点对齐修复后于 2026-10-22 重拍**）：`链路总览`、`服务端`、`客户端`、`SSH 隧道`、`运行时`、`日志` 各一张 + 真实启动会话一张，几何钉死 1475×1000。
 
