@@ -17,7 +17,7 @@ use tokio::time::Interval;
 use tracing::{info, warn};
 
 use rx11_core::config::{BufferDefaults, FlowDefaults, RuntimeConfig, ServerDefaults};
-use rx11_core::dataplane::DataPlane;
+use rx11_core::dataplane::{DataPlane, DataPlaneSide, InboundOutcome};
 use rx11_core::flow::{Advertiser, FlowEdge};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::*;
@@ -47,7 +47,12 @@ pub(super) async fn handle_client(
         &runtime,
     )
     .await?;
-    let dataplane = DataPlane::new(handshake.features, handshake.compression, &runtime);
+    let dataplane = DataPlane::new(
+        DataPlaneSide::Relay,
+        handshake.features,
+        handshake.compression,
+        &runtime,
+    );
 
     if let Some(ref sid) = handshake.resume_session_id {
         info!(
@@ -75,7 +80,13 @@ pub(super) async fn handle_client(
     // batch while keeping idle-queue latency at one frame.
     let sender_task = tokio::spawn(drain_frames(outbound_rx, write_half));
 
+    // Two diff bases, one per direction: `incremental_cache` is what WE diff
+    // against when sending the picture down; `uplink_cache` is what inbound
+    // client diffs are applied against. They share nothing — on one
+    // `connection_id` the request stream and the reply stream are different
+    // byte streams at different offsets.
     let mut incremental_cache = ConnectionDataCache::from_runtime(&runtime);
+    let mut uplink_cache = ConnectionDataCache::from_runtime(&runtime);
     let mut audio_attached = false;
     let mut flow = FlowState {
         negotiated: dataplane.features.supports(Capability::FlowControl),
@@ -95,6 +106,7 @@ pub(super) async fn handle_client(
         heartbeat_deadline: tokio::time::Instant::now() + runtime.heartbeat_timeout,
         x11_event_tx: &x11_event_tx,
         incremental_cache: &mut incremental_cache,
+        uplink_cache: &mut uplink_cache,
         stats: &stats,
         audio: &audio,
         audio_attached: &mut audio_attached,
@@ -143,6 +155,10 @@ struct RelayContext<'a> {
     heartbeat_deadline: tokio::time::Instant,
     x11_event_tx: &'a mpsc::Sender<X11ConnToRelay>,
     incremental_cache: &'a mut ConnectionDataCache,
+    /// Receive-side diff base for the CLIENT uplink (application requests →
+    /// relay); kept separate from [`Self::incremental_cache`] because the
+    /// two directions of one channel are different byte streams.
+    uplink_cache: &'a mut ConnectionDataCache,
     stats: &'a Arc<ConnectionStats>,
     /// Shared capture hub; `audio_attached` pins at most one subscription
     /// per connection task (attached with the first successful session
@@ -354,9 +370,101 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
             info!("Session destroyed for display {}", disp);
             RelayAction::Continue
         }
-        Frame::StreamData(msg) => {
-            ctx.stats.add_bytes_received(msg.data.len() as u64);
-            forward_to_x11(ctx, msg.connection_id, msg.data).await
+        frame @ (Frame::StreamData(_)
+        | Frame::CompressedStreamData(_)
+        | Frame::IncrementalStreamData(_)
+        | Frame::CompressedIncrementalStreamData(_)) => {
+            // The client's uplink (application requests → relay). All four
+            // shapes ride the SAME policy chain that builds and parses the
+            // downlink — decode, diff-apply, decompress, savings accounting
+            // — so a diff frame is handled exactly once, here, and a shape
+            // this session never negotiated is refused INSIDE the chain
+            // (`Dropped`) instead of touching the cache.
+            //
+            // Ownership is checked against the channel the frame names
+            // BEFORE the frame may touch any per-connection state: a peer
+            // must not be able to poison another client's diff base or
+            // compression stream.
+            let Some(connection_id) = frame.connection_id() else {
+                warn!(
+                    "Client {} sent a data frame without a channel id; ignoring",
+                    ctx.transport_id
+                );
+                return RelayAction::Continue;
+            };
+            if !ctx
+                .session_mgr
+                .owns_connection(connection_id, ctx.transport_id)
+                .await
+            {
+                warn!(
+                    "Client {} sent {} for unowned {}",
+                    ctx.transport_id,
+                    frame.msg_type(),
+                    connection_id
+                );
+                return RelayAction::Continue;
+            }
+            match ctx
+                .dataplane
+                .apply_inbound(frame, ctx.uplink_cache, ctx.stats)
+            {
+                InboundOutcome::Payload {
+                    connection_id,
+                    data,
+                } => forward_to_x11(ctx, connection_id, data).await,
+                InboundOutcome::ResyncRequired { connection_id } => {
+                    // Our receive base is out of sync: tell the client to
+                    // stop diffing this channel and resend whole payloads.
+                    // The bytes already delivered to the X server are
+                    // untouched — the hole self-heals forward, same promise
+                    // the client's downlink resync makes.
+                    if !ctx.dataplane.features.supports(Capability::RequestResync) {
+                        warn!(
+                            "Uplink diff desync on {} but resync was not negotiated; \
+                             the frame was dropped",
+                            connection_id
+                        );
+                        return RelayAction::Continue;
+                    }
+                    ctx.stats.add_incremental_full_fallback();
+                    info!(
+                        "Uplink diff desync on {}; asking client {} for full resend",
+                        connection_id, ctx.transport_id
+                    );
+                    // A control signal, so it rides the priority lane — never
+                    // queued behind the redraw burst on the bulk byte budget
+                    // (the flow-control structural law). A full-lane drop is
+                    // harmless: the next failed diff re-asks.
+                    if ctx
+                        .outbound
+                        .send_priority(Frame::StreamResyncRequest(StreamResyncRequestMessage {
+                            connection_id,
+                        }))
+                        .is_err()
+                    {
+                        warn!(
+                            "Resync request for {} lost on a full priority lane; \
+                             relying on the next diff to re-ask",
+                            connection_id
+                        );
+                    }
+                    RelayAction::Continue
+                }
+                InboundOutcome::StreamBroken => {
+                    // Those bytes are gone and the X server stream is
+                    // positional: keeping the session alive would corrupt
+                    // it. Drop the connection so the client reconnects
+                    // (resume rebuilds transports and the compression
+                    // stream).
+                    warn!(
+                        "Uplink decompression failed for {} — failing the client connection",
+                        connection_id
+                    );
+                    RelayAction::Disconnect
+                }
+                InboundOutcome::Dropped => RelayAction::Continue,
+            }
         }
         Frame::StreamResyncRequest(msg) => {
             if !ctx.dataplane.features.supports(Capability::RequestResync) {
@@ -382,63 +490,6 @@ async fn handle_inbound_frame(frame: Frame, ctx: &mut RelayContext<'_>) -> Relay
                 ctx.transport_id, msg.connection_id
             );
             ctx.incremental_cache.clear_connection(msg.connection_id);
-            RelayAction::Continue
-        }
-        Frame::CompressedStreamData(msg) => {
-            if !ctx
-                .session_mgr
-                .owns_connection(msg.connection_id, ctx.transport_id)
-                .await
-            {
-                warn!(
-                    "Client {} sent compressed data for unowned {}",
-                    ctx.transport_id, msg.connection_id
-                );
-                return RelayAction::Continue;
-            }
-            if ctx.dataplane.compression.is_none() {
-                warn!("CompressedStreamData received but no compression negotiated, dropping");
-                return RelayAction::Continue;
-            }
-            ctx.stats.add_bytes_received(msg.data.len() as u64);
-            match ctx
-                .dataplane
-                .decompress_payload(&msg.data, msg.original_len)
-            {
-                Some(decompressed) => {
-                    match ctx
-                        .session_mgr
-                        .route_to_x11(msg.connection_id, ctx.transport_id)
-                        .await
-                    {
-                        Some((sender, flow)) => {
-                            deliver_charged(
-                                ctx,
-                                sender,
-                                flow,
-                                msg.connection_id,
-                                bytes::Bytes::from(decompressed),
-                            )
-                            .await
-                        }
-                        None => warn!(
-                            "Client {} routed compressed data for unowned {}",
-                            ctx.transport_id, msg.connection_id
-                        ),
-                    }
-                }
-                None => {
-                    // Those bytes are gone and the X server stream is
-                    // positional: keep the session alive would corrupt it.
-                    // Drop the connection so the client reconnects (resume
-                    // rebuilds transports and the compression stream).
-                    warn!(
-                        "Decompression failed for {} — failing the client connection",
-                        msg.connection_id
-                    );
-                    return RelayAction::Disconnect;
-                }
-            }
             RelayAction::Continue
         }
         Frame::HeartbeatAck => {
@@ -655,7 +706,12 @@ async fn handle_x11_event(
             ctx.session_mgr
                 .unregister_x11_connection(connection_id)
                 .await;
+            // Both bases for this channel die with it: our downlink send
+            // base and the uplink receive base we keep for the client's
+            // diffs. Freed memory, and a recycled ConnectionId can never
+            // apply a stale base.
             ctx.incremental_cache.clear_connection(connection_id);
+            ctx.uplink_cache.clear_connection(connection_id);
             ctx.flow.advertiser.forget(connection_id);
             ctx.flow.peer_paused.remove(&connection_id);
             ctx.stats.dec_x11_connections();

@@ -13,7 +13,7 @@ use tokio::io::{duplex, DuplexStream};
 use rx11_core::auth::generate_token;
 use rx11_core::compress::CompressionAlgo;
 use rx11_core::config::RuntimeConfig;
-use rx11_core::dataplane::{DataPlane, InboundOutcome};
+use rx11_core::dataplane::{DataPlane, DataPlaneSide, InboundOutcome};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{
     client_handshake, decode_frame, encode_frame, server_handshake, Capability, ConnectionMode,
@@ -32,8 +32,19 @@ fn all_features() -> Features {
     Features::from_list(&Capability::advertised())
 }
 
-fn test_dataplane(compression: Option<CompressionAlgo>) -> DataPlane {
-    DataPlane::new(all_features(), compression, &RuntimeConfig::default())
+fn test_dataplane(side: DataPlaneSide) -> DataPlane {
+    DataPlane::new(side, all_features(), None, &RuntimeConfig::default())
+}
+
+/// Same, with the algorithm the default handshake negotiates — for tests
+/// where compression stacks on top of the diff frames.
+fn test_dataplane_zstd(side: DataPlaneSide) -> DataPlane {
+    DataPlane::new(
+        side,
+        all_features(),
+        Some(CompressionAlgo::ZstdStream),
+        &RuntimeConfig::default(),
+    )
 }
 
 struct Session {
@@ -205,14 +216,18 @@ async fn client_recv(s: &mut Session) -> Frame {
     s.client_rx.recv_frame().await.unwrap()
 }
 
+async fn relay_recv(s: &mut Session) -> Frame {
+    s.relay_rx.recv_frame().await.unwrap()
+}
+
 #[tokio::test]
 async fn data_plane_diff_and_self_heal_over_the_wire() {
     let (mut session, features, _compression) = negotiated_session().await;
     assert!(features.supports(Capability::Incremental));
     assert!(features.supports(Capability::RequestResync));
 
-    let server_dp = test_dataplane(None);
-    let client_dp = test_dataplane(None);
+    let server_dp = test_dataplane(DataPlaneSide::Relay);
+    let client_dp = test_dataplane(DataPlaneSide::Client);
     // Chunk 1024 on a 2048-byte payload: one chunked region changes per step.
     let mut server_cache = ConnectionDataCache::with_chunk_size(1024);
     let mut client_cache = ConnectionDataCache::new();
@@ -342,13 +357,200 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
     );
 }
 
+/// The CLIENT's request stream (local X server → relay) goes through the
+/// same chain as the picture, mirrored: diffs ride the wire once
+/// `incremental_uplink` negotiated, compression stacks on top of them
+/// (0x23), and a desync self-heals back the other way.
+#[tokio::test]
+async fn uplink_diff_compression_and_self_heal_over_the_wire() {
+    let (mut session, features, compression) = negotiated_session().await;
+    // Defaults negotiate the whole data-plane family in both directions,
+    // and the best mutual algorithm — stream zstd, which stacks on diffs.
+    assert!(features.supports(Capability::Incremental));
+    assert!(features.supports(Capability::IncrementalUplink));
+    assert_eq!(compression, Some(CompressionAlgo::ZstdStream));
+
+    let client_dp = test_dataplane_zstd(DataPlaneSide::Client);
+    let relay_dp = test_dataplane_zstd(DataPlaneSide::Relay);
+    let mut uplink_cache = ConnectionDataCache::with_chunk_size(1024);
+    let mut relay_receive_cache = ConnectionDataCache::new();
+    let client_stats = ConnectionStats::new();
+    let relay_stats = ConnectionStats::new();
+    let conn = ConnectionId::new(9);
+
+    // A high-entropy-ish base so the stream compressor has real content to
+    // carry; mostly-unchanged afterwards so the DIFFER sees savings.
+    fn payload(seed: u8) -> Vec<u8> {
+        (0..2048u32)
+            .map(|j| ((j * 31 + seed as u32 * 7) % 251) as u8 ^ seed)
+            .collect()
+    }
+
+    // 1) First payload: no base yet → whole payload over the wire,
+    //    compressed (the plain frame never becomes a diff).
+    let first = payload(1);
+    let seq = uplink_cache.next_sequence_for(conn);
+    let frame = client_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(first.clone()),
+        Some(&mut uplink_cache),
+        Some(&client_stats),
+    );
+    assert!(matches!(frame, Frame::CompressedStreamData(_)), "{frame:?}");
+    session.client_tx.send_frame(&frame).await.unwrap();
+    match relay_dp.apply_inbound(
+        relay_recv(&mut session).await,
+        &mut relay_receive_cache,
+        &relay_stats,
+    ) {
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(first.clone())),
+        other => panic!("expected payload, got {other:?}"),
+    }
+
+    // 2) Mostly-identical payload → diff frame, and stream compression
+    //    stacks on it: shape 0x23 on the wire. The changed region is
+    //    deliberately wider than the compression threshold so the encoded
+    //    diff is big enough for the compressor to take it at all.
+    let mut second = payload(1);
+    second[1500..1900].fill(0xA5);
+    let seq = uplink_cache.next_sequence_for(conn);
+    let frame = client_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(second.clone()),
+        Some(&mut uplink_cache),
+        Some(&client_stats),
+    );
+    assert!(
+        matches!(frame, Frame::CompressedIncrementalStreamData(_)),
+        "expected compressed diff, got {frame:?}"
+    );
+    session.client_tx.send_frame(&frame).await.unwrap();
+    match relay_dp.apply_inbound(
+        relay_recv(&mut session).await,
+        &mut relay_receive_cache,
+        &relay_stats,
+    ) {
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(second.clone())),
+        other => panic!("expected payload, got {other:?}"),
+    }
+
+    // 3) The RELAY loses its receive base (channel reset, restart, any
+    //    reason): the next diff cannot apply → resync request travels back
+    //    over the wire relay→client, and the client pump drops its send base.
+    relay_receive_cache.clear_connection(conn);
+    let mut third = second.clone();
+    third[100..500].fill(0x33);
+    let seq = uplink_cache.next_sequence_for(conn);
+    let frame = client_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(third.clone()),
+        Some(&mut uplink_cache),
+        Some(&client_stats),
+    );
+    assert!(matches!(frame, Frame::CompressedIncrementalStreamData(_)));
+    session.client_tx.send_frame(&frame).await.unwrap();
+    match relay_dp.apply_inbound(
+        relay_recv(&mut session).await,
+        &mut relay_receive_cache,
+        &relay_stats,
+    ) {
+        InboundOutcome::ResyncRequired { connection_id } => assert_eq!(connection_id, conn),
+        other => panic!("expected ResyncRequired, got {other:?}"),
+    }
+    // Mirror of relay::connection's handler: stats fallback + the request
+    // frame on its way back to the client.
+    relay_stats.add_incremental_full_fallback();
+    session
+        .relay_tx
+        .send_frame(&Frame::StreamResyncRequest(StreamResyncRequestMessage {
+            connection_id: conn,
+        }))
+        .await
+        .unwrap();
+    match client_recv(&mut session).await {
+        Frame::StreamResyncRequest(m) => {
+            assert_eq!(m.connection_id, conn);
+            // The pump's response (proxy::uplink): drop the base so the
+            // next payload ships whole.
+            uplink_cache.clear_connection(conn);
+        }
+        other => panic!("expected StreamResyncRequest at client, got {other:?}"),
+    }
+
+    // 4) Next payload is a compressed WHOLE frame again (no base to diff
+    //    against), and it re-establishes the receive base for future diffs.
+    let seq = uplink_cache.next_sequence_for(conn);
+    let frame = client_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(third.clone()),
+        Some(&mut uplink_cache),
+        Some(&client_stats),
+    );
+    assert!(matches!(frame, Frame::CompressedStreamData(_)), "{frame:?}");
+    session.client_tx.send_frame(&frame).await.unwrap();
+    match relay_dp.apply_inbound(
+        relay_recv(&mut session).await,
+        &mut relay_receive_cache,
+        &relay_stats,
+    ) {
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(third.clone())),
+        other => panic!("expected payload after resync, got {other:?}"),
+    }
+
+    // 5) And a diff right after the reset applies cleanly — the loop is
+    //    self-healing in BOTH directions now. The change stays inside one
+    //    1024-byte diff block so the diff clears the savings ratio.
+    let mut fourth = third.clone();
+    fourth[200..600].fill(0x77);
+    let seq = uplink_cache.next_sequence_for(conn);
+    let frame = client_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(fourth.clone()),
+        Some(&mut uplink_cache),
+        Some(&client_stats),
+    );
+    assert!(matches!(frame, Frame::CompressedIncrementalStreamData(_)));
+    session.client_tx.send_frame(&frame).await.unwrap();
+    match relay_dp.apply_inbound(
+        relay_recv(&mut session).await,
+        &mut relay_receive_cache,
+        &relay_stats,
+    ) {
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(fourth)),
+        other => panic!("expected payload, got {other:?}"),
+    }
+
+    // The client sent three compressed diffs (steps 2, 3, 5); the relay
+    // applied two payloads and fell back exactly once.
+    let client_summary = client_stats.summary();
+    assert!(
+        client_summary.contains("Incremental: 3 frames"),
+        "{client_summary}"
+    );
+    let relay_summary = relay_stats.summary();
+    assert!(
+        relay_summary.contains("Incremental: 2 frames") && relay_summary.contains("1 fallbacks"),
+        "{relay_summary}"
+    );
+}
+
 #[tokio::test]
 async fn feature_gated_dataplane_never_emits_diffs() {
     // Same caches, but Incremental not negotiated: every frame is plain or
     // compressed, matching what an older/feature-restricted peer would get.
     // Everything except Incremental.
     let features = Features::from_list(&["request_resync".to_string(), "flow_control".to_string()]);
-    let dp = DataPlane::new(features, None, &RuntimeConfig::default());
+    let dp = DataPlane::new(
+        DataPlaneSide::Relay,
+        features,
+        None,
+        &RuntimeConfig::default(),
+    );
     let mut cache = ConnectionDataCache::new();
     let conn = ConnectionId::new(3);
     let first = vec![0u8; 2048];

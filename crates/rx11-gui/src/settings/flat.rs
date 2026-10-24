@@ -330,6 +330,7 @@ impl Section for RuntimeSection {
         "diff_chunk_size",
         "diff_min_block_size",
         "diff_min_savings_ratio",
+        "incremental_uplink",
         "outbound_queue_bytes",
         "tcp_send_buffer_bytes",
         "image_recode",
@@ -354,6 +355,7 @@ impl Section for RuntimeSection {
             "diff_chunk_size" => self.diff_chunk_size.map(|v| v.to_string()),
             "diff_min_block_size" => self.diff_min_block_size.map(|v| v.to_string()),
             "diff_min_savings_ratio" => self.diff_min_savings_ratio.map(|v| v.to_string()),
+            "incremental_uplink" => self.incremental_uplink.map(|v| v.to_string()),
             "outbound_queue_bytes" => self.outbound_queue_bytes.map(|v| v.to_string()),
             "tcp_send_buffer_bytes" => self.tcp_send_buffer_bytes.map(|v| v.to_string()),
             "image_recode" => self.image_recode.map(|v| v.to_string()),
@@ -384,6 +386,7 @@ impl Section for RuntimeSection {
             "diff_chunk_size" => opt_field!(self, diff_chunk_size, raw, parse_usize),
             "diff_min_block_size" => opt_field!(self, diff_min_block_size, raw, parse_usize),
             "diff_min_savings_ratio" => opt_field!(self, diff_min_savings_ratio, raw, parse_f64),
+            "incremental_uplink" => opt_field!(self, incremental_uplink, raw, parse_bool),
             "outbound_queue_bytes" => opt_field!(self, outbound_queue_bytes, raw, parse_usize),
             "tcp_send_buffer_bytes" => opt_field!(self, tcp_send_buffer_bytes, raw, parse_usize),
             "image_recode" => opt_field!(self, image_recode, raw, parse_bool),
@@ -417,6 +420,7 @@ impl Section for RuntimeSection {
         set_usize(table, "diff_chunk_size", self.diff_chunk_size);
         set_usize(table, "diff_min_block_size", self.diff_min_block_size);
         set_float(table, "diff_min_savings_ratio", self.diff_min_savings_ratio);
+        set_bool(table, "incremental_uplink", self.incremental_uplink);
         set_usize(table, "outbound_queue_bytes", self.outbound_queue_bytes);
         set_usize(table, "tcp_send_buffer_bytes", self.tcp_send_buffer_bytes);
         set_bool(table, "image_recode", self.image_recode);
@@ -558,7 +562,7 @@ mod tests {
     #[test]
     fn all_field_keys_are_unique_and_dotted() {
         let keys = all_field_keys();
-        assert_eq!(keys.len(), 4 + 3 + 9 + 20, "四段字段总数");
+        assert_eq!(keys.len(), 4 + 3 + 9 + 21, "四段字段总数");
         let mut sorted = keys.clone();
         sorted.sort();
         sorted.dedup();

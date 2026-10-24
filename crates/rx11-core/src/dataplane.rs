@@ -2,9 +2,14 @@
 //! an inbound data frame becomes payload again.
 //!
 //! Both ends build a [`DataPlane`] from the negotiated [`Features`] +
-//! [`RuntimeConfig`], so:
+//! [`RuntimeConfig`], tagged with the [`DataPlaneSide`] it sits on, so:
 //! - diff/compression decisions are **capability-gated**, not guessed from
 //!   whatever frame arrives;
+//! - the diff policy is **per direction**: `incremental` covers the picture
+//!   (relay → client, the plane's send side when `side == Relay`), while
+//!   `incremental_uplink` opens the application request stream
+//!   (client → relay). A receiver refuses a diff shape its side never
+//!   negotiated instead of letting it touch the cache;
 //! - savings accounting happens at one place (frame construction), keeping
 //!   server and client stats semantics symmetric;
 //! - adding a new data-plane stage (e.g. a future retransmit window or
@@ -73,17 +78,34 @@ impl std::fmt::Debug for ZstdContexts {
     }
 }
 
+/// Which end of the relay link a [`DataPlane`] sits on. One instance serves
+/// exactly one send direction and one receive direction (the relay plane
+/// sends the picture and receives requests; the client plane is the mirror),
+/// so the diff policy per direction derives from this instead of from a
+/// guess about which frames happen to arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataPlaneSide {
+    /// The server end: diffs the downlink picture on `incremental`, and
+    /// accepts uplink diffs only when the peer also negotiated
+    /// `incremental_uplink`.
+    Relay,
+    /// The client end: the mirror image of [`Self::Relay`].
+    Client,
+}
+
 /// Negotiated data-plane configuration for one relay session.
 #[derive(Debug, Clone)]
 pub struct DataPlane {
     pub features: Features,
     pub compression: Option<CompressionAlgo>,
     pub compression_threshold: usize,
+    side: DataPlaneSide,
     zstd: std::sync::Arc<ZstdContexts>,
 }
 
 impl DataPlane {
     pub fn new(
+        side: DataPlaneSide,
         features: Features,
         compression: Option<CompressionAlgo>,
         runtime: &RuntimeConfig,
@@ -92,8 +114,29 @@ impl DataPlane {
             features,
             compression,
             compression_threshold: runtime.compression_threshold,
+            side,
             zstd: std::sync::Arc::new(ZstdContexts::default()),
         }
+    }
+
+    /// May this plane emit `IncrementalStreamData` / compressed diffs?
+    /// The frame family rides `incremental`; `incremental_uplink` is what
+    /// opens the request stream (the client's send direction) on top of it.
+    /// Public because the uplink pump decides with it whether to keep a
+    /// diff base at all — the receiver still re-checks on arrival.
+    pub fn may_diff_send(&self) -> bool {
+        self.features.supports(Capability::Incremental)
+            && (self.side == DataPlaneSide::Relay
+                || self.features.supports(Capability::IncrementalUplink))
+    }
+
+    /// May this plane *apply* an inbound diff frame? Mirror of
+    /// [`Self::may_diff_send`]: a receiver that never negotiated the shape
+    /// refuses it outright rather than letting it touch the cache.
+    pub fn may_diff_receive(&self) -> bool {
+        self.features.supports(Capability::Incremental)
+            && (self.side == DataPlaneSide::Client
+                || self.features.supports(Capability::IncrementalUplink))
     }
 
     fn compress(&self, data: &[u8]) -> Option<Bytes> {
@@ -297,7 +340,7 @@ impl DataPlane {
         stats: Option<&ConnectionStats>,
     ) -> Frame {
         let original_len = data.len();
-        let frame = match (self.features.supports(Capability::Incremental), cache) {
+        let frame = match (self.may_diff_send(), cache) {
             (true, Some(cache)) => {
                 let diff = cache.compute_incremental_owned(connection_id, sequence_id, &data);
                 cache.update_cache_owned(connection_id, sequence_id, data.clone());
@@ -315,16 +358,23 @@ impl DataPlane {
     }
 
     /// Decode one inbound data frame, maintaining `cache` and inbound stats.
+    /// The receive base is only maintained while THIS direction can see diff
+    /// frames ([`Self::may_diff_receive`]): a plain frame is the base a later
+    /// diff applies against, and caching payloads that can never be a base
+    /// would be pure memory cost.
     pub fn apply_inbound(
         &self,
         frame: Frame,
         cache: &mut ConnectionDataCache,
         stats: &ConnectionStats,
     ) -> InboundOutcome {
+        let keep_base = self.may_diff_receive();
         match frame {
             Frame::StreamData(msg) => {
                 stats.add_bytes_received(msg.data.len() as u64);
-                cache.update_cache_owned(msg.connection_id, msg.sequence_id, msg.data.clone());
+                if keep_base {
+                    cache.update_cache_owned(msg.connection_id, msg.sequence_id, msg.data.clone());
+                }
                 InboundOutcome::Payload {
                     connection_id: msg.connection_id,
                     data: msg.data,
@@ -349,14 +399,34 @@ impl DataPlane {
                 stats.add_compression_saved(original_len.saturating_sub(compressed_len) as u64);
                 let data = Bytes::from(decompressed);
                 stats.add_bytes_received(data.len() as u64);
-                cache.update_cache_owned(conn, seq, data.clone());
+                if keep_base {
+                    cache.update_cache_owned(conn, seq, data.clone());
+                }
                 InboundOutcome::Payload {
                     connection_id: conn,
                     data,
                 }
             }
-            Frame::IncrementalStreamData(msg) => self.apply_diff(msg, cache, stats),
+            Frame::IncrementalStreamData(msg) => {
+                if !self.may_diff_receive() {
+                    tracing::warn!(
+                        "IncrementalStreamData for {} but this direction never negotiated diffs, \
+                         dropping",
+                        msg.connection_id
+                    );
+                    return InboundOutcome::Dropped;
+                }
+                self.apply_diff(msg, cache, stats)
+            }
             Frame::CompressedIncrementalStreamData(msg) => {
+                if !self.may_diff_receive() {
+                    tracing::warn!(
+                        "CompressedIncrementalStreamData for {} but this direction never \
+                         negotiated diffs, dropping",
+                        msg.connection_id
+                    );
+                    return InboundOutcome::Dropped;
+                }
                 if self.compression.is_none() {
                     tracing::warn!(
                         "CompressedIncrementalStreamData but no compression negotiated, dropping"
@@ -469,7 +539,7 @@ mod tests {
 
     #[test]
     fn plain_payload_without_compression_yields_data_frame() {
-        let dp = DataPlane::new(Features::default(), None, &runtime());
+        let dp = DataPlane::new(DataPlaneSide::Relay, Features::default(), None, &runtime());
         let frame = dp.build_frame(conn(), 1, Bytes::from_static(b"hello"), None, None);
         assert!(matches!(frame, Frame::StreamData(_)));
     }
@@ -479,7 +549,7 @@ mod tests {
         let mut cache = ConnectionDataCache::new();
         let big = vec![0u8; 4096];
         cache.update_cache(conn(), 1, &big);
-        let dp = DataPlane::new(Features::default(), None, &runtime());
+        let dp = DataPlane::new(DataPlaneSide::Relay, Features::default(), None, &runtime());
         let frame = dp.build_frame(conn(), 2, Bytes::from(big.clone()), Some(&mut cache), None);
         // no Incremental capability ⇒ plain frame, not a diff
         assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
@@ -488,7 +558,7 @@ mod tests {
     #[test]
     fn diff_produced_when_capability_and_savings_align() {
         let mut cache = ConnectionDataCache::with_chunk_size(1024);
-        let dp = DataPlane::new(all_features(), None, &runtime());
+        let dp = DataPlane::new(DataPlaneSide::Relay, all_features(), None, &runtime());
         let old = vec![0u8; 2048];
         let mut new = vec![0u8; 2048];
         new[1500..1600].fill(1);
@@ -546,7 +616,7 @@ mod tests {
 
     #[test]
     fn inbound_plain_updates_cache_and_stats() {
-        let dp = DataPlane::new(all_features(), None, &runtime());
+        let dp = DataPlane::new(DataPlaneSide::Relay, all_features(), None, &runtime());
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(
@@ -571,7 +641,7 @@ mod tests {
 
     #[test]
     fn inbound_stale_diff_requests_resync() {
-        let dp = DataPlane::new(all_features(), None, &runtime());
+        let dp = DataPlane::new(DataPlaneSide::Relay, all_features(), None, &runtime());
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(
@@ -601,7 +671,7 @@ mod tests {
 
     #[test]
     fn inbound_compressed_without_negotiation_is_dropped() {
-        let dp = DataPlane::new(Features::default(), None, &runtime());
+        let dp = DataPlane::new(DataPlaneSide::Relay, Features::default(), None, &runtime());
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(
@@ -617,14 +687,128 @@ mod tests {
         assert_eq!(outcome, InboundOutcome::Dropped);
     }
 
+    fn uplink_features() -> Features {
+        // Downlink diffs + resync, but the request stream was never opened:
+        // exactly what a relay negotiates with an older client.
+        Features::from_list(&["incremental".to_string(), "request_resync".to_string()])
+    }
+
+    #[test]
+    fn client_plane_without_uplink_cap_never_diffs_send() {
+        let mut cache = ConnectionDataCache::with_chunk_size(1024);
+        let dp = DataPlane::new(DataPlaneSide::Client, uplink_features(), None, &runtime());
+        let old = vec![0u8; 2048];
+        let mut new = vec![0u8; 2048];
+        new[1500..1600].fill(1);
+        cache.update_cache(conn(), 1, &old);
+        assert!(!dp.may_diff_send());
+        let frame = dp.build_frame(conn(), 2, Bytes::from(new), Some(&mut cache), None);
+        assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
+    }
+
+    #[test]
+    fn relay_plane_accepts_uplink_diffs_only_when_negotiated() {
+        let base = Bytes::from(vec![0u8; 2048]);
+        let make_diff = || {
+            Frame::IncrementalStreamData(IncrementalStreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 2,
+                base_sequence_id: 1,
+                total_len: 2048,
+                chunks: vec![crate::protocol::IncrementalChunk {
+                    offset: 1500,
+                    length: 100,
+                    data: Bytes::from(vec![1u8; 100]),
+                }],
+            })
+        };
+
+        // Uplink never negotiated: the shape is refused before it can touch
+        // the receive base — a peer must not dictate cache churn.
+        let dp = DataPlane::new(DataPlaneSide::Relay, uplink_features(), None, &runtime());
+        let mut cache = ConnectionDataCache::new();
+        let stats = ConnectionStats::new();
+        let outcome = dp.apply_inbound(make_diff(), &mut cache, &stats);
+        assert_eq!(outcome, InboundOutcome::Dropped);
+        // And plain frames are not cached either: no base can form.
+        let outcome = dp.apply_inbound(
+            Frame::StreamData(StreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 3,
+                data: base.clone(),
+            }),
+            &mut cache,
+            &stats,
+        );
+        assert!(matches!(outcome, InboundOutcome::Payload { .. }));
+        assert_eq!(cache.get_cached(conn()), None);
+
+        // Negotiated: the same diff applies against the base maintained from
+        // the plain frame before it.
+        let dp = DataPlane::new(DataPlaneSide::Relay, all_features(), None, &runtime());
+        let mut cache = ConnectionDataCache::new();
+        dp.apply_inbound(
+            Frame::StreamData(StreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 1,
+                data: base.clone(),
+            }),
+            &mut cache,
+            &stats,
+        );
+        let outcome = dp.apply_inbound(make_diff(), &mut cache, &stats);
+        match outcome {
+            InboundOutcome::Payload { data, .. } => {
+                assert_eq!(data.len(), 2048);
+                assert_eq!(&data[1500..1600], &[1u8; 100][..]);
+            }
+            other => panic!("expected payload, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compressed_uplink_diff_without_negotiation_is_dropped() {
+        // The compressed wrapper must meet the SAME direction gate as the
+        // plain diff — checked before any decompression happens.
+        let dp = DataPlane::new(
+            DataPlaneSide::Relay,
+            uplink_features(),
+            Some(CompressionAlgo::ZstdStream),
+            &runtime(),
+        );
+        let mut cache = ConnectionDataCache::new();
+        let stats = ConnectionStats::new();
+        let outcome = dp.apply_inbound(
+            Frame::CompressedIncrementalStreamData(CompressedIncrementalStreamDataMessage {
+                connection_id: conn(),
+                sequence_id: 2,
+                original_len: 64,
+                data: Bytes::from_static(&[0x99; 32]),
+            }),
+            &mut cache,
+            &stats,
+        );
+        assert_eq!(outcome, InboundOutcome::Dropped);
+    }
+
     /// Streaming pair helper: sender and receiver DataPlanes that live for
     /// the whole "connection" — the same lifetime relationship the halves
     /// have in the real topology (one DataPlane per direction, per session).
     fn stream_pair() -> (DataPlane, DataPlane) {
         let rt = runtime();
         (
-            DataPlane::new(Features::default(), Some(CompressionAlgo::ZstdStream), &rt),
-            DataPlane::new(all_features(), Some(CompressionAlgo::ZstdStream), &rt),
+            DataPlane::new(
+                DataPlaneSide::Relay,
+                Features::default(),
+                Some(CompressionAlgo::ZstdStream),
+                &rt,
+            ),
+            DataPlane::new(
+                DataPlaneSide::Client,
+                all_features(),
+                Some(CompressionAlgo::ZstdStream),
+                &rt,
+            ),
         )
     }
 
@@ -688,7 +872,7 @@ mod tests {
         // Direct wire-byte comparison: sum the payload each mode emits.
         let rt = runtime();
         let sum = |algo: CompressionAlgo| -> usize {
-            let dp = DataPlane::new(Features::default(), Some(algo), &rt);
+            let dp = DataPlane::new(DataPlaneSide::Relay, Features::default(), Some(algo), &rt);
             frames
                 .iter()
                 .map(
@@ -731,7 +915,12 @@ mod tests {
     fn one_shot_decompression_failure_also_breaks_the_stream() {
         // Byte-stream truth does not care which mode: lost bytes are lost.
         let rt = runtime();
-        let dp = DataPlane::new(all_features(), Some(CompressionAlgo::Zstd), &rt);
+        let dp = DataPlane::new(
+            DataPlaneSide::Client,
+            all_features(),
+            Some(CompressionAlgo::Zstd),
+            &rt,
+        );
         let mut cache = ConnectionDataCache::new();
         let stats = ConnectionStats::new();
         let outcome = dp.apply_inbound(

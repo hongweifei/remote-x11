@@ -10,6 +10,7 @@ use bytes::{Bytes, BytesMut};
 use super::*;
 use crate::error::{Result, Rx11Error};
 use crate::protocol::messages::{validate_session_auto_create, validate_session_create};
+use crate::types::ConnectionId;
 
 macro_rules! define_frame_types {
     (
@@ -37,6 +38,26 @@ macro_rules! define_frame_types {
                     $( Frame::$JVar(_) => MessageType::$JVar, )*
                     $( Frame::$BVar(_) => MessageType::$BVar, )*
                     $( Frame::$EVar => MessageType::$EVar, )*
+                }
+            }
+
+            /// The multiplexed channel a frame belongs to, when it names one
+            /// (data-plane shapes, channel open/close, resync request, flow
+            /// control scope). Receivers check ownership against this BEFORE
+            /// letting the frame touch any per-connection state — an
+            /// unauthenticated peer must not be able to poison another
+            /// client's diff cache or compression stream.
+            pub fn connection_id(&self) -> Option<ConnectionId> {
+                match self {
+                    Frame::StreamData(m) => Some(m.connection_id),
+                    Frame::CompressedStreamData(m) => Some(m.connection_id),
+                    Frame::IncrementalStreamData(m) => Some(m.connection_id),
+                    Frame::CompressedIncrementalStreamData(m) => Some(m.connection_id),
+                    Frame::ChannelOpen(m) => Some(m.connection_id),
+                    Frame::ChannelClose(m) => Some(m.connection_id),
+                    Frame::StreamResyncRequest(m) => Some(m.connection_id),
+                    Frame::FlowControl(m) => m.connection_id,
+                    _ => None,
                 }
             }
 

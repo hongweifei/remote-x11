@@ -53,6 +53,7 @@ pub(super) fn full_config() -> GuiConfig {
             diff_chunk_size: Some(4096),
             diff_min_block_size: Some(1024),
             diff_min_savings_ratio: Some(0.25),
+            incremental_uplink: Some(true),
             outbound_queue_bytes: Some(1_048_576),
             tcp_send_buffer_bytes: Some(262_144),
             image_recode: Some(true),

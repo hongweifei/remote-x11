@@ -28,6 +28,7 @@ pub struct RuntimeFileConfig {
     pub diff_chunk_size: Option<usize>,
     pub diff_min_block_size: Option<usize>,
     pub diff_min_savings_ratio: Option<f64>,
+    pub incremental_uplink: Option<bool>,
     pub outbound_queue_bytes: Option<usize>,
     pub tcp_send_buffer_bytes: Option<usize>,
     pub image_recode: Option<bool>,
@@ -61,6 +62,9 @@ impl RuntimeFileConfig {
             diff_min_savings_ratio: self
                 .diff_min_savings_ratio
                 .unwrap_or(defaults.diff_min_savings_ratio),
+            incremental_uplink: self
+                .incremental_uplink
+                .unwrap_or(defaults.incremental_uplink),
             outbound_queue_bytes: self
                 .outbound_queue_bytes
                 .unwrap_or(defaults.outbound_queue_bytes),
@@ -165,6 +169,8 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # diff_chunk_size = 4096         # incremental diff granularity
 # diff_min_block_size = 1024     # frames below this are never diffed
 # diff_min_savings_ratio = 0.1   # min saved fraction to send a diff
+# incremental_uplink = true      # false = diff the picture only; the
+#                                # request stream then always ships whole
 #
 # Slow-WAN tuning (e.g. a 3 Mbit/s VPS). Compression is zstd-stream by
 # default: cross-frame history, flushed per frame so nothing waits for a

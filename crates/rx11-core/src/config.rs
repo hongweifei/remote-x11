@@ -130,6 +130,12 @@ pub struct RuntimeConfig {
     pub diff_min_block_size: usize,
     /// Minimum fraction of the base frame a diff must save to be sent.
     pub diff_min_savings_ratio: f64,
+    /// Diff the client uplink (application requests → relay) too, not only
+    /// the picture on the downlink. ON by default: the same chunk-diff +
+    /// compression chain keyed per channel, self-healing through
+    /// `StreamResyncRequest`. Set `false` on either end to keep the
+    /// downlink-only policy and ship uplink payloads whole.
+    pub incremental_uplink: bool,
     /// In-flight byte budget of the WAN-bound outbound queue (see
     /// [`BufferDefaults::OUTBOUND_QUEUE_BYTES`]).
     pub outbound_queue_bytes: usize,
@@ -187,6 +193,7 @@ impl Default for RuntimeConfig {
             diff_chunk_size: IncrementalDefaults::DEFAULT_CHUNK_SIZE,
             diff_min_block_size: IncrementalDefaults::MIN_BLOCK_SIZE_FOR_DIFF,
             diff_min_savings_ratio: IncrementalDefaults::MIN_SAVINGS_RATIO,
+            incremental_uplink: true,
             outbound_queue_bytes: BufferDefaults::OUTBOUND_QUEUE_BYTES,
             tcp_send_buffer_bytes: None,
             image_recode: true,

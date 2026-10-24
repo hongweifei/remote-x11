@@ -4,10 +4,13 @@
 //! Each connection carries its flow-control pair: a [`FlowMeter`] gauging
 //! downlink bytes accepted-but-not-written-to-the-local-X-server (its edges
 //! are advertised to the relay as pause/resume), and an [`EgressGate`] the
-//! uplink read awaits when the relay has paused this direction.
+//! uplink read awaits when the relay has paused this direction. It also
+//! carries an `uplink_reset` flag: the serve loop raises it when the relay
+//! reports a diff desync on our uplink, and the pump — sole owner of the
+//! uplink diff base — drops that base before building its next frame.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +22,7 @@ use tracing::{debug, error};
 use rx11_core::config::BufferDefaults;
 use rx11_core::dataplane::DataPlane;
 use rx11_core::flow::{EgressGate, FlowEdge, FlowMeter};
+use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{Capability, ChannelCloseMessage, Frame};
 use rx11_core::queue::OutboundSender;
 use rx11_core::stats::ConnectionStats;
@@ -26,7 +30,7 @@ use rx11_core::types::ConnectionId;
 use rx11_core::x11recode::DownstreamExpander;
 
 /// Live local X connections: `connection_id -> (write channel, pump task,
-/// downlink gauge, uplink gate)`.
+/// downlink gauge, uplink gate, uplink-diff reset flag)`.
 pub(crate) type X11ConnMap = HashMap<
     u32,
     (
@@ -34,6 +38,7 @@ pub(crate) type X11ConnMap = HashMap<
         JoinHandle<()>,
         Arc<FlowMeter>,
         Arc<EgressGate>,
+        Arc<AtomicBool>,
     ),
 >;
 pub(crate) type SharedX11Conns = Arc<tokio::sync::Mutex<X11ConnMap>>;
@@ -87,9 +92,12 @@ pub(crate) async fn spawn_local_connection(
 
     // Flow pair for this channel: the gauge below feeds pause/resume
     // advertisements; the gate is flipped by the serve loop when the relay
-    // pauses our uplink.
+    // pauses our uplink. `uplink_reset` is raised by the serve loop when the
+    // relay reports a desync on OUR diffs; the pump (its sole owner below)
+    // then drops the base and resends whole payloads.
     let meter = FlowMeter::from_runtime(deps.runtime);
     let gate = EgressGate::new();
+    let uplink_reset = Arc::new(AtomicBool::new(false));
 
     let outbound = deps.outbound.clone();
     let stats = Arc::clone(deps.stats);
@@ -99,6 +107,12 @@ pub(crate) async fn spawn_local_connection(
     let flow_edges = deps.flow_edges.clone();
     let pump_meter = Arc::clone(&meter);
     let pump_gate = Arc::clone(&gate);
+    let pump_reset = Arc::clone(&uplink_reset);
+    // The pump is the only owner of the uplink diff base, so the base (and
+    // the runtime knobs that parameterize it) move into the task. When the
+    // direction was not negotiated there is no base to keep at all.
+    let diffing = dataplane.may_diff_send();
+    let uplink_runtime = diffing.then(|| deps.runtime.clone());
 
     let handle = tokio::spawn(async move {
         let ctx = ProxyContext {
@@ -112,6 +126,8 @@ pub(crate) async fn spawn_local_connection(
             seq: &seq,
             meter: pump_meter,
             gate: pump_gate,
+            uplink_reset: pump_reset,
+            uplink_runtime,
             flow_edges,
         };
         pump_local_x11_connection(ctx).await;
@@ -128,7 +144,7 @@ pub(crate) async fn spawn_local_connection(
     deps.x11_connections
         .lock()
         .await
-        .insert(conn_id.get(), (write_tx, handle, meter, gate));
+        .insert(conn_id.get(), (write_tx, handle, meter, gate, uplink_reset));
     Ok(())
 }
 
@@ -148,6 +164,13 @@ struct ProxyContext<'a> {
     /// Uplink latch: while the relay holds it closed we do not read the
     /// local X server; its output stalls in kernel buffers, losslessly.
     gate: Arc<EgressGate>,
+    /// Raised by the serve loop when the relay could not apply one of our
+    /// diffs. Checked (and cleared) by the uplink arm before building the
+    /// next frame — a plain atomic, never a lock held across an await.
+    uplink_reset: Arc<AtomicBool>,
+    /// Some iff the uplink diff direction was negotiated; the pump builds
+    /// its per-connection base cache from it.
+    uplink_runtime: Option<rx11_core::config::RuntimeConfig>,
     flow_edges: mpsc::Sender<FlowEdge>,
 }
 
@@ -176,12 +199,23 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
         seq,
         meter,
         gate,
+        uplink_reset,
+        uplink_runtime,
         flow_edges,
     } = ctx;
     let dp_up = dataplane;
     let dp_down = dataplane;
 
     let uplink = async move {
+        // The pump owns the uplink diff base outright: one cache per channel,
+        // never shared, so the hot path takes no lock. The serve loop's only
+        // say in it is the `uplink_reset` flag below.
+        //
+        // Sequence numbers come from the base cache when diffing (per
+        // connection, the same rule the relay's downlink uses) because a diff
+        // names the base sequence it applies to; without diffs the channel
+        // keeps the session-wide counter, byte-identical to before.
+        let mut base = uplink_runtime.map(|rt| ConnectionDataCache::from_runtime(&rt));
         // BytesMut accumulation: kernel read lands directly in the buffer
         // that becomes the frame payload (split().freeze() is a refcount,
         // not a memcpy), saving one full payload copy per read.
@@ -200,11 +234,26 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
                 Ok(0) => break,
                 Ok(_) => {
                     let data = buf.split().freeze();
-                    let seq_id = seq.fetch_add(1, Ordering::Relaxed);
+                    // The relay could not apply one of our previous diffs:
+                    // forget the base so this payload ships whole and future
+                    // diffs re-apply against it. The swap consumes the flag,
+                    // so a reset raised mid-frame is honored next iteration.
+                    if base.is_some() && uplink_reset.swap(false, Ordering::AcqRel) {
+                        debug!("Uplink diff base reset for {conn_id} by relay resync");
+                        if let Some(cache) = base.as_mut() {
+                            cache.clear_connection(conn_id);
+                        }
+                    }
+                    let seq_id = match base.as_mut() {
+                        Some(cache) => cache.next_sequence_for(conn_id),
+                        None => seq.fetch_add(1, Ordering::Relaxed),
+                    };
 
                     // build_frame owns outbound stats (wire bytes plus
-                    // compression savings for the emitted shape).
-                    let frame = dp_up.build_frame(conn_id, seq_id, data, None, Some(stats));
+                    // compression and incremental savings for the shape
+                    // actually emitted).
+                    let frame =
+                        dp_up.build_frame(conn_id, seq_id, data, base.as_mut(), Some(stats));
                     if outbound.send(frame).await.is_err() {
                         break;
                     }
@@ -268,7 +317,7 @@ pub(crate) async fn send_data_to_local(
         let conns = x11_connections.lock().await;
         conns
             .get(&conn_id.get())
-            .map(|(tx, _, meter, _)| (tx.clone(), Arc::clone(meter)))
+            .map(|(tx, _, meter, _, _)| (tx.clone(), Arc::clone(meter)))
     };
 
     let (tx, meter) = route?;
@@ -308,10 +357,16 @@ mod tests {
     async fn send_data_to_local_delivers_to_live_channel() {
         let conns = new_shared_conns();
         let (tx, mut rx) = mpsc::channel::<bytes::Bytes>(4);
-        conns
-            .lock()
-            .await
-            .insert(12, (tx, stub_handle().await, idle_flow(), open_gate()));
+        conns.lock().await.insert(
+            12,
+            (
+                tx,
+                stub_handle().await,
+                idle_flow(),
+                open_gate(),
+                no_reset(),
+            ),
+        );
         let (n, edge) = send_data_to_local(
             &conns,
             ConnectionId::new(12),
@@ -330,16 +385,26 @@ mod tests {
     fn open_gate() -> Arc<EgressGate> {
         EgressGate::new()
     }
+    /// Uplink-diff reset flag in its resting state.
+    fn no_reset() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
 
     #[tokio::test]
     async fn send_data_to_local_prunes_gone_receiver() {
         let conns = new_shared_conns();
         let (tx, rx) = mpsc::channel::<bytes::Bytes>(4);
         drop(rx); // pump task vanished
-        conns
-            .lock()
-            .await
-            .insert(11, (tx, stub_handle().await, idle_flow(), open_gate()));
+        conns.lock().await.insert(
+            11,
+            (
+                tx,
+                stub_handle().await,
+                idle_flow(),
+                open_gate(),
+                no_reset(),
+            ),
+        );
 
         let out = send_data_to_local(
             &conns,
@@ -358,7 +423,13 @@ mod tests {
         let meter = FlowMeter::new(10, 4);
         conns.lock().await.insert(
             13,
-            (tx, stub_handle().await, Arc::clone(&meter), open_gate()),
+            (
+                tx,
+                stub_handle().await,
+                Arc::clone(&meter),
+                open_gate(),
+                no_reset(),
+            ),
         );
 
         let (_, edge) = send_data_to_local(
@@ -400,10 +471,16 @@ mod tests {
         let stats = Arc::new(ConnectionStats::new());
         for id in 1..=2u32 {
             let (tx, _rx) = mpsc::channel::<bytes::Bytes>(1);
-            conns
-                .lock()
-                .await
-                .insert(id, (tx, stub_handle().await, idle_flow(), open_gate()));
+            conns.lock().await.insert(
+                id,
+                (
+                    tx,
+                    stub_handle().await,
+                    idle_flow(),
+                    open_gate(),
+                    no_reset(),
+                ),
+            );
             stats.inc_x11_connections();
         }
 

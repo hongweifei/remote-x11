@@ -39,8 +39,8 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **Image re-encoding (on by default)** — the `x11_recode` capability recognizes large core `PutImage` requests (ZPixmap, depth 24/32) and ships them as JPEG (lossy, 10–50× smaller) or lossless PNG on the wire; the client re-expands them into the original request bytes before the local X server sees anything. Non-image traffic passes byte-for-byte. On by default with the **lossless** PNG tier; either end setting `image_recode = false` forces byte-for-byte passthrough, and the lossy JPEG tier only exists as an explicit `image_recode_codec = "jpeg"` choice. Honest edge: GL-rendered video and Xv extension paths are out of recognition scope — that's framebuffer territory (Xpra/x2go), not a transparent forwarder's
 - **Desktop audio forwarding (on by default)** — the `audio` channel: the server captures its default output sink's monitor, encodes with Opus (**pure-Rust** port, 48 kHz stereo, no system library build requirements) and streams it on the **real-time priority lane**; the client decodes and feeds `paplay`. The capture is **shared process-wide** — one recorder and one encoder fanned out to every client: N clients never spawn N `parec`s, late joiners pick up at the next packet, and the recorder stops itself when the last listener leaves. 64 kbit/s ≈ 2% of a 3 Mbit/s link; the lane bypasses the outbound byte budget, so audio latency under an image flood is bounded by one write chunk. On by default; `audio_forward = false` on either end disables it, and endpoints without a capture/playback stack (parec/paplay) degrade to silence without touching the session. Honest edge: playback only — no microphone back-channel, no lip sync
 - **Per-channel flow control (on by default)** — the `flow_control` capability: when a receiver's accepted-but-unconsumed backlog crosses the watermark (default 2 MB), it advertises `Pause` for that channel (`connection_id` granularity, each leg gauged separately); the sender's bulk pump stops reading its source socket, so the stall retreats into kernel buffers and the producing application's own `write()` — lossless by construction, not one byte discarded. Draining below the low watermark (default 256 KB) advertises `Resume`. Flow-control frames ride the **real-time priority lane** and are re-advertised periodically: the signal never queues behind a redraw burst, and a lane drop self-heals by the next re-advertisement; control frames and the audio lane are never gated. A channel congested in both directions at once gates only the uplink — the downlink advertisement yields, because gating both legs freezes an X11 conversation while deferring fresh requests never does. Either end setting `flow_control = false` returns the chain to plain transport-level backpressure (the byte-budgeted queue)
-- **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed); the receiver auto-requests full frames when its diff cache goes stale
-- **Capability negotiation** — incremental/resync/flow-control/recode/audio features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
+- **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed), in BOTH directions: the picture downstream and the request stream upstream (the client→relay leg is gated separately by `incremental_uplink`); a receiver auto-requests full frames when its diff cache goes stale
+- **Capability negotiation** — incremental/uplink-incremental/resync/flow-control/recode/audio features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
 - **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11` and `audio`), kinds *are* capability names, and unknown kinds pass through without parse failures
 - **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
@@ -271,6 +271,7 @@ Priority: **CLI args > env vars > config file > defaults**
 # diff_chunk_size = 4096            incremental diff granularity
 # diff_min_block_size = 1024        frames shorter than this are never diffed
 # diff_min_savings_ratio = 0.1      minimum saved fraction for sending a diff
+# incremental_uplink = true         diff the client uplink too (false = picture-only diffs)
 # outbound_queue_bytes = 1048576    in-flight byte budget towards the WAN (queueing-delay cap)
 # tcp_send_buffer_bytes = 262144    cap the kernel send buffer too; omit to let the OS autotune
 # image_recode = true               image re-encoding master switch (default on; false on either end = passthrough)
@@ -411,12 +412,14 @@ The current protocol version is **1**, enforced twice: a frame-header version oc
 Bands are not a gentlemen's agreement — a `TagBand` registry plus a per-band roster test enforce them: **minting a frame requires registering its band and updating that band's expected roster, or CI goes red**, and squatting a tag in no-man's-land (0x05, 0x2C, …) fails the same way.
 
 **Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
-feature names (`incremental`, `request_resync`, `flow_control`, …) and the server
+feature names (`incremental`, `incremental_uplink`, `request_resync`, `flow_control`, …) and the server
 replies with the intersection. Features outside the intersection are never used by
-either side; unrecognized names are ignored — shipping a new frame type later only
+either side (`incremental` gates the picture downlink, `incremental_uplink` opens
+diffing of the client's request stream; a receiver refuses diff shapes its direction
+never negotiated); unrecognized names are ignored — shipping a new frame type later only
 requires minting a new capability name, not a protocol bump.
 
-Control frame payloads use JSON encoding. Binary `DataX11` frames look like:
+Control frame payloads use JSON encoding. Binary `StreamData` frames look like:
 
 ```
 ┌───────────────┬─────────────┬─────────────────┐
@@ -426,7 +429,7 @@ Control frame payloads use JSON encoding. Binary `DataX11` frames look like:
 └───────────────┴─────────────┴─────────────────┘
 ```
 
-`CompressedDataX11` frames add an original-length field used to validate decompression:
+`CompressedStreamData` frames add an original-length field used to validate decompression:
 
 ```
 ┌───────────────┬─────────────┬──────────────┬─────────────────┐
@@ -436,7 +439,7 @@ Control frame payloads use JSON encoding. Binary `DataX11` frames look like:
 └───────────────┴─────────────┴──────────────┴─────────────────┘
 ```
 
-`IncrementalDataX11` frames start with `[conn][seq][base_seq][total_len][chunk_count: u16]` followed by `[offset][length][chunk]` per chunk; the receiver matches `base_seq` against its cache and sends `IncrementalRequestFull` to resynchronize when it falls out of step.
+`IncrementalStreamData` frames start with `[conn][seq][base_seq][total_len][chunk_count: u16]` followed by `[offset][length][chunk]` per chunk; the receiver matches `base_seq` against its cache and sends `StreamResyncRequest` to resynchronize when it falls out of step — in either direction. Stacked compression wraps the whole encoded diff in `CompressedIncrementalStreamData`, decompressed before parsing.
 
 `X11Connect` / `X11Disconnect` frames carry `{display, connection_id}` to notify the peer of X11 application connect/disconnect events. Multiple connections are multiplexed via `connection_id`.
 
@@ -452,7 +455,7 @@ Client                          Server
   │◄── SessionAck ──────────────│  (includes session_id)
   │◄──► ChannelOpen/Close ────│  (channel open/close, kind=x11)
   │◄──► StreamData (bidirectional)►│  (X11 data relay, includes connection_id)
-  │─── StreamResyncRequest ────►│  (self-heal: request full frames)
+  │◄──► StreamResyncRequest ────►│  (self-heal: request full frames, either direction)
   │◄──► Heartbeat / HeartbeatAck│  (server-driven keepalive)
   │─── SessionDestroy ──────────►│  (optional, explicit destroy)
 ```

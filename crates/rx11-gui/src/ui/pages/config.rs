@@ -225,6 +225,12 @@ static RT_COMPRESSION: &[FieldSpec] = &[
         kind: FieldKind::Float,
     },
     FieldSpec {
+        key: "runtime.incremental_uplink",
+        label: "上行增量差分",
+        hint: "本地程序发往中继的请求流也做差分（默认开启）；关闭后上行始终发整帧",
+        kind: FieldKind::Toggle,
+    },
+    FieldSpec {
         key: "runtime.outbound_queue_bytes",
         label: "出站排队上限",
         hint: "字节；限住慢链路上的排队延迟（1 MB ≈ 3 Mbps 下 2.8 秒）",
@@ -400,6 +406,7 @@ mod tests {
             "runtime.diff_chunk_size",
             "runtime.diff_min_block_size",
             "runtime.diff_min_savings_ratio",
+            "runtime.incremental_uplink",
             "runtime.outbound_queue_bytes",
             "runtime.tcp_send_buffer_bytes",
             "runtime.image_recode",

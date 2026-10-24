@@ -21,6 +21,16 @@ pub enum Capability {
     RequestResync,
     /// Sender may emit `IncrementalStreamData` / `CompressedIncrementalStreamData`.
     Incremental,
+    /// The CLIENT end may diff its uplink (local X server → relay) too.
+    /// `Incremental` alone is the downlink direction (relay → client, the
+    /// picture): the client's uplink carries the application's REQUEST
+    /// stream, whose position-based chunks have a different redundancy
+    /// profile, so the direction is negotiated separately — a peer that
+    /// survives from before this variant keeps the old downlink-only policy
+    /// instead of receiving diff frames it was never asked to apply.
+    /// Advertised by default; either peer opts OUT with
+    /// `[runtime] incremental_uplink = false`.
+    IncrementalUplink,
     /// Per-channel bulk pause/resume (`FlowControl` frames): a stalled
     /// consumer asks the sender to stop delivering x11 data for one
     /// `connection_id`, and the sender's pump stops reading the producing
@@ -51,9 +61,10 @@ impl Capability {
     /// What this build can actually do. Every capability here is fully
     /// implemented; the gated ones ride default-ON with per-end kill
     /// switches in `advertised_for`.
-    pub const SUPPORTED: [Capability; 6] = [
+    pub const SUPPORTED: [Capability; 7] = [
         Capability::RequestResync,
         Capability::Incremental,
+        Capability::IncrementalUplink,
         Capability::FlowControl,
         Capability::X11,
         Capability::X11Recode,
@@ -64,6 +75,7 @@ impl Capability {
         match self {
             Capability::RequestResync => "request_resync",
             Capability::Incremental => "incremental",
+            Capability::IncrementalUplink => "incremental_uplink",
             Capability::FlowControl => "flow_control",
             Capability::X11 => "x11",
             Capability::X11Recode => "x11_recode",
@@ -87,10 +99,10 @@ impl Capability {
     }
 
     /// Advertised list honoring the per-endpoint kill switches: recode,
-    /// audio and flow control ride by default (their default tiers are
-    /// lossless / harmless), and an explicit `false` in `[runtime]` removes
-    /// the name from the wire — a peer that disabled a capability can never
-    /// be talked into it.
+    /// audio, uplink diffing and flow control ride by default (their default
+    /// tiers are lossless / harmless), and an explicit `false` in `[runtime]`
+    /// removes the name from the wire — a peer that disabled a capability can
+    /// never be talked into it.
     pub fn advertised_for(runtime: &crate::config::RuntimeConfig) -> Vec<String> {
         Capability::SUPPORTED
             .iter()
@@ -98,6 +110,7 @@ impl Capability {
                 Capability::X11Recode => runtime.image_recode,
                 Capability::AudioForward => runtime.audio_forward,
                 Capability::FlowControl => runtime.flow_control,
+                Capability::IncrementalUplink => runtime.incremental_uplink,
                 _ => true,
             })
             .map(|c| c.name().to_string())

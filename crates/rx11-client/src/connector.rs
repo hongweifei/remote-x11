@@ -18,7 +18,7 @@ use tracing::{error, info, warn};
 
 use rx11_core::auth::generate_display_cookie;
 use rx11_core::config::{BufferDefaults, ClientDefaults, RuntimeConfig};
-use rx11_core::dataplane::DataPlane;
+use rx11_core::dataplane::{DataPlane, DataPlaneSide};
 use rx11_core::error::{is_retriable_io_error, Rx11Error};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{
@@ -432,7 +432,12 @@ impl LocalConnector {
             disp
         };
 
-        let dataplane = DataPlane::new(handshake.features, compression, &self.runtime);
+        let dataplane = DataPlane::new(
+            DataPlaneSide::Client,
+            handshake.features,
+            compression,
+            &self.runtime,
+        );
         Ok((transport, display, dataplane))
     }
 

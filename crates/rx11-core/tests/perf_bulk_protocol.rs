@@ -6,7 +6,7 @@ use bytes::Bytes;
 use tokio::net::{TcpListener, TcpStream};
 
 use rx11_core::config::RuntimeConfig;
-use rx11_core::dataplane::{DataPlane, InboundOutcome};
+use rx11_core::dataplane::{DataPlane, DataPlaneSide, InboundOutcome};
 use rx11_core::incremental::ConnectionDataCache;
 use rx11_core::protocol::{Capability, Features, Frame};
 use rx11_core::transport::Rx11Transport;
@@ -54,6 +54,7 @@ async fn bulk_over_tcp_dataplane_only() {
             let stream = TcpStream::connect(addr).await.unwrap();
             let mut tx = Rx11Transport::connect_tcp(stream, None).unwrap();
             let dp = DataPlane::new(
+                DataPlaneSide::Relay,
                 features,
                 Some(rx11_core::compress::CompressionAlgo::ZstdStream),
                 &rt,
@@ -83,6 +84,7 @@ async fn bulk_over_tcp_dataplane_only() {
     let mut rx = Rx11Transport::connect_tcp(peer, None).unwrap();
     let rt = Arc::clone(&rt);
     let dp = DataPlane::new(
+        DataPlaneSide::Client,
         features.clone(),
         Some(rx11_core::compress::CompressionAlgo::ZstdStream),
         &rt,

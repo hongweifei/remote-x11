@@ -43,8 +43,8 @@
 - **图像流量重编码（默认开启）** — `x11_recode` 能力：识别 X 协议里的大块 `PutImage` 请求（ZPixmap 24/32 位），在线路上换成 JPEG（有损，省 10~50 倍）或无损 PNG，收端展开后以原始请求字节写回本地 X server；非图像请求逐字节透传。默认开启（PNG 无损档）：任一端 `[runtime] image_recode = false` 即整链逐字节透传；JPEG 有损档只有显式 `image_recode_codec = "jpeg"` 才会启用。边界：GL 渲染的视频、Xv 扩展路径不在识别范围——那是帧缓冲模式（Xpra/x2go 的领域），不是透明转发器该假装的
 - **桌面音频转发（默认开启）** — `audio` 通道：服务端采集默认输出 sink 的 monitor，Opus（**纯 Rust** 移植，48 kHz 立体声，构建零系统库要求）编码后走**实时优先道**下推，收端解码交给 `paplay` 播放。全服务**一份采集一份编码**扇出给所有客户端：多客户端不重复起 parec、不重复编码；迟到者从下一帧接上；最后一个监听者离开后录音器自动停。64 kbit/s 约占 3 Mbps 链路 2%；优先道不受出站字节预算排队，图像洪峰下音频延迟以单个写块为界。默认开启，任一端 `audio_forward = false` 即关；端点没有采集/播放栈（parec/paplay）时自动静默降级不影响会话。边界：只放声音，不做麦克风反向输入，不做唇音同步
 - **逐通道流控（默认开启）** — `flow_control` 能力：接收端「已收下但没消费完」的积压超过高水位（默认 2 MB）就对该通道（`connection_id` 粒度，上下行各自计量）宣告 Pause，发端大块泵**停止从源头 socket 读取**——积压退到内核缓冲和应用自己的 `write()` 里，一个字节都不丢；回落到低于低水位（默认 256 KB）宣告 Resume。流控帧走**实时优先道**并周期性再宣告：信号自己不排在洪峰后面，优先道满丢弃也可再宣告找回；控制帧（心跳/会话）与音频道永不被它门控。同向通道双向同时堵时，下行让位上行——双向互门会冻住 X11 会话，推迟新请求不会。任一端 `[runtime] flow_control = false` 即整链退回纯传输背压（字节预算队列）
-- **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
-- **能力协商** — 增量/重同步/流控/重编码/音频等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
+- **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩），画面下行与请求上行两个方向各自差分（`incremental_uplink` 单独控制上行）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
+- **能力协商** — 增量/上行增量/重同步/流控/重编码/音频等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
 - **通道类型可扩展** — 数据面帧族与载荷类型解耦：`ChannelOpen.kind` 声明类型（现为 `x11` 与 `audio`），kind 即能力名，未知 kind 安全穿透不解析错
 - **双向统计** — 客户端与服务端各自每 30 秒输出收发字节、压缩/增量节省量与活跃连接数
 - **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
@@ -272,6 +272,7 @@ rx11 config show   # 显示配置文件路径与当前内容
 # diff_chunk_size = 4096           增量差分粒度
 # diff_min_block_size = 1024       低于此长度的帧不做差分
 # diff_min_savings_ratio = 0.1     差分最少需节省的比例
+# incremental_uplink = true        上行请求流也做差分（false 则仅画面下行差分）
 # outbound_queue_bytes = 1048576   发往公网的在途字节预算（排队延迟上限）
 # tcp_send_buffer_bytes = 262144   限制内核发送缓冲；不设则交给 OS 自动调优
 # image_recode = true              图像重编码总开关（默认开；任一端 false 即全透传）
@@ -411,12 +412,13 @@ rx11 使用自定义二进制帧协议，每帧结构：
 段位不是口头约定——`TagBand` 注册表 + roster 测试强制执行：**新增帧类型必须同时登记所属段并更新该段的期望清单，否则 CI 失败**；把编号编进无主地带（如 0x05、0x2C）同样直接飘红。
 
 **能力协商（Capability Negotiation）**：`Hello.capabilities` / `HelloAck.capabilities`
-以字符串列表声明特性（`incremental`、`request_resync`、`flow_control`……），
+以字符串列表声明特性（`incremental`、`incremental_uplink`、`request_resync`、`flow_control`……），
 服务端回复交集。未协商的能力两侧都不会使用（例如未声明 `incremental` 时对端
-永不产生增量帧）；未识别的能力名会被忽略——新增帧类型只需配合新能力名即可
+永不产生增量帧；`incremental_uplink` 在此基础上开启客户端上行请求流的差分，
+接收端会对未协商方向的增量帧拒收）；未识别的能力名会被忽略——新增帧类型只需配合新能力名即可
 平滑上线，无需再整体升版本。
 
-控制帧的 Payload 使用 JSON 编码。X11 数据帧使用二进制编码，`DataX11` 帧格式：
+控制帧的 Payload 使用 JSON 编码。X11 数据帧使用二进制编码，`StreamData` 帧格式：
 
 ```
 ┌───────────────┬─────────────┬─────────────────┐
@@ -426,7 +428,7 @@ rx11 使用自定义二进制帧协议，每帧结构：
 └───────────────┴─────────────┴─────────────────┘
 ```
 
-`CompressedDataX11` 帧格式（多一个原始长度字段，用于解压校验）：
+`CompressedStreamData` 帧格式（多一个原始长度字段，用于解压校验）：
 
 ```
 ┌───────────────┬─────────────┬──────────────┬─────────────────┐
@@ -436,7 +438,7 @@ rx11 使用自定义二进制帧协议，每帧结构：
 └───────────────┴─────────────┴──────────────┴─────────────────┘
 ```
 
-`IncrementalDataX11` 帧头为 `[conn][seq][base_seq][total_len][chunk_count: u16]`，随后每块 `[offset][length][chunk]`；接收端依据 `base_seq` 与自身缓存对齐，失步时发送 `IncrementalRequestFull` 请求全帧。
+`IncrementalStreamData` 帧头为 `[conn][seq][base_seq][total_len][chunk_count: u16]`，随后每块 `[offset][length][chunk]`；接收端依据 `base_seq` 与自身缓存对齐，失步时发送 `StreamResyncRequest` 请求全帧（上下行两个方向都适用）。压缩叠加后的形态是 `CompressedIncrementalStreamData`：对整段差分载荷压缩，解压后按上述格式解析。
 
 `X11Connect` / `X11Disconnect` 帧携带 `{display, connection_id}`，用于通知对端 X11 应用的连接与断开。多连接通过 `connection_id` 实现多路复用。
 
@@ -452,7 +454,7 @@ Client                          Server
   │◄── SessionAck ──────────────│  (含 session_id)
   │◄──► ChannelOpen/Close ────│  (通道开闭，kind=x11)
   │◄──► StreamData (双向) ────────►│  (X11 数据转发，含 connection_id)
-  │─── StreamResyncRequest ────►│  (增量失步时请求回退全帧)
+  │◄──► StreamResyncRequest ────►│  (任一方向增量失步时请求对端回退全帧)
   │◄──► Heartbeat / HeartbeatAck│  (服务端保活)
   │─── SessionDestroy ──────────►│  (可选，显式销毁)
 ```

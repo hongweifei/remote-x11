@@ -41,7 +41,7 @@ pub struct SshSection {
 }
 
 /// `[runtime]`：运行时可调参数，秒为单位，字段与 CLI 的
-/// `RuntimeFileConfig` 一一对应（共 20 项）。
+/// `RuntimeFileConfig` 一一对应（共 21 项）。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct RuntimeSection {
@@ -52,6 +52,8 @@ pub struct RuntimeSection {
     pub diff_chunk_size: Option<usize>,
     pub diff_min_block_size: Option<usize>,
     pub diff_min_savings_ratio: Option<f64>,
+    /// 上行（本地 X 程序 → 中继）请求流是否也做增量差分。默认开启。
+    pub incremental_uplink: Option<bool>,
     pub outbound_queue_bytes: Option<usize>,
     pub tcp_send_buffer_bytes: Option<usize>,
     pub image_recode: Option<bool>,
@@ -86,6 +88,9 @@ impl RuntimeSection {
             diff_min_savings_ratio: self
                 .diff_min_savings_ratio
                 .unwrap_or(defaults.diff_min_savings_ratio),
+            incremental_uplink: self
+                .incremental_uplink
+                .unwrap_or(defaults.incremental_uplink),
             outbound_queue_bytes: self
                 .outbound_queue_bytes
                 .unwrap_or(defaults.outbound_queue_bytes),
@@ -159,6 +164,7 @@ mod tests {
         assert_eq!(rt.diff_chunk_size, 4096);
         assert_eq!(rt.diff_min_block_size, 1024);
         assert_eq!(rt.diff_min_savings_ratio, 0.25);
+        assert!(rt.incremental_uplink);
         assert_eq!(rt.outbound_queue_bytes, 1_048_576);
         assert_eq!(rt.tcp_send_buffer_bytes, Some(262_144));
         assert!(rt.image_recode);

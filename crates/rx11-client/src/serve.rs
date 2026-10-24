@@ -158,7 +158,7 @@ async fn re_advertise(ctx: &mut ServeCtx<'_>) {
             .filter(|id| {
                 conns
                     .get(&id.get())
-                    .is_some_and(|(_, _, meter, _)| !meter.latched())
+                    .is_some_and(|(_, _, meter, _, _)| !meter.latched())
             })
             .collect()
     };
@@ -288,13 +288,21 @@ async fn request_full_resend(ctx: &mut ServeCtx<'_>, conn_id: ConnectionId) {
         return;
     }
     ctx.proxy.stats.add_incremental_full_fallback();
-    let _ = ctx
+    // Control signal: rides the priority lane so it never queues behind the
+    // redraw burst it is trying to stop. A full-lane drop is harmless — the
+    // next failed diff re-asks.
+    if ctx
         .proxy
         .outbound
-        .send(Frame::StreamResyncRequest(StreamResyncRequestMessage {
+        .send_priority(Frame::StreamResyncRequest(StreamResyncRequestMessage {
             connection_id: conn_id,
         }))
-        .await;
+        .is_err()
+    {
+        warn!(
+            "Resync request for {conn_id} lost on a full priority lane; relying on the next diff"
+        );
+    }
 }
 
 async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
@@ -321,6 +329,39 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
                 conns.remove(&msg.connection_id.get());
                 ctx.incremental_cache.clear_connection(msg.connection_id);
                 ctx.flow.advertiser.forget(msg.connection_id);
+            }
+        }
+        Frame::StreamResyncRequest(msg) => {
+            // The relay could not apply one of OUR uplink diffs. The send
+            // base belongs to this channel's pump task, so we raise its
+            // reset flag instead of reaching into a shared cache: the pump
+            // drops the base before building the next frame, and this
+            // payload ships whole from there on.
+            if !ctx.dataplane().features.supports(Capability::RequestResync) {
+                warn!(
+                    "Relay sent StreamResyncRequest but resync capability was not negotiated; ignoring"
+                );
+                return;
+            }
+            let raised = {
+                let conns = ctx.proxy.x11_connections.lock().await;
+                conns
+                    .get(&msg.connection_id.get())
+                    .map(|(_, _, _, _, uplink_reset)| {
+                        uplink_reset.store(true, std::sync::atomic::Ordering::Release);
+                    })
+                    .is_some()
+            };
+            if raised {
+                info!(
+                    "Relay requested full resend for {}; uplink diff base will reset",
+                    msg.connection_id
+                );
+            } else {
+                debug!(
+                    "Resync request for unknown channel {}; nothing to reset",
+                    msg.connection_id
+                );
             }
         }
         Frame::Error(msg) => {
@@ -350,7 +391,7 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
             for id in ids {
                 let gate = {
                     let conns = ctx.proxy.x11_connections.lock().await;
-                    conns.get(&id.get()).map(|(_, _, _, gate)| gate.clone())
+                    conns.get(&id.get()).map(|(_, _, _, gate, _)| gate.clone())
                 };
                 match gate {
                     Some(gate) => {
@@ -384,6 +425,7 @@ mod tests {
     use bytes::Bytes;
     use rx11_core::compress::CompressionAlgo;
     use rx11_core::config::RuntimeConfig;
+    use rx11_core::dataplane::DataPlaneSide;
     use rx11_core::protocol::{
         BinaryMessageCodec, ChannelCloseMessage, CompressedIncrementalStreamDataMessage,
         CompressedStreamDataMessage, Features, HelloAckMessage, IncrementalChunk,
@@ -439,7 +481,12 @@ mod tests {
                 stats: Arc::new(ConnectionStats::new()),
                 seq: Arc::new(AtomicU32::new(1)),
                 cache: ConnectionDataCache::new(),
-                dataplane: DataPlane::new(features.clone(), compression, &RuntimeConfig::default()),
+                dataplane: DataPlane::new(
+                    DataPlaneSide::Client,
+                    features.clone(),
+                    compression,
+                    &RuntimeConfig::default(),
+                ),
                 rt: RuntimeConfig::default(),
                 audio: None,
                 flow: ServeFlow::new(&features, flow_edge_rx),
@@ -490,10 +537,16 @@ mod tests {
         ) -> mpsc::Receiver<Bytes> {
             let (tx, rx) = mpsc::channel(16);
             let handle = tokio::spawn(future::pending::<()>());
-            self.conns
-                .lock()
-                .await
-                .insert(conn.get(), (tx, handle, meter, gate));
+            self.conns.lock().await.insert(
+                conn.get(),
+                (
+                    tx,
+                    handle,
+                    meter,
+                    gate,
+                    Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                ),
+            );
             rx
         }
 
@@ -641,8 +694,10 @@ mod tests {
                 .unwrap();
         }
 
-        match h.outbound_rx.recv().await {
-            Some((Frame::StreamResyncRequest(m), _)) => assert_eq!(m.connection_id, conn(7)),
+        // The resync request rides the priority lane: it is a control signal
+        // that must not queue behind the redraw burst it is trying to stop.
+        match h.outbound_rx.recv_priority().await {
+            Some(Frame::StreamResyncRequest(m)) => assert_eq!(m.connection_id, conn(7)),
             other => panic!("expected StreamResyncRequest, got {other:?}"),
         }
         let summary = h.stats.summary();
@@ -719,13 +774,12 @@ mod tests {
             .await
             .unwrap();
         }
-        // apply_inbound does not know about per-direction gating yet, so the
-        // base mismatch surfaces as a resync request; assert nothing panics
-        // and one request frame is emitted.
-        assert!(matches!(
-            h.outbound_rx.recv().await,
-            Some((Frame::StreamResyncRequest(_), _))
-        ));
+        // The direction gate lives inside `apply_inbound`: a diff frame the
+        // session never negotiated is refused outright (Dropped, with a
+        // warning), so no resync request is emitted and the cache is never
+        // touched. A peer that can't agree on the shape must not be able to
+        // make us spam control frames.
+        h.assert_nothing_emitted().await;
     }
 
     #[tokio::test]
