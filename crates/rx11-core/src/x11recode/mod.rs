@@ -157,21 +157,24 @@ impl DownstreamReencoder {
                 self.raw_acc.extend(std::mem::take(&mut self.buf));
                 return;
             }
-            if self.buf.len() < 8 {
-                return; // base header (opcode word + length word) incomplete
+            if self.buf.len() < 4 {
+                return; // request header (opcode, data, length) incomplete
             }
-            let len_field = frame::u32_at(&self.buf, 4, self.big_endian);
+            // The request length is at bytes 2..4, in 4-byte units; 0 marks an
+            // extended request whose length is the u32 pair at bytes 4..12,
+            // counting the bytes after that 12-byte header.
+            let len_field = frame::u16_at(&self.buf, 2, self.big_endian) as u64;
             let total: u64 = if len_field == 0 {
                 if self.buf.len() < 16 {
                     return;
                 }
-                let lo = frame::u32_at(&self.buf, 8, self.big_endian) as u64;
-                let hi = frame::u32_at(&self.buf, 12, self.big_endian) as u64;
-                8 + lo + (hi << 32)
+                let lo = frame::u32_at(&self.buf, 4, self.big_endian) as u64;
+                let hi = frame::u32_at(&self.buf, 8, self.big_endian) as u64;
+                12 + lo + (hi << 32)
             } else {
-                len_field as u64 * 4
+                len_field * 4
             };
-            if !(8..=frame::MAX_RECODE_REQUEST).contains(&total) {
+            if !(4..=frame::MAX_RECODE_REQUEST).contains(&total) {
                 self.disable();
                 continue;
             }
@@ -317,12 +320,11 @@ mod tests {
     /// pixels a constant color packed per connection byte order.
     fn put_image(width: u16, height: u16, be: bool, fill: u8) -> Vec<u8> {
         let data_len = width as usize * height as usize * 4;
-        let total = 24 + data_len;
+        let total = 20 + data_len;
         let mut req = Vec::with_capacity(total);
-        req.push(53);
-        req.push(2);
-        req.extend_from_slice(&[0, 0]);
-        req.extend_from_slice(&w32(total as u32 / 4, be));
+        req.push(53); // opcode: PutImage
+        req.push(2); // request data: format ZPixmap
+        req.extend_from_slice(&w16((total / 4) as u16, be)); // length in b32
         req.extend_from_slice(&w32(1, be)); // window
         req.extend_from_slice(&w32(2, be)); // gc
         req.extend_from_slice(&w16(width, be));
@@ -341,16 +343,35 @@ mod tests {
         req
     }
 
+    /// A spec-faithful non-image request: opcode, request data, length in b32
+    /// at bytes 2..4, then the payload.
+    fn request(opcode: u8, data: u8, payload: &[u8], be: bool) -> Vec<u8> {
+        let total = 4 + payload.len();
+        let mut req = Vec::with_capacity(total);
+        req.push(opcode);
+        req.push(data);
+        req.extend_from_slice(&w16((total / 4) as u16, be));
+        req.extend_from_slice(payload);
+        req
+    }
+
     fn setup_bytes(be: bool, name: &str, auth: &str) -> Vec<u8> {
+        // X11 connection setup: byte-order(1) unused(1) major(2) minor(2)
+        // auth-name length(2) auth-data length(2) unused(2), then the padded
+        // authorization protocol name and the padded authorization data.
         let mut v = vec![if be { b'B' } else { b'l' }, 0];
         v.extend_from_slice(&w16(11, be));
         v.extend_from_slice(&w16(0, be));
         v.extend_from_slice(&w16(name.len() as u16, be));
         v.extend_from_slice(&w16(auth.len() as u16, be));
+        v.extend_from_slice(&[0, 0]);
         v.extend_from_slice(name.as_bytes());
-        v.resize(10 + pad4(name.len()), 0);
+        v.resize(frame::SETUP_HEADER_LEN + pad4(name.len()), 0);
         v.extend_from_slice(auth.as_bytes());
-        v.resize(10 + pad4(name.len()) + pad4(auth.len()), 0);
+        v.resize(
+            frame::SETUP_HEADER_LEN + pad4(name.len()) + pad4(auth.len()),
+            0,
+        );
         v
     }
 
@@ -369,16 +390,90 @@ mod tests {
             ..Default::default()
         });
         let setup = setup_bytes(false, "MIT-MAGIC-COOKIE-1", "0123456789abcdef");
-        // A 16-byte request (opcode 1, b32 length = 4).
-        let mut other = vec![1u8, 0, 2, 0];
-        other.extend_from_slice(&4u32.to_le_bytes());
-        other.extend_from_slice(&[0u8; 8]);
+        // A 16-byte request (opcode 1, length 4 in b32 units).
+        let mut other = vec![1u8, 0];
+        other.extend_from_slice(&w16(4, false));
+        other.extend_from_slice(&[0u8; 12]);
         let mut input = setup.clone();
         input.extend_from_slice(&other);
         let mut out = Vec::new();
         m.push(&input, &mut out);
         assert!(out.iter().all(|u| u[0] == KIND_RAW));
         assert_eq!(expand_all(out), input);
+    }
+
+    /// The setup request of a real X client carries a 12-byte fixed header.
+    /// Reading it as 10 bytes truncates the header and the machine then waits
+    /// forever for a request that can never be framed, so the window never
+    /// appears on the far side. The measured header is pinned here.
+    #[test]
+    fn setup_header_is_twelve_bytes() {
+        let setup = setup_bytes(false, "", "");
+        // byte-order 'l', unused, major 11, minor 0, name len 0, auth len 0.
+        assert_eq!(
+            &setup[..frame::SETUP_HEADER_LEN],
+            &[b'l', 0, 11, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+        assert_eq!(setup.len(), frame::SETUP_HEADER_LEN);
+        assert_eq!(
+            frame::setup_message_len(&setup),
+            Some((false, frame::SETUP_HEADER_LEN))
+        );
+    }
+
+    /// The machine must hand the whole setup request over, not a prefix of it.
+    #[test]
+    fn machine_forwards_the_complete_setup_request() {
+        let mut m = DownstreamReencoder::new(RecodeSpec::default());
+        let setup = setup_bytes(false, "MIT-MAGIC-COOKIE-1", "0123456789abcdef");
+        let mut out = Vec::new();
+        m.push(&setup, &mut out);
+        assert_eq!(expand_all(out), setup);
+    }
+
+    /// The exact byte stream a real X client sends after the setup: a
+    /// QueryExtension whose length field is at bytes 2..4. Reading the length
+    /// from the wrong offset makes the machine wait for bytes that never
+    /// come, and the window never appears on the far side.
+    #[test]
+    fn real_client_request_stream_is_framed_correctly() {
+        // Captured from a live X client against the local X server.
+        let setup: Vec<u8> = vec![
+            0x6c, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let query: Vec<u8> = vec![
+            0x62, 0x00, 0x05, 0x00, 0x0c, 0x00, 0x00, 0x00, b'B', b'I', b'G', b'-', b'R', b'E',
+            b'Q', b'U', b'E', b'S', b'T', b'S',
+        ];
+
+        let mut m = DownstreamReencoder::new(RecodeSpec::default());
+        let mut out = Vec::new();
+        m.push(&setup, &mut out);
+        m.push(&query, &mut out);
+
+        // The query is 20 bytes: length 5 in 4-byte units.
+        assert_eq!(query.len(), 20);
+        let mut want = setup.clone();
+        want.extend_from_slice(&query);
+        assert_eq!(
+            expand_all(out),
+            want,
+            "the request stream must survive the machine byte for byte"
+        );
+    }
+
+    /// A request's length lives at bytes 2..4, in 4-byte units.
+    #[test]
+    fn request_length_is_read_from_the_spec_offset() {
+        // QueryExtension with a 12-byte name: 4 header + 12 name = 16 bytes.
+        let req = request(0x62, 0x00, b"BIG-REQUESTS", false);
+        assert_eq!(req.len(), 16);
+        assert_eq!(&req[..4], &[0x62, 0x00, 0x04, 0x00]);
+
+        let mut m = DownstreamReencoder::new(RecodeSpec::default());
+        let mut out = Vec::new();
+        m.push(&req, &mut out);
+        assert_eq!(expand_all(out), req);
     }
 
     #[test]
@@ -426,10 +521,10 @@ mod tests {
         assert_eq!(out[1][0], KIND_CONTAINER);
         let rebuilt = DownstreamExpander::expand(out[1].clone()).expect("expand");
         assert_eq!(rebuilt.len(), img.len());
-        assert_eq!(&rebuilt[..24], &img[..24], "request header must survive");
+        assert_eq!(&rebuilt[..20], &img[..20], "request header must survive");
         // constant fill: every pixel within a hair of the original B,G,R
-        let (b0, g0, r0) = (img[24], img[25], img[26]);
-        for px in rebuilt[24..].as_chunks::<4>().0 {
+        let (b0, g0, r0) = (img[20], img[21], img[22]);
+        for px in rebuilt[20..].as_chunks::<4>().0 {
             assert!((px[0] as i32 - b0 as i32).abs() <= 2, "B {}", px[0]);
             assert!((px[1] as i32 - g0 as i32).abs() <= 2, "G {}", px[1]);
             assert!((px[2] as i32 - r0 as i32).abs() <= 2, "R {}", px[2]);
@@ -463,13 +558,14 @@ mod tests {
     fn extended_length_requests_are_recoded() {
         let (w, h) = (65u16, 700u16); // 182000 pixel bytes
         let standard = put_image(w, h, false, 90);
-        // Re-emit the same request in extended framing: b32 length 0,
-        // then two u32s = byte count following the first 8 bytes.
-        let body = &standard[8..]; // window..depth + data (16 + data_len)
-        let bytes_after = 8 + body.len() as u32; // ext-length pair + body
+        // Re-emit the same request in extended framing: the b32 length field
+        // is 0, and the u32 pair at bytes 4..12 gives the byte count that
+        // follows that 12-byte header.
+        let body = &standard[4..]; // window..depth + data (16 + data_len)
+        let bytes_after = body.len() as u32; // the bytes after the 12-byte header
         let mut ext = Vec::new();
-        ext.extend_from_slice(&standard[..4]);
-        ext.extend_from_slice(&0u32.to_le_bytes());
+        ext.extend_from_slice(&standard[..2]); // opcode + request data
+        ext.extend_from_slice(&w16(0, false)); // length 0 = extended
         ext.extend_from_slice(&bytes_after.to_le_bytes());
         ext.extend_from_slice(&0u32.to_le_bytes());
         ext.extend_from_slice(body);
@@ -504,8 +600,8 @@ mod tests {
         let mut out = Vec::new();
         m.push(&setup, &mut out);
         // A request claiming ~64 GiB via extended length.
-        let mut bogus = vec![53u8, 2, 0, 0];
-        bogus.extend_from_slice(&0u32.to_le_bytes());
+        let mut bogus = vec![53u8, 2];
+        bogus.extend_from_slice(&w16(0, false)); // length 0 = extended
         bogus.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
         bogus.extend_from_slice(&0x0000_000Fu32.to_le_bytes());
         bogus.extend_from_slice(&[9u8; 64]);

@@ -1,12 +1,24 @@
 //! PutImage frame recognition, the recode container format, and the
 //! pixel layout math that makes a reconstructed request byte-faithful.
 //!
-//! Wire facts this encodes (X11 protocol spec, PutImage = request 53):
+//! Wire facts this encodes (X11 protocol spec, PutImage = request 53).
+//!
+//! Every X11 request starts with the same 4-byte header:
 //!
 //! ```text
-//!  1      format (0 XYBitmap, 1 XYPixmap, 2 ZPixmap)
-//!  3      unused
-//!  4      length of request in b32 (0 => extended, see below)
+//!  1      opcode (PutImage = 53)
+//!  1      request data (PutImage: format, 2 = ZPixmap)
+//!  2      length of the request in 4-byte units
+//! ```
+//!
+//! so the request length lives at bytes 2..4, and a request occupies
+//! `length * 4` bytes. A length of 0 marks an EXTENDED request, whose real
+//! length is the u32 pair that follows the 4-byte header (bytes 4..12),
+//! counting the bytes after those 12 bytes.
+//!
+//! PutImage itself continues:
+//!
+//! ```text
 //!  4      window
 //!  4      gc
 //!  2      width
@@ -16,10 +28,12 @@
 //!  2      unused
 //!  *      image data: rows of ceil(width*bpp/32)*4 bytes
 //! ```
-//! When the b32 length field is 0, the two u32s following the base 8 bytes
-//! give the byte count beyond those 8 (extended requests — every frame of a
-//! video is one). Requests are written in the CONNECTION byte order, latched
-//! from the client setup message's first byte ('B' or 'l').
+//!
+//! The standard-form PutImage therefore has its image data at offset 20;
+//! the extended form adds the 8-byte length pair, so the data starts at 28.
+//!
+//! Requests are written in the CONNECTION byte order, latched from the
+//! client setup message's first byte ('B' or 'l').
 //!
 //! Recode only touches ZPixmap at depth 24/32 with left_pad == 0 (bpp 32),
 //! the layout every modern TrueColor visual uses. Everything else must
@@ -80,27 +94,27 @@ pub(crate) fn classify_put_image(req: &[u8], big_endian: bool) -> Option<PutImag
     if req[0] != OP_PUT_IMAGE || req[1] != FORMAT_ZPIXMAP {
         return None;
     }
-    let len_field = u32_at(req, 4, big_endian);
+    // The request length sits at bytes 2..4, in 4-byte units.
+    let len_field = u16_at(req, 2, big_endian) as u32;
     let (data_off, total) = if len_field == 0 {
-        // Extended: 8 base + 8 length + window/gc/w/h/leftpad/depth/pad (16).
+        // Extended request: the u32 pair at bytes 4..12 gives the byte count
+        // that follows the 12-byte header.
         if req.len() < 16 {
             return None;
         }
-        let bytes_after_lo = u32_at(req, 8, big_endian) as u64;
-        let bytes_after_hi = u32_at(req, 12, big_endian) as u64;
-        // Spec: when the b32 length is 0, bytes 8..16 give the byte count
-        // that follows the FIRST EIGHT bytes of the request.
-        let total = 8 + bytes_after_lo + (bytes_after_hi << 32);
+        let bytes_after_lo = u32_at(req, 4, big_endian) as u64;
+        let bytes_after_hi = u32_at(req, 8, big_endian) as u64;
+        let total = 12 + bytes_after_lo + (bytes_after_hi << 32);
         if total > MAX_RECODE_REQUEST || total > req.len() as u64 {
             return None;
         }
-        (32usize, total as usize)
+        (28usize, total as usize)
     } else {
         let total = len_field as u64 * 4;
         if total > MAX_RECODE_REQUEST || total > req.len() as u64 {
             return None;
         }
-        (24usize, total as usize)
+        (20usize, total as usize)
     };
     let left_pad = req[data_off - 4];
     let depth = req[data_off - 3];
@@ -288,11 +302,17 @@ pub(crate) fn rebuild_request(c: &Container<'_>, pixels: &[u8]) -> Bytes {
     buf.freeze()
 }
 
+/// Fixed part of the X11 connection setup request, in bytes:
+/// byte-order(1) unused(1) protocol-major(2) protocol-minor(2)
+/// authorization-protocol-name length(2) authorization-data length(2)
+/// unused(2).
+pub(crate) const SETUP_HEADER_LEN: usize = 12;
+
 /// The connection setup header the very first client message begins with:
-/// 10 fixed bytes + padded name + padded auth. Returns the byte order flag
-/// and total length, once the whole message is buffered.
+/// [`SETUP_HEADER_LEN`] fixed bytes + padded name + padded auth. Returns the
+/// byte order flag and total length, once the whole message is buffered.
 pub(crate) fn setup_message_len(buf: &[u8]) -> Option<(bool, usize)> {
-    if buf.len() < 10 {
+    if buf.len() < SETUP_HEADER_LEN {
         return None;
     }
     let big_endian = match buf[0] {
@@ -302,5 +322,8 @@ pub(crate) fn setup_message_len(buf: &[u8]) -> Option<(bool, usize)> {
     };
     let name_len = u16_at(buf, 6, big_endian) as usize;
     let auth_len = u16_at(buf, 8, big_endian) as usize;
-    Some((big_endian, 10 + pad4(name_len) + pad4(auth_len)))
+    Some((
+        big_endian,
+        SETUP_HEADER_LEN + pad4(name_len) + pad4(auth_len),
+    ))
 }
