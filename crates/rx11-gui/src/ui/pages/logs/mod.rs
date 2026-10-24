@@ -24,6 +24,12 @@ use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
 use crate::ui::scrollbar::{Hit, ScrollBar};
 use crate::ui::{Page, PageInput};
 
+/// The filter, the unread watermark and the pixel-scroll bookkeeping — state
+/// only, no FLTK, unit-tested on its own.
+mod state;
+use state::ROW_LINE_H;
+pub use state::{LogEntry, LogView};
+
 /// 级别 → 颜色。颜色属于表现层，所以映射留在页面里：`model::LogLevel` 只管语义
 /// （严重度顺序 + 中文标签 + 三字母码）。
 fn level_color(level: LogLevel) -> u32 {
@@ -32,72 +38,6 @@ fn level_color(level: LogLevel) -> u32 {
         LogLevel::Warn => C::WARN,
         LogLevel::Info => C::TEXT,
         LogLevel::Debug | LogLevel::Trace => C::TEXT_3,
-    }
-}
-
-/// One rendered log record.
-#[derive(Debug, Clone)]
-pub struct LogEntry {
-    /// Pre-formatted local time, `HH:MM:SS.mmm`.
-    pub time: String,
-    pub level: LogLevel,
-    pub target: String,
-    pub message: String,
-}
-
-/// The page's view state, owned by the app so the filter survives page
-/// switches (an operator who filtered to errors does not want to re-filter
-/// after glancing at the config).
-#[derive(Debug, Clone)]
-pub struct LogView {
-    pub entries: Vec<LogEntry>,
-    /// Minimum level shown.
-    pub min_level: LogLevel,
-    /// Substring filter, matched case-insensitively against message+target.
-    pub filter: String,
-    /// Scroll offset in rows from the top of the filtered list.
-    pub scroll: usize,
-    /// Whether to keep the view pinned to the newest line.
-    pub follow: bool,
-}
-
-impl Default for LogView {
-    fn default() -> Self {
-        Self {
-            entries: Vec::new(),
-            min_level: LogLevel::Info,
-            filter: String::new(),
-            scroll: 0,
-            follow: true,
-        }
-    }
-}
-
-impl LogView {
-    /// Indices of the entries that pass the level and text filters.
-    pub fn visible(&self) -> Vec<usize> {
-        let needle = self.filter.trim().to_lowercase();
-        self.entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.level <= self.min_level)
-            .filter(|(_, e)| {
-                needle.is_empty()
-                    || e.message.to_lowercase().contains(&needle)
-                    || e.target.to_lowercase().contains(&needle)
-            })
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// Counts per level, shown next to the filter so the operator can see
-    /// whether filtering to errors would show anything at all.
-    pub fn counts(&self) -> [usize; 5] {
-        let mut c = [0usize; 5];
-        for e in &self.entries {
-            c[e.level as usize] += 1;
-        }
-        c
     }
 }
 
@@ -114,8 +54,13 @@ pub enum LogAction {
 struct LogState {
     view: LogView,
     /// While dragging the list's scrollbar: pointer offset below the thumb's
-    /// top edge.
+    /// top edge. Pixels — the same space `scroll_px` moves in.
     thumb_grab: Option<i32>,
+    /// While dragging: the knob's own top edge, pointer-minus-grab clamped to
+    /// the track. The painter draws the knob *here* (not at the offset's
+    /// derived position), and the offset comes from the same number — that is
+    /// what keeps the knob under the cursor one pixel at a time.
+    drag_top: Option<i32>,
 }
 
 /// The log page.
@@ -149,9 +94,6 @@ const BUTTON_W: i32 = 96;
 
 /// Width of the level-filter button.
 const LEVEL_W: i32 = 120;
-
-/// Line height of one log row.
-const ROW_LINE_H: i32 = 20;
 
 /// Inset from the well's edge to the text block (the well is inset like a card).
 const WELL_PAD: Insets = Insets::xy(18, 16);
@@ -234,6 +176,7 @@ impl LogPage {
         let st = Rc::new(RefCell::new(LogState {
             view: LogView::default(),
             thumb_grab: None,
+            drag_top: None,
         }));
         let on_action: ActionSlot<LogAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -254,8 +197,11 @@ impl LogPage {
             input.set_callback(move |i| {
                 let mut s = st_c.borrow_mut();
                 s.view.filter = i.value();
-                s.view.scroll = 0;
+                s.view.scroll_px = 0;
+                // A filter change re-pins to the newest match; everything the
+                // new view can show is by definition already seen.
                 s.view.follow = true;
+                s.view.seen_at_bottom = s.view.entries.len();
             });
         }
 
@@ -292,6 +238,7 @@ impl LogPage {
                         LogLevel::Error => LogLevel::Info,
                     };
                     s.view.follow = true;
+                    s.view.seen_at_bottom = s.view.entries.len();
                     s.view.min_level
                 };
                 lm.set_label(&format!("级别：{}", next.label()));
@@ -320,7 +267,9 @@ impl LogPage {
     ///
     /// Scrolling up leaves "follow" mode (the list stops jumping to the newest
     /// line); scrolling back to the bottom re-arms it, which is the behaviour a
-    /// tail -f reader expects.
+    /// tail -f reader expects. Both moves go through `LogView::scroll_to`, the
+    /// only writer of the offset, so the follow flag, the unread watermark and
+    /// the whole-group repaint cannot desynchronise from the offset itself.
     fn install_input(&self) {
         let st = self.st.clone();
         let rect = self.rect.clone();
@@ -340,16 +289,12 @@ impl LogPage {
                     if total <= rows {
                         return false;
                     }
-                    let cur = if s.view.follow {
-                        total - rows
-                    } else {
-                        s.view.scroll.min(total - 1)
-                    };
-                    let next = (cur as i32 + dy).clamp(0, (total - rows) as i32) as usize;
-                    s.view.follow = next + rows >= total;
-                    s.view.scroll = next;
+                    let cur = s.view.effective_scroll(total, rows);
+                    let changed = s.view.scroll_to(cur + dy * ROW_LINE_H, total, rows);
                     drop(s);
-                    page.redraw();
+                    if changed {
+                        page.redraw();
+                    }
                     true
                 }
                 PageInput::Push(lx, ly) => {
@@ -358,25 +303,33 @@ impl LogPage {
                     };
                     match bar.hit(lx + px, ly + py) {
                         Some(Hit::Thumb { grab }) => {
-                            st.borrow_mut().thumb_grab = Some(grab);
+                            // Anchor the knob where it is *shown*, not where
+                            // the offset says it should be: pressing must not
+                            // move it, and from here the pointer drags it.
+                            let mut s = st.borrow_mut();
+                            s.thumb_grab = Some(grab);
+                            s.drag_top = Some(bar.thumb_top());
+                            drop(s);
                             page.redraw();
                             true
                         }
                         Some(Hit::Track { dir }) => {
                             let mut s = st.borrow_mut();
                             let total = s.view.visible().len();
-                            let cur = if s.view.follow {
-                                total - rows
-                            } else {
-                                s.view.scroll
-                            };
-                            let next = (cur as i32 + dir * rows as i32)
-                                .clamp(0, (total - rows) as i32)
-                                as usize;
-                            s.view.follow = false;
-                            s.view.scroll = next;
+                            if total <= rows {
+                                return false;
+                            }
+                            let cur = s.view.effective_scroll(total, rows);
+                            // A track click pages by one viewport, the usual
+                            // scrollbar convention — in pixels, so the jump
+                            // lands row-aligned at the bottom.
+                            let changed =
+                                s.view
+                                    .scroll_to(cur + dir * rows as i32 * ROW_LINE_H, total, rows);
                             drop(s);
-                            page.redraw();
+                            if changed {
+                                page.redraw();
+                            }
                             true
                         }
                         None => false,
@@ -389,20 +342,38 @@ impl LogPage {
                     let Some(bar) = log_bar(&geometry, &solved, &st.borrow()) else {
                         return false;
                     };
-                    let row = (bar.scroll_at(ly + py - grab) / ROW_LINE_H).max(0) as usize;
+                    // One number drives both readers: the knob is drawn at
+                    // `pointer - grab` (clamped to the track, so it follows
+                    // the cursor pixel for pixel), and the content offset is
+                    // `scroll_at` of that same position — no division by the
+                    // row height anywhere in this path. `ly + py` converts
+                    // the page-relative pointer to the bar's absolute space.
+                    let (lo, hi) = bar.knob_top_range();
+                    let knob = (ly + py - grab).clamp(lo, hi);
+                    let offset = bar.scroll_at(knob);
                     {
                         let mut s = st.borrow_mut();
+                        s.drag_top = Some(knob);
                         let total = s.view.visible().len();
-                        let max = total.saturating_sub(rows);
-                        s.view.follow = false;
-                        s.view.scroll = row.min(max);
-                    }
+                        s.view.scroll_to(offset, total, rows)
+                    };
+                    // Repaint on every drag frame, not only when the offset
+                    // moved: the knob itself is the thing under the cursor.
+                    // FLTK coalesces repeated damage within one flush, so a
+                    // frame where only the knob settled costs one repaint.
                     page.redraw();
                     true
                 }
                 PageInput::Release => {
-                    let was = st.borrow_mut().thumb_grab.take();
+                    let was = {
+                        let mut s = st.borrow_mut();
+                        s.drag_top = None;
+                        s.thumb_grab.take()
+                    };
                     if was.is_some() {
+                        // Repaint: the knob settles onto the offset-derived
+                        // position and cools from the grabbed colour, without
+                        // waiting for the next poll.
                         page.redraw();
                     }
                     was.is_some()
@@ -415,16 +386,18 @@ impl LogPage {
         set_handler(&self.on_action, f);
     }
 
-    /// Replace the tail, keeping the filter, level and follow state.
+    /// Replace the tail, keeping the filter, scroll and follow state.
     pub fn set_view(&self, view: LogView) {
         // Only the entries come from the app each tick. Level, filter, scroll
         // and follow are the operator's, not the poller's: overwriting them made
-        // a wheel scroll snap back half a second later.
+        // a wheel scroll snap back half a second later. The cap and the unread
+        // watermark move with the entries — `adopt_entries` owns both.
         let mut s = self.st.borrow_mut();
-        s.view.entries = view.entries;
+        s.view.adopt_entries(view.entries);
         drop(s);
         self.filter.set_value(&self.st.borrow().view.filter);
-        // The list scrolls itself; keep the newest line in view.
+        // New lines under follow must land in view: repaint the whole group,
+        // not just the canvas.
         self.page.redraw();
     }
 
@@ -476,16 +449,13 @@ impl LogPage {
 /// Scroll bar for the log list, or `None` when the whole filtered view fits.
 ///
 /// Its track spans exactly the drawn rows, so it cannot poke past the well.
+/// Every argument is in pixels and comes from the same geometry the painter
+/// uses: the thumb's `scroll_at` inverse is the drag's offset, which is what
+/// makes the thumb stay under the pointer one pixel at a time.
 fn log_bar(geometry: &LogLayout, solved: &Solved, s: &LogState) -> Option<ScrollBar> {
     let text = geometry.text_area(solved);
     let rows = list_rows(solved.get(geometry.well).h);
     let total = s.view.visible().len();
-    // `scroll` counts from the top; in follow mode the view is pinned to the end.
-    let first = if s.view.follow {
-        total.saturating_sub(rows)
-    } else {
-        s.view.scroll.min(total.saturating_sub(1))
-    };
     ScrollBar::new(
         // In the well's right padding, clear of the text columns.
         text.right() + 7,
@@ -493,7 +463,7 @@ fn log_bar(geometry: &LogLayout, solved: &Solved, s: &LogState) -> Option<Scroll
         (rows as i32 * ROW_LINE_H).max(20),
         total as i32 * ROW_LINE_H,
         rows as i32 * ROW_LINE_H,
-        first as i32 * ROW_LINE_H,
+        s.view.effective_scroll(total, rows),
     )
 }
 
@@ -585,17 +555,20 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     }
 
     let rows = list_rows(well.h);
-    // `scroll` is an offset from the top; when following, pin to the end.
-    let start = if v.follow {
-        visible.len().saturating_sub(rows)
-    } else {
-        v.scroll.min(visible.len().saturating_sub(1))
-    };
-    let end = (start + rows).min(visible.len());
+    // One pixel offset drives everything below: the first row, its overshoot,
+    // the clipped draw window and the scrollbar all come from the same pair.
+    let scroll = v.effective_scroll(visible.len(), rows);
+    let (start, frac, count) = LogView::row_window(scroll, visible.len(), rows);
 
     let (ix, iw) = (text.x, text.w);
-    let mut ly = text.y + WELL_TOP_GAP;
-    for &idx in &visible[start..end] {
+    let track_top = text.y + WELL_TOP_GAP;
+    let track_h = rows as i32 * ROW_LINE_H;
+    // Clip to the track the scrollbar spans: a mid-drag frame shows the rows
+    // cut by the track edge, never over the well border. Whole rows are never
+    // cut (`max_scroll` ends are row-aligned), only intermediate frames are.
+    th::push_clip(ix, track_top, iw, track_h);
+    let mut ly = track_top - frac;
+    for &idx in &visible[start..start + count] {
         let e = &v.entries[idx];
         // Gutter: level code, then time, then target, then the message. The
         // columns are fixed so a long target never pushes text out of line.
@@ -628,92 +601,32 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
         );
         ly += ROW_LINE_H;
     }
+    th::pop_clip();
 
-    // Scrollbar for the list well.
+    // Scrollbar for the list well. While held, the knob shows the drag
+    // position, not the quantised offset's position.
     if let Some(bar) = log_bar(&geometry, &solved, s) {
-        bar.paint(s.thumb_grab.is_some());
+        bar.paint(s.thumb_grab.is_some(), s.drag_top);
     }
 
     // The scroll position is shown by the shared scrollbar above; only the
-    // paused-follow notice lives here.
+    // paused-follow notice lives here. While history is being read the line
+    // count that piled up behind the view is the point: "已暂停" says what
+    // stopped, "还有 N 条未读" says what is waiting.
     if visible.len() > rows && !v.follow {
-        th::micro(
-            "已暂停跟随 · 滚到底部恢复",
-            well.x + 16,
-            well.bottom() - 20,
-            300,
-            14,
-            C::AMBER,
-        );
+        let unread = v.unread(&visible);
+        let notice = if unread > 0 {
+            format!("还有 {unread} 条未读 · 滚到底部恢复")
+        } else {
+            "已暂停跟随 · 滚到底部恢复".to_string()
+        };
+        th::micro(&notice, well.x + 16, well.bottom() - 20, 300, 14, C::AMBER);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn entry(_seq: u64, level: LogLevel, msg: &str) -> LogEntry {
-        LogEntry {
-            time: "12:00:00.000".into(),
-            level,
-            target: "rx11_server::relay".into(),
-            message: msg.into(),
-        }
-    }
-
-    #[test]
-    fn level_filter_keeps_everything_at_or_above() {
-        let mut v = LogView {
-            entries: vec![
-                entry(1, LogLevel::Error, "boom"),
-                entry(2, LogLevel::Warn, "careful"),
-                entry(3, LogLevel::Info, "hello"),
-                entry(4, LogLevel::Debug, "detail"),
-            ],
-            min_level: LogLevel::Warn,
-            ..LogView::default()
-        };
-        assert_eq!(v.visible().len(), 2);
-        v.min_level = LogLevel::Trace;
-        assert_eq!(v.visible().len(), 4);
-    }
-
-    #[test]
-    fn text_filter_matches_message_and_target_case_insensitively() {
-        let mut v = LogView {
-            entries: vec![
-                entry(1, LogLevel::Info, "Relay listening on 0.0.0.0:7000"),
-                entry(2, LogLevel::Info, "session created"),
-            ],
-            filter: "LISTENING".into(),
-            ..LogView::default()
-        };
-        let vis = v.visible();
-        assert_eq!(vis.len(), 1);
-        assert_eq!(v.entries[vis[0]].message, "Relay listening on 0.0.0.0:7000");
-
-        v.filter = "rx11_server".into();
-        assert_eq!(v.visible().len(), 2);
-
-        v.filter = "  ".into();
-        assert_eq!(v.visible().len(), 2, "blank filter must not filter");
-    }
-
-    #[test]
-    fn counts_report_every_level() {
-        let v = LogView {
-            entries: vec![
-                entry(1, LogLevel::Error, "a"),
-                entry(2, LogLevel::Error, "b"),
-                entry(3, LogLevel::Info, "c"),
-            ],
-            ..LogView::default()
-        };
-        let c = v.counts();
-        assert_eq!(c[LogLevel::Error as usize], 2);
-        assert_eq!(c[LogLevel::Info as usize], 1);
-        assert_eq!(c[LogLevel::Debug as usize], 0);
-    }
 
     #[test]
     fn visible_rows_never_returns_zero() {

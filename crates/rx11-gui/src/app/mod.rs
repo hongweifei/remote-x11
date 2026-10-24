@@ -323,12 +323,9 @@ impl App {
                 });
             }
             a.state.log_seq = log_seq.max(log_records.last().map(|r| r.seq).unwrap_or(log_seq));
-            // Keep the in-memory tail bounded; the ring keeps the history.
-            let cap = 4000;
-            if view.entries.len() > cap {
-                let drop = view.entries.len() - cap;
-                view.entries.drain(0..drop);
-            }
+            // The tail cap and the unread watermark move with the entries, so
+            // the page owns both (`LogView::adopt_entries`); the poller must
+            // not resize the list behind the watermark's back.
             a.logs.set_view(view);
         }
 

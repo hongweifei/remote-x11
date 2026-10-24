@@ -4,6 +4,7 @@
 //! moved onto the tree; the tree must reproduce them, so a migration that shifts
 //! anything on screen fails here instead of only in a screenshot.
 
+use super::scroll::{apply_table_scroll, compute_row_hits};
 use super::*;
 
 /// Page 944x714 logical is what a 1180x800 window leaves the content area after
@@ -96,4 +97,142 @@ fn row_columns_track_the_row() {
         geometry.row_area(&solved).right(),
         "the action column closes the row"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Pixel scrolling: the window, the ends, and the button rule
+// ---------------------------------------------------------------------------
+
+fn sessions(n: usize) -> Vec<SessionRow> {
+    (0..n)
+        .map(|i| SessionRow {
+            id: i as u64 + 1,
+            role: crate::model::Role::Server,
+            health: Health::Running,
+            headline: "x".into(),
+            detail: String::new(),
+            sent: None,
+            received: None,
+            uptime: None,
+        })
+        .collect()
+}
+
+/// Both detents of the table's scroll range are row-aligned: resting the thumb
+/// at top or bottom shows whole rows, never a sliver. Only mid-drag frames are
+/// fractional.
+#[test]
+fn table_scroll_extends_are_row_aligned() {
+    for (total, fit) in [(12usize, 2usize), (12, 5), (2, 2), (400, 24)] {
+        let max = table_max_scroll(total, fit);
+        assert_eq!(max % Metrics::ROW_H, 0, "max {max} 必须落在整行上");
+        let (first, frac, count) = row_window(max, total, fit);
+        assert_eq!((first, frac), (total.saturating_sub(fit), 0));
+        assert!(first + count <= total);
+        let (first, frac, _) = row_window(0, total, fit);
+        assert_eq!((first, frac), (0, 0));
+    }
+}
+
+/// A fractional offset slides the window: the first slot is the row being cut
+/// by the top edge, and one extra slot is drawn so the row sliding in at the
+/// bottom is already on screen mid-drag. The count never runs past the list.
+#[test]
+fn row_window_tracks_the_fraction() {
+    let (first, frac, count) = row_window(46 * 3 + 12, 12, 2);
+    assert_eq!((first, frac), (3, 12));
+    assert_eq!(count, 3, "两行视口 + 滑进来的第三行");
+    // Near the end the window closes without overshooting the list.
+    let (first, frac, count) = row_window(table_max_scroll(12, 2), 12, 2);
+    assert_eq!((first, frac, count), (10, 0, 2));
+    // Nothing to scroll: exactly the fitting rows, aligned.
+    let (first, frac, count) = row_window(0, 2, 2);
+    assert_eq!((first, frac, count), (0, 0, 2));
+}
+
+/// `apply_table_scroll` is the only writer: clamped at both ends, and it only
+/// reports "changed" for real moves — the caller repaints on `true` alone
+/// (drag frames repaint unconditionally for the knob itself, wheel and track
+/// moves repaint on change).
+#[test]
+fn apply_table_scroll_clamps_and_only_reports_real_moves() {
+    let mut s = ConsoleState {
+        data: ConsoleData {
+            sessions: sessions(12),
+            ..ConsoleData::default()
+        },
+        rows: Vec::new(),
+        hover_stop: None,
+        pressed_stop: None,
+        scroll_px: 0,
+        thumb_grab: None,
+        drag_top: None,
+    };
+    assert!(!apply_table_scroll(&mut s, 0, 2), "不动不算变化");
+    assert!(apply_table_scroll(&mut s, 40, 2));
+    assert_eq!(s.scroll_px, 40);
+    let max = table_max_scroll(12, 2);
+    assert!(apply_table_scroll(&mut s, max + 9_999, 2));
+    assert_eq!(s.scroll_px, max, "越界必须夹到底");
+    assert!(
+        apply_table_scroll(&mut s, -50, 2),
+        "从底部一把推过头也是一次真实移动"
+    );
+    assert_eq!(s.scroll_px, 0, "负方向同样夹住");
+    assert!(
+        !apply_table_scroll(&mut s, -1, 2),
+        "已经贴着 0 再推不算移动"
+    );
+}
+
+/// The button rule the pointer handler depends on: a row half-scrolled past an
+/// edge still paints (clipped) but carries no 「停止」 hit rect — you cannot
+/// stop a session by clicking pixels that were cut away. And the hit rects
+/// slide with the rows, from the same solve that paints them.
+#[test]
+fn half_scrolled_rows_keep_the_row_but_lose_the_button() {
+    let geometry = build_layout(12);
+    let solved = geometry.solve(PAGE);
+    let area = geometry.row_area(&solved);
+    let fit = list_rows(area);
+    let list = sessions(12);
+
+    // At rest every fully visible row has a live button…
+    let hits = compute_row_hits(&geometry, &solved, &list, 0);
+    assert_eq!(hits.len(), fit + 1, "静止时多画的那一行整体裁掉");
+    let band_bottom = area.y + fit as i32 * Metrics::ROW_H;
+    for (slot, h) in hits.iter().enumerate().take(fit) {
+        let (_, sy, _, sh) = h
+            .stop
+            .unwrap_or_else(|| panic!("第 {slot} 行静止时应整行可见"));
+        assert!(sy >= area.y && sy + sh <= band_bottom, "按钮在行带内");
+        assert_eq!(h.session_id, slot as u64 + 1);
+    }
+    assert!(hits[fit].stop.is_none(), "视口外的那一行没有命中框");
+
+    // …dragged into a fraction, the top row's button has left the area.
+    let frac = 20;
+    let hits = compute_row_hits(&geometry, &solved, &list, frac);
+    assert_eq!(hits.len(), fit + 1);
+    assert!(hits[0].stop.is_none(), "被上边缘切掉的按钮不可点");
+    assert_eq!(hits[0].session_id, 1, "行内容还在，只是裁了");
+    for h in hits.iter().skip(1).take(fit - 1) {
+        assert!(h.stop.is_some(), "中间整行仍然可点");
+    }
+    if let Some((_, sy, _, sh)) = hits[1].stop {
+        assert_eq!(
+            sy,
+            area.y + Metrics::ROW_H - frac + (Metrics::ROW_H - 24) / 2,
+            "命中框随行一起平移"
+        );
+        assert!(sy >= area.y && sy + sh <= area.y + fit as i32 * Metrics::ROW_H);
+    } else {
+        panic!("拖动后的第二行仍是整行，按钮必须还在");
+    }
+
+    // At the bottom detent the last row is fully visible with its button —
+    // nothing dead-ends the table just because the offset moved.
+    let max = table_max_scroll(12, fit);
+    let hits = compute_row_hits(&geometry, &solved, &list, max);
+    assert!(hits.iter().take(fit).all(|h| h.stop.is_some()));
 }

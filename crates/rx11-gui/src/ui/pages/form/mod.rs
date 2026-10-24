@@ -312,6 +312,9 @@ struct FormState {
     /// While dragging the scrollbar: how far below the thumb's top edge the
     /// pointer grabbed it. `None` when not dragging.
     thumb_grab: Option<i32>,
+    /// While dragging: the knob's drawn top edge — pointer minus grab,
+    /// clamped to the track. The offset is derived from the same number.
+    drag_top: Option<i32>,
 }
 
 /// A settings page: a scrolling field form on the left, an action column on
@@ -347,6 +350,7 @@ impl FormPage {
             view_h: h,
             hover_row: None,
             thumb_grab: None,
+            drag_top: None,
         }));
         let on_action: ActionSlot<FormAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -703,7 +707,13 @@ impl FormPage {
                     // absolute space as the painters.
                     match bar.hit(px + page_rect.x, py + page_rect.y) {
                         Some(Hit::Thumb { grab }) => {
-                            st.borrow_mut().thumb_grab = Some(grab);
+                            // Anchor the knob where it is shown: pressing
+                            // must not move it; from there the pointer drags
+                            // it and the offset follows.
+                            let mut s = st.borrow_mut();
+                            s.thumb_grab = Some(grab);
+                            s.drag_top = Some(bar.thumb_top());
+                            drop(s);
                             page.redraw();
                             true
                         }
@@ -725,11 +735,27 @@ impl FormPage {
                         return false;
                     };
                     let Some(bar) = bar else { return false };
-                    apply_scroll(spec, &widgets, &st, &rect, &page, bar.scroll_at(py - grab));
+                    // One number drives both readers: the knob is drawn at
+                    // `pointer - grab` (clamped to the track), the content
+                    // offset is `scroll_at` of the same position. `PageInput`
+                    // is page-relative, the bar is absolute — convert, or
+                    // every drag offsets by the page origin.
+                    let (lo, hi) = bar.knob_top_range();
+                    let knob = (py + page_rect.y - grab).clamp(lo, hi);
+                    st.borrow_mut().drag_top = Some(knob);
+                    apply_scroll(spec, &widgets, &st, &rect, &page, bar.scroll_at(knob));
+                    // Repaint on every drag frame: the knob itself moved even
+                    // where the offset did not. FLTK coalesces damage within
+                    // one flush, so this costs no extra pass.
+                    page.redraw();
                     true
                 }
                 PageInput::Release => {
-                    let was = st.borrow_mut().thumb_grab.take();
+                    let was = {
+                        let mut s = st.borrow_mut();
+                        s.drag_top = None;
+                        s.thumb_grab.take()
+                    };
                     if was.is_some() {
                         page.redraw();
                     }
@@ -862,7 +888,7 @@ fn paint(spec: &FormSpec, rect: PageRect, s: &FormState, origin_x: i32) {
     // derives its own geometry from the page rect.
     let _ = (content_x, content_w);
     if let Some(bar) = scroll_bar(rect, s) {
-        bar.paint(s.thumb_grab.is_some());
+        bar.paint(s.thumb_grab.is_some(), s.drag_top);
     }
     paint_side(
         spec,

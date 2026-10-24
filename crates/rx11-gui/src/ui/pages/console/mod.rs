@@ -29,11 +29,16 @@ use crate::ui::chrome::{
 use crate::ui::controls::{BtnKind, Button};
 use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
 use crate::ui::scope::{Scope, ScopeData};
-use crate::ui::scrollbar::{Hit, ScrollBar};
-use crate::ui::{Page, PageInput};
+use crate::ui::Page;
 
 /// The background painter: page rect in, pixels out.
 type Painter = Box<dyn FnMut(i32, i32, i32, i32)>;
+
+/// Which part of the row list is visible, and how the pointer moves it.
+/// Split out when the per-file line rule fired; painting, hit testing and the
+/// scrollbar here read the same window that file computes.
+mod scroll;
+use scroll::{reflow_rows, row_window, session_bar, table_max_scroll, RowHit};
 
 /// Vertical rhythm of the page, in one place: `paint` and `layout` both read
 /// these, so a height change cannot desynchronise drawing from hit testing.
@@ -99,25 +104,23 @@ impl ConsoleData {
     }
 }
 
-/// One row's hit geometry. Recomputed in `layout`, so drawing and hit testing
-/// can never disagree about where a control is.
-#[derive(Clone, Copy)]
-struct RowHit {
-    session_id: u64,
-    stop: (i32, i32, i32, i32),
-}
-
 struct ConsoleState {
     data: ConsoleData,
     rows: Vec<RowHit>,
     hover_stop: Option<usize>,
     pressed_stop: Option<usize>,
-    /// First visible session row. The launcher keeps every session; the table
-    /// is windowed onto them, so this is a row index, not a pixel offset.
-    scroll: usize,
+    /// Scroll offset of the table in **pixels**. The launcher keeps every
+    /// session; the table is windowed onto them. Pixels rather than a row
+    /// index because a thumb drag produces a pixel offset: quantising it to
+    /// whole rows is what made the thumb lag up to 46 units behind the
+    /// pointer.
+    scroll_px: i32,
     /// While dragging the table's scrollbar: pointer offset below the thumb's
     /// top edge. `None` when not dragging.
     thumb_grab: Option<i32>,
+    /// While dragging: the knob's drawn top edge — pointer minus grab,
+    /// clamped to the track. The offset is derived from the same number.
+    drag_top: Option<i32>,
 }
 
 /// The overview page.
@@ -142,8 +145,9 @@ impl ConsolePage {
             rows: Vec::new(),
             hover_stop: None,
             pressed_stop: None,
-            scroll: 0,
+            scroll_px: 0,
             thumb_grab: None,
+            drag_top: None,
         }));
         let on_action: ActionSlot<ConsoleAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -193,8 +197,9 @@ impl ConsolePage {
             wid.handle(move |w, ev| {
                 let (mx, my) = fltk::app::event_coords();
                 let hit = st_ev.borrow().rows.iter().position(|r| {
-                    let (sx, sy, sw, sh) = r.stop;
-                    mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh
+                    r.stop.is_some_and(|(sx, sy, sw, sh)| {
+                        mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh
+                    })
                 });
                 match ev {
                     Event::Move | Event::Enter => {
@@ -250,71 +255,8 @@ impl ConsolePage {
         page
     }
 
-    /// Wheel and scrollbar input for the session table.
-    ///
-    /// The table is the only scrolling surface on this page, so the wheel works
-    /// anywhere on it; the bar sits at the table's right edge and is draggable.
-    fn install_input(&self) {
-        let st = self.st.clone();
-        let rect = self.rect.clone();
-        let page = self.page.clone();
-        self.page.on_input(move |input| {
-            let (px, py, pw, ph) = *rect.borrow();
-            // One solve, reused by every branch: the bar the pointer grabs is
-            // the bar that was painted.
-            let geometry = build_layout(st.borrow().data.sessions.len());
-            let solved = geometry.solve(Rect::new(px, py, pw, ph));
-            let card = geometry.session_card(&solved);
-            let area = geometry.row_area(&solved);
-            let fit = list_rows(area);
-            let scrollable = st.borrow().data.sessions.len() > fit;
-            let max = (st.borrow().data.sessions.len() as i32 - fit as i32).max(0);
-            match input {
-                PageInput::Wheel(dy) => {
-                    if dy == 0 || !scrollable {
-                        return false;
-                    }
-                    let step = if dy > 0 { 1 } else { -1 };
-                    let cur = st.borrow().scroll as i32;
-                    st.borrow_mut().scroll = (cur + step).clamp(0, max) as usize;
-                    page.redraw();
-                    true
-                }
-                PageInput::Push(lx, ly) => {
-                    let Some(bar) = session_bar(card, area, &st.borrow()) else {
-                        return false;
-                    };
-                    match bar.hit(lx + px, ly + py) {
-                        Some(Hit::Thumb { grab }) => {
-                            st.borrow_mut().thumb_grab = Some(grab);
-                            page.redraw();
-                            true
-                        }
-                        Some(Hit::Track { dir }) => {
-                            let cur = st.borrow().scroll as i32;
-                            st.borrow_mut().scroll = (cur + dir * 3).clamp(0, max) as usize;
-                            page.redraw();
-                            true
-                        }
-                        None => false,
-                    }
-                }
-                PageInput::Drag(_lx, ly) => {
-                    let Some(grab) = st.borrow().thumb_grab else {
-                        return false;
-                    };
-                    let Some(bar) = session_bar(card, area, &st.borrow()) else {
-                        return false;
-                    };
-                    let next = rows_for(bar.scroll_at(ly + py - grab));
-                    st.borrow_mut().scroll = next.min(max.max(0) as usize);
-                    page.redraw();
-                    true
-                }
-                PageInput::Release => st.borrow_mut().thumb_grab.take().is_some(),
-            }
-        });
-    }
+    // The wheel/drag/track input path for the session table lives in
+    // `scroll.rs`; the constructor wires it once.
 
     pub fn on_action<F: Fn(ConsoleAction) + 'static>(&self, f: F) {
         set_handler(&self.on_action, f);
@@ -375,32 +317,16 @@ impl ConsolePage {
 
         // Session rows: hit testing from the same solve that paints them, so a
         // scrolled row's 「停止」 button can never belong to another session.
-        let area = geometry.row_area(&solved);
-        let fit = list_rows(area);
-        let stop_w = SESSION_ACTION_W;
-        let mut rows = Vec::new();
-        let (start, end, list) = {
-            let st = self.st.borrow();
-            (
-                st.scroll,
-                st.data.sessions.len().min(st.scroll + fit),
-                st.data.sessions.clone(),
-            )
-        };
-        for slot in 0..(end.saturating_sub(start)) {
-            let ry = area.y + slot as i32 * Metrics::ROW_H;
-            let action = geometry.column_rects(&solved, slot)[4];
-            rows.push(RowHit {
-                session_id: list[start + slot].id,
-                stop: (
-                    action.right() - stop_w,
-                    ry + (Metrics::ROW_H - 24) / 2,
-                    stop_w,
-                    24,
-                ),
-            });
+        // Data can shrink under a stored offset (a session removed), so the
+        // clamp lives here too — the last line of defence behind
+        // `apply_table_scroll`.
+        let fit = list_rows(geometry.row_area(&solved));
+        {
+            let mut s = self.st.borrow_mut();
+            let max = table_max_scroll(s.data.sessions.len(), fit);
+            s.scroll_px = s.scroll_px.clamp(0, max);
         }
-        self.st.borrow_mut().rows = rows;
+        reflow_rows(&self.st, &geometry, &solved);
     }
 }
 
@@ -602,29 +528,6 @@ const ROW_CONTENT_H: i32 = 34;
 /// painter and a hit test disagree.
 fn list_rows(area: Rect) -> usize {
     (area.h / Metrics::ROW_H).max(1) as usize
-}
-
-/// Pixel scroll from a bar drag → first visible row.
-fn rows_for(scroll_px: i32) -> usize {
-    (scroll_px / Metrics::ROW_H).max(0) as usize
-}
-
-/// Scroll bar for the session table, or `None` when every row fits.
-///
-/// `area` is the solved row area: the track spans exactly the rows that are
-/// drawn, so it cannot leave the card.
-fn session_bar(card: Rect, area: Rect, s: &ConsoleState) -> Option<ScrollBar> {
-    let total = s.data.sessions.len() as i32;
-    // Sit in the card's right padding, not on top of the content: the last
-    // column here is the 停止 button, and an inside-the-content bar lands on it.
-    ScrollBar::new(
-        card.right() - 11,
-        area.y,
-        area.h.max(20),
-        total * Metrics::ROW_H,
-        list_rows(area) as i32 * Metrics::ROW_H,
-        s.scroll as i32 * Metrics::ROW_H,
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -830,15 +733,23 @@ fn paint_sessions(geometry: &ConsoleLayout, solved: &Solved, s: &ConsoleState) {
         return;
     }
 
-    let end = d.sessions.len().min(s.scroll + fit);
-    for slot in 0..(end.saturating_sub(s.scroll)) {
-        let i = s.scroll + slot;
-        let row = &d.sessions[i];
-        let ry = area.y + slot as i32 * Metrics::ROW_H;
+    // One pixel offset drives the window: the rows slide with `frac`, clipped
+    // to the row area. The extra slot at the bottom is the row sliding in —
+    // without it the drag would show a gap until the next whole row.
+    let scroll = s
+        .scroll_px
+        .clamp(0, table_max_scroll(d.sessions.len(), fit));
+    let (first, frac, count) = row_window(scroll, d.sessions.len(), fit);
+    // Clip to the same band `compute_row_hits` measured button visibility
+    // against: one rectangle for the drawn window, the hit rule and the
+    // scrollbar's view — never a second one.
+    th::push_clip(area.x, area.y, area.w, fit as i32 * Metrics::ROW_H);
+    let mut ry = area.y - frac;
+    for slot in 0..count {
+        let row = &d.sessions[first + slot];
         let row_cols = geometry.column_rects(solved, slot);
         paint_session_row(&row_cols, ry, row);
-        if let Some(r) = s.rows.get(slot) {
-            let (sx, sy, sw, sh) = r.stop;
+        if let Some((sx, sy, sw, sh)) = s.rows.get(slot).and_then(|r| r.stop) {
             let hovered = s.hover_stop == Some(slot);
             let pressed = s.pressed_stop == Some(slot);
             let (fill, text) = if pressed {
@@ -868,10 +779,12 @@ fn paint_sessions(geometry: &ConsoleLayout, solved: &Solved, s: &ConsoleState) {
                 Align::Center,
             );
         }
+        ry += Metrics::ROW_H;
     }
+    th::pop_clip();
 
     if let Some(bar) = session_bar(card, area, s) {
-        bar.paint(s.thumb_grab.is_some());
+        bar.paint(s.thumb_grab.is_some(), s.drag_top);
     }
 }
 
