@@ -14,7 +14,7 @@
 //! continuously, but never carries a live button.
 
 use super::*;
-use crate::ui::scrollbar::ScrollBar;
+use crate::ui::scrollbar::{list_max_scroll, list_row_window, ScrollBar};
 use crate::ui::PageInput;
 
 /// One row's hit geometry. Recomputed whenever the visible window moves, so
@@ -31,20 +31,19 @@ pub(super) struct RowHit {
 }
 
 /// Scrollable range in pixels for `total` sessions in a window of `fit` rows.
-/// Like the log well, both ends are row-aligned: the thumb's bottom detents
-/// onto the last whole row.
+/// Delegates to the shared [`list_max_scroll`] with the table's row height —
+/// same arithmetic as the log well, so both lists hide and show the bar under
+/// exactly the same condition.
 pub(super) fn table_max_scroll(total: usize, fit: usize) -> i32 {
-    (total as i32 - fit as i32).max(0) * Metrics::ROW_H
+    list_max_scroll(total, fit, Metrics::ROW_H)
 }
 
 /// The pixel offset → the row window: first row slot, how far it has scrolled
 /// past the top of the area, and how many slots to draw (one extra so the row
-/// sliding in at the bottom is already on screen mid-drag).
+/// sliding in at the bottom is already on screen mid-drag). The shared
+/// [`list_row_window`], parameterised by the table's row height.
 pub(super) fn row_window(scroll_px: i32, total: usize, fit: usize) -> (usize, i32, usize) {
-    let first = (scroll_px / Metrics::ROW_H).max(0) as usize;
-    let frac = scroll_px.rem_euclid(Metrics::ROW_H);
-    let count = (fit + 1).min(total.saturating_sub(first));
-    (first, frac, count)
+    list_row_window(scroll_px, total, fit, Metrics::ROW_H)
 }
 
 /// Clamp a pixel offset into the table's range and store it.
@@ -146,10 +145,13 @@ pub(super) fn session_bar(card: Rect, area: Rect, s: &ConsoleState) -> Option<Sc
     let fit = list_rows(area) as i32;
     // Sit in the card's right padding, not on top of the content: the last
     // column here is the 停止 button, and an inside-the-content bar lands on it.
+    // The track spans exactly the drawn band — `fit` rows, not the solved
+    // area's slack — so the clip, the button rule, the bar and the viewport
+    // step are one rectangle (the third layout baseline, DESIGN §3).
     ScrollBar::new(
         card.right() - 11,
         area.y,
-        area.h.max(20),
+        (fit * Metrics::ROW_H).max(20),
         total * Metrics::ROW_H,
         fit * Metrics::ROW_H,
         s.scroll_px

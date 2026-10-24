@@ -8,6 +8,7 @@
 //! long before a screenshot could say anything about them.
 
 use crate::model::LogLevel;
+use crate::ui::scrollbar::{list_max_scroll, list_row_window};
 
 /// One rendered log record.
 #[derive(Debug, Clone)]
@@ -30,9 +31,11 @@ pub(super) const ROW_LINE_H: i32 = 20;
 pub(super) const TAIL_CAP: usize = 4000;
 
 /// Scrollable range in pixels for a list of `total` rows in a window of
-/// `rows`. Zero when everything fits — the same condition that hides the bar.
+/// `rows`. Delegates to the shared [`list_max_scroll`] with this page's line
+/// height, so the log well and the session table cannot disagree about the
+/// arithmetic that decides when the bar appears.
 pub(super) fn max_scroll(total: usize, rows: usize) -> i32 {
-    (total as i32 - rows as i32).max(0) * ROW_LINE_H
+    list_max_scroll(total, rows, ROW_LINE_H)
 }
 
 /// The page's view state, owned by the app so the filter survives page
@@ -118,12 +121,10 @@ impl LogView {
 
     /// The row window for a pixel offset: first visible row, how far it has
     /// scrolled past the top of the track, and how many slots to draw (one
-    /// extra so the partially scrolled-in row at the bottom shows).
+    /// extra so the partially scrolled-in row at the bottom shows). The
+    /// arithmetic itself is the shared [`list_row_window`].
     pub(super) fn row_window(scroll_px: i32, total: usize, rows: usize) -> (usize, i32, usize) {
-        let first = (scroll_px / ROW_LINE_H).max(0) as usize;
-        let frac = scroll_px.rem_euclid(ROW_LINE_H);
-        let count = (rows + 1).min(total.saturating_sub(first));
-        (first, frac, count)
+        list_row_window(scroll_px, total, rows, ROW_LINE_H)
     }
 
     /// Move the viewport to a pixel offset. Returns whether anything changed.

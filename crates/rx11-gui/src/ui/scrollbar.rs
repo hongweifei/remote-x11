@@ -149,6 +149,40 @@ impl ScrollBar {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The row window — shared by every scrolling list
+// ---------------------------------------------------------------------------
+//
+// Both scrolling lists in this console (the log well at 20px lines, the
+// session table at 46px rows) derive their visible window from the pixel
+// offset the same way. The formulas used to be copied into each page; they
+// live here once, in pure geometry, so a page can unit-test its own scroll
+// arithmetic without a display and neither list can drift from the other.
+
+/// Scrollable range in pixels for `total` rows of height `row_h` in a window
+/// of `fit` rows: zero when everything fits — the exact condition that hides
+/// the bar. Both ends are row-aligned, so resting at either end shows no
+/// half row.
+pub fn list_max_scroll(total: usize, fit: usize, row_h: i32) -> i32 {
+    (total as i32 - fit as i32).max(0) * row_h
+}
+
+/// The pixel offset → the row window: the first drawn row slot, how far that
+/// row has scrolled past the top of the area (`0..row_h`), and how many slots
+/// to draw — one extra so the row sliding in at the bottom is already on
+/// screen mid-drag rather than a gap until the next whole row.
+pub fn list_row_window(
+    scroll_px: i32,
+    total: usize,
+    fit: usize,
+    row_h: i32,
+) -> (usize, i32, usize) {
+    let first = (scroll_px / row_h).max(0) as usize;
+    let frac = scroll_px.rem_euclid(row_h);
+    let count = (fit + 1).min(total.saturating_sub(first));
+    (first, frac, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -158,6 +192,27 @@ mod tests {
     /// old row-quantised build.
     fn bar() -> ScrollBar {
         ScrollBar::new(1400, 316, 478, 400 * 20, 24 * 20, 0).unwrap()
+    }
+
+    /// The shared row-window arithmetic, pinned at its source. Both scrolling
+    /// lists delegate here; the pages' own tests exercise it through their
+    /// row-height constants (20 and 46), this covers the general shape.
+    #[test]
+    fn row_window_is_pure_division_and_row_aligned_at_both_ends() {
+        // At rest: first row, no overshoot, fit+1 slots (capped by total).
+        assert_eq!(list_row_window(0, 100, 10, 20), (0, 0, 11));
+        // A full row down: the window advances one, no overshoot.
+        assert_eq!(list_row_window(20, 100, 10, 20), (1, 0, 11));
+        // Mid-row: the first slot is clipped by a fraction.
+        assert_eq!(list_row_window(25, 100, 10, 20), (1, 5, 11));
+        // Both ends are row-aligned: the maximum offset shows whole rows.
+        assert_eq!(list_max_scroll(100, 10, 20), 90 * 20);
+        let (first, frac, count) = list_row_window(90 * 20, 100, 10, 20);
+        assert_eq!((first, frac), (90, 0), "底部不留残行");
+        assert_eq!(count, 10, "最后一屏没有第 11 行可滑入");
+        // Content shorter than the window: no scroll, one row, nothing extra.
+        assert_eq!(list_max_scroll(5, 10, 20), 0);
+        assert_eq!(list_row_window(0, 5, 10, 20), (0, 0, 5));
     }
 
     /// The algebra behind "跟手": the drag path is `scroll_at(pointer)` and the
