@@ -377,9 +377,15 @@ async fn s6_stream_pressure() {
 
 /// An X11-shaped byte stream: connection setup followed by `frames`
 /// ZPixmap PutImage requests (depth 24, 64x96 => 24 KiB pixels each).
+/// Layouts follow Xproto.h, matching what the recode machine parses:
+/// the setup request has a 12-byte fixed header; each PutImage request
+/// is `opcode(1) format(1) length(2, in 4-byte units) drawable(4) gc(4)
+/// width(2) height(2) dst-x(2) dst-y(2) left-pad(1) depth(1) unused(2)`
+/// = 24 bytes, then the pixels.
 fn x_traffic(frames: usize, seed: u8) -> Vec<u8> {
     let mut v = Vec::new();
-    // setup: 'l', major 11, name "MIT-MAGIC-COOKIE-1"(18->20 pad), auth 16B
+    // setup: 'l', major 11, minor 0, name "MIT-MAGIC-COOKIE-1"(18->20 pad),
+    // auth 16B, plus the two unused bytes the fixed 12-byte header carries.
     v.extend_from_slice(&[b'l', 0]);
     v.extend_from_slice(&11u16.to_le_bytes());
     v.extend_from_slice(&0u16.to_le_bytes());
@@ -387,22 +393,24 @@ fn x_traffic(frames: usize, seed: u8) -> Vec<u8> {
     let auth = [seed; 16];
     v.extend_from_slice(&(name.len() as u16).to_le_bytes());
     v.extend_from_slice(&(auth.len() as u16).to_le_bytes());
+    v.extend_from_slice(&[0, 0]);
     v.extend_from_slice(name);
-    v.resize(10 + ((name.len() + 3) & !3), 0);
+    v.resize(12 + ((name.len() + 3) & !3), 0);
     v.extend_from_slice(&auth);
     v.resize(v.len() + ((4 - (auth.len() % 4)) % 4), 0);
     for f in 0..frames {
         let (w, h) = (64u16, 96u16);
         let data_len = w as usize * h as usize * 4;
         let total = 24 + data_len;
-        v.push(53);
+        v.push(72);
         v.push(2);
-        v.extend_from_slice(&[0, 0]);
-        v.extend_from_slice(&((total / 4) as u32).to_le_bytes());
+        v.extend_from_slice(&((total / 4) as u16).to_le_bytes());
         v.extend_from_slice(&1u32.to_le_bytes());
         v.extend_from_slice(&2u32.to_le_bytes());
         v.extend_from_slice(&w.to_le_bytes());
         v.extend_from_slice(&h.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
+        v.extend_from_slice(&0u16.to_le_bytes());
         v.push(0);
         v.push(24);
         v.extend_from_slice(&[0, 0]);
@@ -461,25 +469,19 @@ async fn s7_recode_end_to_end() {
             assert_eq!(got, traffic, "png tier must be byte-exact end to end");
         } else {
             assert_eq!(got.len(), traffic.len(), "jpeg must keep framing sizes");
-            assert_eq!(&got[..10], &traffic[..10], "setup survives");
+            assert_eq!(&got[..12], &traffic[..12], "setup survives");
             // each PutImage header (24B) must be intact at its offsets
             let mut pos = 0usize;
             let mut headers = 0;
             while pos + 24 <= got.len() {
-                if got[pos] == 53 && got[pos + 1] == 2 {
+                if got[pos] == 72 && got[pos + 1] == 2 {
                     assert_eq!(
                         &got[pos..pos + 24],
                         &traffic[pos..pos + 24],
                         "header {headers} at {pos}"
                     );
-                    let len_b32 = u32::from_le_bytes([
-                        got[pos + 4],
-                        got[pos + 5],
-                        got[pos + 6],
-                        got[pos + 7],
-                    ]) as usize
-                        * 4;
-                    pos += len_b32;
+                    let len_b32 = u16::from_le_bytes([got[pos + 2], got[pos + 3]]) as usize;
+                    pos += len_b32 * 4;
                     headers += 1;
                 } else {
                     pos += 1;
