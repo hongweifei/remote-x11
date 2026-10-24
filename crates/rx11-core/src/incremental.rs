@@ -133,15 +133,47 @@ impl ConnectionDataCache {
         let (base_sequence_id, old_data) = self.get_cached(connection_id)?;
 
         if new_data.len() < self.params.min_block_size {
+            // Below the chunk-diff floor, a diff is all overhead — but an
+            // EXACTLY-equal payload can still win: a reference frame carries
+            // zero content, and it pays off as soon as the payload exceeds
+            // the fixed diff header (18 payload bytes; a plain frame's own
+            // 11-byte header is paid either way). Small repeats — key
+            // auto-repeat, polling requests — are exactly this traffic.
+            if new_data.len() > IncrementalDefaults::REFERENCE_OVERHEAD && new_data == old_data {
+                return Some(IncrementalStreamDataMessage {
+                    connection_id,
+                    sequence_id: new_sequence_id,
+                    base_sequence_id,
+                    total_len: new_data.len(),
+                    chunks: Vec::new(),
+                });
+            }
             return None;
         }
 
         let chunks = self.compute_diff_chunks(old_data, new_data, &take);
 
-        // Identical payload: an empty diff relies on the receiver's cache
-        // staying in sync; fall back to a full (compressible) frame instead.
+        // An unchanged payload ships as a *reference frame*: the diff itself
+        // is empty, so the content travels zero bytes while the frame still
+        // carries its sequence number and length — the receiver expands it
+        // out of the base it already holds. Skipping the frame entirely is
+        // not an option: the byte stream is positional, and a frame the
+        // receiver cannot tell apart from "never sent" would lose bytes.
+        // Empty chunks mean "identical" only when the lengths agree: chunk
+        // walking stops at the NEW length, so a truncated prefix scans empty
+        // too — and the receiver could never expand it from its base (the
+        // guard in `apply_incremental` refuses such frames from any peer;
+        // this is the sender-side half of the same rule). A true diff of a
+        // changed payload clears the savings ratio below and never reaches
+        // this branch with zero chunks.
         if chunks.is_empty() {
-            return None;
+            return (new_data.len() == old_data.len()).then_some(IncrementalStreamDataMessage {
+                connection_id,
+                sequence_id: new_sequence_id,
+                base_sequence_id,
+                total_len: new_data.len(),
+                chunks,
+            });
         }
 
         let saved_bytes = old_data
@@ -150,6 +182,7 @@ impl ConnectionDataCache {
 
         // Only send a diff when it saves a meaningful fraction of the base
         // frame; the floor matches the previous `len() / 10` integer rule.
+        // An unchanged payload saves the whole base, so it clears any ratio.
         let min_saved = (old_data.len() as f64 * self.params.min_savings_ratio) as usize;
         if saved_bytes < min_saved {
             return None;
@@ -207,6 +240,15 @@ impl ConnectionDataCache {
 
         let mut result = BytesMut::zeroed(msg.total_len);
 
+        if msg.chunks.is_empty() && cached_data.len() != msg.total_len {
+            // A reference frame says "re-emit my base" — a declared length
+            // that differs from the base is provably malformed (a diff of an
+            // unchanged payload always keeps the length), so refuse the WHOLE
+            // frame: expanding it would hand the caller zero-padded or
+            // truncated bytes and re-poison the cache on every retry.
+            return None;
+        }
+
         if cached_data.len() <= msg.total_len {
             result[..cached_data.len()].copy_from_slice(cached_data);
         } else {
@@ -248,6 +290,7 @@ impl Default for ConnectionDataCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::BinaryMessageCodec;
     use crate::types::ConnectionId;
 
     #[test]
@@ -316,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn test_compute_incremental_identical() {
+    fn test_compute_incremental_identical_yields_reference_frame() {
         let mut cache = ConnectionDataCache::new();
         let conn_id = ConnectionId::new(1);
         let data = vec![0u8; 2048];
@@ -324,7 +367,109 @@ mod tests {
         cache.update_cache(conn_id, 1, &data);
         let result = cache.compute_incremental(conn_id, 2, &data);
 
-        assert!(result.is_none());
+        // An unchanged payload still produces a frame — the sequence number
+        // is part of the positional byte stream and cannot be skipped — but
+        // the frame carries NO content: the receiver expands it from its
+        // own base. This is the "don't retransmit what did not change" win.
+        let msg = result.expect("reference frame");
+        assert!(msg.chunks.is_empty());
+        assert_eq!(msg.base_sequence_id, 1);
+        assert_eq!(msg.total_len, 2048);
+    }
+
+    #[test]
+    fn test_small_payload_reference_frame_below_diff_floor() {
+        // 32 bytes < 1024 diff floor, but > 18 bytes overhead — an EXACTLY
+        // identical repeat wins via reference frame instead of sending whole.
+        let mut cache = ConnectionDataCache::new();
+        let conn_id = ConnectionId::new(1);
+        let small = [0xABu8; 32];
+        cache.update_cache(conn_id, 1, &small);
+        let result = cache.compute_incremental(conn_id, 2, &small);
+        assert!(
+            result.is_some(),
+            "exact repeat must emit reference even below diff floor"
+        );
+        let msg = result.unwrap();
+        assert!(msg.chunks.is_empty());
+        assert_eq!(msg.total_len, 32);
+        // Non-identical does NOT produce reference when below diff floor.
+        let changed = [0xACu8; 32];
+        let result = cache.compute_incremental(conn_id, 3, &changed);
+        assert!(
+            result.is_none(),
+            "different payload below diff floor must not emit reference"
+        );
+    }
+
+    #[test]
+    fn test_apply_reference_frame_expands_from_base() {
+        let mut cache = ConnectionDataCache::new();
+        let conn_id = ConnectionId::new(1);
+        let data = vec![3u8; 2048];
+        cache.update_cache(conn_id, 1, &data);
+
+        let msg = IncrementalStreamDataMessage {
+            connection_id: conn_id,
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: 2048,
+            chunks: vec![],
+        };
+        let result = cache.apply_incremental(&msg).expect("reference applies");
+        assert_eq!(result, Bytes::from(data.clone()));
+
+        // The reference becomes the new base: a later diff applies against
+        // THIS sequence, and a stale reference (wrong base) is refused so
+        // the standard resync path can heal.
+        let stale = IncrementalStreamDataMessage {
+            sequence_id: 3,
+            base_sequence_id: 1,
+            ..msg
+        };
+        assert_eq!(cache.apply_incremental(&stale), None);
+    }
+
+    #[test]
+    fn test_reference_frame_survives_the_codec() {
+        // 0x22 encodes with a 20-byte header and zero chunk entries; the
+        // empty-chunk shape must round-trip exactly (this is what actually
+        // crosses the wire).
+        let msg = IncrementalStreamDataMessage {
+            connection_id: ConnectionId::new(1),
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: 2048,
+            chunks: vec![],
+        };
+        let encoded = msg.encode_payload().unwrap();
+        assert_eq!(encoded.len(), 4 + 4 + 4 + 4 + 2);
+        let decoded = IncrementalStreamDataMessage::decode_payload(&encoded).unwrap();
+        assert_eq!(decoded.connection_id, msg.connection_id);
+        assert_eq!(decoded.sequence_id, 2);
+        assert_eq!(decoded.base_sequence_id, 1);
+        assert_eq!(decoded.total_len, 2048);
+        assert!(decoded.chunks.is_empty());
+    }
+
+    #[test]
+    fn test_apply_refuses_malformed_reference_frame() {
+        // A zero-chunk frame whose declared length differs from the base is
+        // provably malformed: refuse it (caller resyncs) instead of
+        // delivering a zero-padded or truncated expansion.
+        let mut cache = ConnectionDataCache::new();
+        let conn_id = ConnectionId::new(1);
+        cache.update_cache(conn_id, 1, &vec![5u8; 2048]);
+        let msg = IncrementalStreamDataMessage {
+            connection_id: conn_id,
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: 1024,
+            chunks: vec![],
+        };
+        assert_eq!(cache.apply_incremental(&msg), None);
+        // The base stays where it was: the next whole frame re-establishes.
+        assert_eq!(cache.get_cached(conn_id).unwrap().0, 1);
     }
 
     #[test]

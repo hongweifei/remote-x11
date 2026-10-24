@@ -95,6 +95,12 @@ impl IncrementalDefaults {
     /// Minimum fraction of the base frame that must be saved for a diff
     /// frame to be worth sending.
     pub const MIN_SAVINGS_RATIO: f64 = 0.1;
+    /// Fixed payload of a reference frame — the chunk-diff header with zero
+    /// chunks (`conn + seq + base_seq + total_len + chunk_count` =
+    /// 4+4+4+4+2 bytes). A repeat of a payload longer than this ships as a
+    /// reference instead of whole even below the diff floor: the frame is
+    /// mandatory on a positional stream, but its CONTENT is free.
+    pub const REFERENCE_OVERHEAD: usize = 18;
 }
 
 impl FlowDefaults {

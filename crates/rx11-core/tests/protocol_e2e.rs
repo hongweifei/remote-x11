@@ -357,6 +357,122 @@ async fn data_plane_diff_and_self_heal_over_the_wire() {
     );
 }
 
+/// An unchanged payload no longer retransmits its content: it ships as an
+/// empty-chunk reference frame. The frame itself still crosses the wire —
+/// the byte stream is positional, so the sequence number and the declared
+/// length must advance — but the bytes travel zero instead of the whole
+/// payload again, and the receiver expands them out of its own base.
+#[tokio::test]
+async fn unchanged_payload_crosses_the_wire_as_a_reference_frame() {
+    let (mut session, _features, _compression) = negotiated_session().await;
+    let server_dp = test_dataplane(DataPlaneSide::Relay);
+    let client_dp = test_dataplane(DataPlaneSide::Client);
+    let mut server_cache = ConnectionDataCache::with_chunk_size(1024);
+    let mut client_cache = ConnectionDataCache::new();
+    let relay_stats = ConnectionStats::new();
+    let client_stats = ConnectionStats::new();
+    let conn = ConnectionId::new(11);
+
+    let payload = vec![0x5Au8; 2048];
+
+    // 1) Establish the base: whole frame (nothing to reference yet).
+    let seq = server_cache.next_sequence_for(conn);
+    let frame = server_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(payload.clone()),
+        Some(&mut server_cache),
+        Some(&relay_stats),
+    );
+    assert!(matches!(frame, Frame::StreamData(_)), "{frame:?}");
+    relay_send(&mut session, &frame).await;
+    match client_dp.apply_inbound(
+        client_recv(&mut session).await,
+        &mut client_cache,
+        &client_stats,
+    ) {
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(payload.clone())),
+        other => panic!("expected payload, got {other:?}"),
+    }
+
+    // 2) Byte-for-byte the same payload again: zero content on the wire.
+    let seq = server_cache.next_sequence_for(conn);
+    let frame = server_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(payload.clone()),
+        Some(&mut server_cache),
+        Some(&relay_stats),
+    );
+    match &frame {
+        Frame::IncrementalStreamData(m) => {
+            assert!(m.chunks.is_empty(), "reference frame must carry no chunks");
+            assert_eq!(m.total_len, payload.len());
+            assert_eq!(m.base_sequence_id, 1);
+        }
+        other => panic!("expected reference frame, got {other:?}"),
+    }
+    // The whole frame is header + 18 payload bytes: the content did not
+    // travel a second time.
+    let wire = encode_frame(&frame).unwrap().len();
+    assert!(
+        wire <= 40,
+        "reference frame should be tiny, got {wire} bytes"
+    );
+
+    relay_send(&mut session, &frame).await;
+    match client_dp.apply_inbound(
+        client_recv(&mut session).await,
+        &mut client_cache,
+        &client_stats,
+    ) {
+        // The reference expands to an identical copy: the local X server
+        // still receives BOTH writes, byte-exact, in order.
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(payload.clone())),
+        other => panic!("expected payload, got {other:?}"),
+    }
+
+    // 3) The reference became the new base — a real change still diffs
+    //    cleanly against it.
+    let mut changed = payload.clone();
+    changed[1200..1400].fill(0x11);
+    let seq = server_cache.next_sequence_for(conn);
+    let frame = server_dp.build_frame(
+        conn,
+        seq,
+        Bytes::from(changed.clone()),
+        Some(&mut server_cache),
+        Some(&relay_stats),
+    );
+    assert!(
+        matches!(frame, Frame::IncrementalStreamData(_)),
+        "{frame:?}"
+    );
+    relay_send(&mut session, &frame).await;
+    match client_dp.apply_inbound(
+        client_recv(&mut session).await,
+        &mut client_cache,
+        &client_stats,
+    ) {
+        InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(changed)),
+        other => panic!("expected payload, got {other:?}"),
+    }
+
+    // Two diff frames sent (reference + changed), both applied. Savings:
+    // the reference saved its whole 2048; the changed frame ships one
+    // 1024-byte chunk (the region lands inside it) and saves 1024.
+    let relay_summary = relay_stats.summary();
+    assert!(
+        relay_summary.contains("Incremental: 2 frames") && relay_summary.contains("saved 3.0 KB"),
+        "{relay_summary}"
+    );
+    let client_summary = client_stats.summary();
+    assert!(
+        client_summary.contains("Incremental: 2 frames") && client_summary.contains("saved 3.0 KB"),
+        "{client_summary}"
+    );
+}
+
 /// The CLIENT's request stream (local X server → relay) goes through the
 /// same chain as the picture, mirrored: diffs ride the wire once
 /// `incremental_uplink` negotiated, compression stacks on top of them

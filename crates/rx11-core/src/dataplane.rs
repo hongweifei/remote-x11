@@ -593,6 +593,93 @@ mod tests {
     }
 
     #[test]
+    fn reference_frame_stays_out_of_the_compression_stream() {
+        // An 18-byte encoded diff is below the compression threshold, so it
+        // rides plain 0x22 — and per the stream lockstep rule the encoder is
+        // untouched on BOTH ends, so later compressed diffs still decode.
+        let rt = runtime();
+        let sender = DataPlane::new(
+            DataPlaneSide::Relay,
+            all_features(),
+            Some(CompressionAlgo::ZstdStream),
+            &rt,
+        );
+        let receiver = DataPlane::new(
+            DataPlaneSide::Client,
+            all_features(),
+            Some(CompressionAlgo::ZstdStream),
+            &rt,
+        );
+        let mut send_cache = ConnectionDataCache::with_chunk_size(1024);
+        let mut recv_cache = ConnectionDataCache::new();
+        let stats = ConnectionStats::new();
+        let payload = Bytes::from_static(&[0xAB; 2048]);
+
+        // Establish the base through the real chain (whole payload,
+        // compressed to 0x21 — above threshold; the diff path finds no base
+        // yet but caches it, which is exactly what the reference below
+        // points at).
+        let frame = sender.build_frame(
+            conn(),
+            1,
+            payload.clone(),
+            Some(&mut send_cache),
+            Some(&stats),
+        );
+        assert!(matches!(frame, Frame::CompressedStreamData(_)), "{frame:?}");
+        match receiver.apply_inbound(frame, &mut recv_cache, &stats) {
+            InboundOutcome::Payload { data, .. } => assert_eq!(data, payload),
+            other => panic!("{other:?}"),
+        }
+
+        // Identical payload: a reference frame, and it must NOT be compressed.
+        let frame = sender.build_frame(
+            conn(),
+            2,
+            payload.clone(),
+            Some(&mut send_cache),
+            Some(&stats),
+        );
+        match &frame {
+            Frame::IncrementalStreamData(m) => {
+                assert!(m.chunks.is_empty());
+                assert_eq!(m.base_sequence_id, 1);
+            }
+            other => panic!("expected plain reference frame, got {other:?}"),
+        }
+        match receiver.apply_inbound(frame, &mut recv_cache, &stats) {
+            InboundOutcome::Payload { data, .. } => assert_eq!(data, payload),
+            other => panic!("{other:?}"),
+        }
+
+        // And the compression stream survived the reference frame: a changed
+        // payload still produces a compressed diff that decodes cleanly.
+        // The changes stay inside ONE 1024-byte diff block (diff granularity
+        // is the whole block, and one block saves enough to clear the ratio).
+        let mut changed = payload.to_vec();
+        changed[100..200].fill(0x00);
+        changed[300..400].fill(0x00);
+        changed[500..600].fill(0x00);
+        let frame = sender.build_frame(
+            conn(),
+            3,
+            Bytes::from(changed.clone()),
+            Some(&mut send_cache),
+            Some(&stats),
+        );
+        match &frame {
+            Frame::CompressedIncrementalStreamData(m) => {
+                assert!(m.original_len >= rt.compression_threshold);
+            }
+            other => panic!("expected compressed diff after reference, got {other:?}"),
+        }
+        match receiver.apply_inbound(frame, &mut recv_cache, &stats) {
+            InboundOutcome::Payload { data, .. } => assert_eq!(data, Bytes::from(changed)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn record_outbound_compressed_diff_reports_both_layers() {
         let stats = ConnectionStats::new();
         let frame =
