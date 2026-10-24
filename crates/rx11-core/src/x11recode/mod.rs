@@ -161,16 +161,14 @@ impl DownstreamReencoder {
                 return; // request header (opcode, data, length) incomplete
             }
             // The request length is at bytes 2..4, in 4-byte units; 0 marks an
-            // extended request whose length is the u32 pair at bytes 4..12,
-            // counting the bytes after that 12-byte header.
+            // extended request, whose 32-bit length follows the header and
+            // counts the WHOLE request (the 8-byte header included).
             let len_field = frame::u16_at(&self.buf, 2, self.big_endian) as u64;
             let total: u64 = if len_field == 0 {
-                if self.buf.len() < 16 {
+                if self.buf.len() < 8 {
                     return;
                 }
-                let lo = frame::u32_at(&self.buf, 4, self.big_endian) as u64;
-                let hi = frame::u32_at(&self.buf, 8, self.big_endian) as u64;
-                12 + lo + (hi << 32)
+                frame::u32_at(&self.buf, 4, self.big_endian) as u64 * 4
             } else {
                 len_field * 4
             };
@@ -320,15 +318,17 @@ mod tests {
     /// pixels a constant color packed per connection byte order.
     fn put_image(width: u16, height: u16, be: bool, fill: u8) -> Vec<u8> {
         let data_len = width as usize * height as usize * 4;
-        let total = 20 + data_len;
+        let total = 24 + data_len;
         let mut req = Vec::with_capacity(total);
-        req.push(53); // opcode: PutImage
+        req.push(72); // opcode: X_PutImage
         req.push(2); // request data: format ZPixmap
         req.extend_from_slice(&w16((total / 4) as u16, be)); // length in b32
-        req.extend_from_slice(&w32(1, be)); // window
+        req.extend_from_slice(&w32(1, be)); // drawable
         req.extend_from_slice(&w32(2, be)); // gc
         req.extend_from_slice(&w16(width, be));
         req.extend_from_slice(&w16(height, be));
+        req.extend_from_slice(&w16(0, be)); // dst x
+        req.extend_from_slice(&w16(0, be)); // dst y
         req.push(0); // left pad
         req.push(24); // depth
         req.extend_from_slice(&[0, 0]);
@@ -476,6 +476,42 @@ mod tests {
         assert_eq!(expand_all(out), req);
     }
 
+    /// The real PutImage request a client sends, captured off the wire.
+    ///
+    /// It pins three things at once: the opcode (72 = `X_PutImage`, not 53 =
+    /// `X_CreatePixmap`), the header layout (width at 12, height at 14,
+    /// left-pad at 20, depth at 21, image data at 24), and the length field
+    /// (in 4-byte units, at bytes 2..4).
+    #[test]
+    fn real_put_image_request_is_recognized() {
+        // A 900x72 PutImage, the first chunk of a larger image.
+        let mut req = Vec::new();
+        req.extend_from_slice(&[72, 2, 0x26, 0xfd]); // opcode, format, length
+        req.extend_from_slice(&[0x01, 0x00, 0x00, 0x01]); // drawable
+        req.extend_from_slice(&[0x02, 0x00, 0x00, 0x01]); // gc
+        req.extend_from_slice(&[0x84, 0x03]); // width = 900
+        req.extend_from_slice(&[0x48, 0x00]); // height = 72
+        req.extend_from_slice(&[0x00, 0x00]); // dst x
+        req.extend_from_slice(&[0x00, 0x00]); // dst y
+        req.push(0); // left pad
+        req.push(24); // depth
+        req.extend_from_slice(&[0x00, 0x00]); // unused
+        let data_len = 900 * 72 * 4;
+        req.extend(std::iter::repeat_n(0u8, data_len));
+
+        // The length field counts the whole request in 4-byte units. The
+        // connection is little-endian, so the bytes 26 fd are 0xfd26.
+        assert_eq!(req.len(), 24 + data_len);
+        assert_eq!(req.len(), 0xfd26 * 4);
+
+        let frame = frame::classify_put_image(&req, false).expect("PutImage");
+        assert_eq!(frame.width, 900);
+        assert_eq!(frame.height, 72);
+        assert_eq!(frame.data_off, 24);
+        assert_eq!(frame.data_len, data_len);
+        assert_eq!(frame.total, req.len());
+    }
+
     #[test]
     fn png_recode_reconstructs_requests_byte_exact() {
         let spec = RecodeSpec {
@@ -521,10 +557,10 @@ mod tests {
         assert_eq!(out[1][0], KIND_CONTAINER);
         let rebuilt = DownstreamExpander::expand(out[1].clone()).expect("expand");
         assert_eq!(rebuilt.len(), img.len());
-        assert_eq!(&rebuilt[..20], &img[..20], "request header must survive");
+        assert_eq!(&rebuilt[..24], &img[..24], "request header must survive");
         // constant fill: every pixel within a hair of the original B,G,R
-        let (b0, g0, r0) = (img[20], img[21], img[22]);
-        for px in rebuilt[20..].as_chunks::<4>().0 {
+        let (b0, g0, r0) = (img[24], img[25], img[26]);
+        for px in rebuilt[24..].as_chunks::<4>().0 {
             assert!((px[0] as i32 - b0 as i32).abs() <= 2, "B {}", px[0]);
             assert!((px[1] as i32 - g0 as i32).abs() <= 2, "G {}", px[1]);
             assert!((px[2] as i32 - r0 as i32).abs() <= 2, "R {}", px[2]);
@@ -559,17 +595,14 @@ mod tests {
         let (w, h) = (65u16, 700u16); // 182000 pixel bytes
         let standard = put_image(w, h, false, 90);
         // Re-emit the same request in extended framing: the b32 length field
-        // is 0, and the u32 pair at bytes 4..12 gives the byte count that
-        // follows that 12-byte header.
-        let body = &standard[4..]; // window..depth + data (16 + data_len)
-        let bytes_after = body.len() as u32; // the bytes after the 12-byte header
+        // is 0, and the 32-bit length that follows counts the WHOLE request
+        // (the 8-byte extended header included), in 4-byte units.
+        let body = &standard[4..]; // drawable..depth + data
         let mut ext = Vec::new();
         ext.extend_from_slice(&standard[..2]); // opcode + request data
         ext.extend_from_slice(&w16(0, false)); // length 0 = extended
-        ext.extend_from_slice(&bytes_after.to_le_bytes());
-        ext.extend_from_slice(&0u32.to_le_bytes());
+        ext.extend_from_slice(&w32(((8 + body.len()) / 4) as u32, false));
         ext.extend_from_slice(body);
-
         let spec = RecodeSpec {
             codec: RecodeCodec::Png,
             min_bytes: 1024,
@@ -600,10 +633,10 @@ mod tests {
         let mut out = Vec::new();
         m.push(&setup, &mut out);
         // A request claiming ~64 GiB via extended length.
-        let mut bogus = vec![53u8, 2];
+        let mut bogus = vec![72u8, 2];
         bogus.extend_from_slice(&w16(0, false)); // length 0 = extended
-        bogus.extend_from_slice(&0xFFFF_FFF0u32.to_le_bytes());
-        bogus.extend_from_slice(&0x0000_000Fu32.to_le_bytes());
+        bogus.extend_from_slice(&w32(0xFFFF_FFF0, false));
+        bogus.extend_from_slice(&w32(0x0000_000F, false));
         bogus.extend_from_slice(&[9u8; 64]);
         m.push(&bogus, &mut out);
         let img = put_image(8, 8, false, 123);

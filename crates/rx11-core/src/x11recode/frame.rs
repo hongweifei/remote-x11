@@ -16,21 +16,23 @@
 //! length is the u32 pair that follows the 4-byte header (bytes 4..12),
 //! counting the bytes after those 12 bytes.
 //!
-//! PutImage itself continues:
+//! PutImage itself continues (the layout of `xPutImageReq` in Xproto.h):
 //!
 //! ```text
-//!  4      window
+//!  4      drawable
 //!  4      gc
 //!  2      width
 //!  2      height
+//!  2      dst x
+//!  2      dst y
 //!  1      left pad
 //!  1      depth
 //!  2      unused
 //!  *      image data: rows of ceil(width*bpp/32)*4 bytes
 //! ```
 //!
-//! The standard-form PutImage therefore has its image data at offset 20;
-//! the extended form adds the 8-byte length pair, so the data starts at 28.
+//! The standard-form PutImage therefore has its image data at offset 24;
+//! the extended form adds the 8-byte length pair, so the data starts at 32.
 //!
 //! Requests are written in the CONNECTION byte order, latched from the
 //! client setup message's first byte ('B' or 'l').
@@ -41,8 +43,8 @@
 
 use bytes::{BufMut, Bytes, BytesMut};
 
-/// Core X11 request opcode for PutImage.
-const OP_PUT_IMAGE: u8 = 53;
+/// Core X11 request opcode for PutImage (`X_PutImage` in Xproto.h).
+const OP_PUT_IMAGE: u8 = 72;
 /// ZPixmap format value — pixel-per-pixel layout (vs bitmap planes).
 pub(crate) const FORMAT_ZPIXMAP: u8 = 2;
 
@@ -97,14 +99,16 @@ pub(crate) fn classify_put_image(req: &[u8], big_endian: bool) -> Option<PutImag
     // The request length sits at bytes 2..4, in 4-byte units.
     let len_field = u16_at(req, 2, big_endian) as u32;
     let (data_off, total) = if len_field == 0 {
-        // Extended request: the u32 pair at bytes 4..12 gives the byte count
-        // that follows the 12-byte header.
-        if req.len() < 16 {
+        // Extended request (BIG-REQUESTS): a 32-bit length in 4-byte units
+        // follows the 4-byte header, and it counts the WHOLE request — the
+        // 8-byte extended header included. (Measured against the server:
+        // counting only the bytes after the header makes it drop the
+        // connection.)
+        if req.len() < 8 {
             return None;
         }
-        let bytes_after_lo = u32_at(req, 4, big_endian) as u64;
-        let bytes_after_hi = u32_at(req, 8, big_endian) as u64;
-        let total = 12 + bytes_after_lo + (bytes_after_hi << 32);
+        let words = u32_at(req, 4, big_endian) as u64;
+        let total = words * 4;
         if total > MAX_RECODE_REQUEST || total > req.len() as u64 {
             return None;
         }
@@ -114,15 +118,15 @@ pub(crate) fn classify_put_image(req: &[u8], big_endian: bool) -> Option<PutImag
         if total > MAX_RECODE_REQUEST || total > req.len() as u64 {
             return None;
         }
-        (20usize, total as usize)
+        (24usize, total as usize)
     };
     let left_pad = req[data_off - 4];
     let depth = req[data_off - 3];
     if left_pad != 0 || !matches!(depth, 24 | 32) {
         return None;
     }
-    let width = u16_at(req, data_off - 8, big_endian);
-    let height = u16_at(req, data_off - 6, big_endian);
+    let width = u16_at(req, data_off - 12, big_endian);
+    let height = u16_at(req, data_off - 10, big_endian);
     if width == 0 || height == 0 {
         return None;
     }
