@@ -1,4 +1,4 @@
-//! Interactive controls, painted by hand.
+//! Interactive controls, painted by hand, driven by the kit.
 //!
 //! Only the controls the console actually uses live here: a button, a text
 //! field shell, a drop-down and a switch. Anything a page draws once and never
@@ -6,21 +6,23 @@
 //! stays a control kit rather than a half-used component library.
 //!
 //! FLTK's stock widgets carry a 1990s chrome that would fight the instrument
-//! language, so every control here is a `Widget` with its own draw and
-//! handle closures: fill, hairline, label and state all come from
-//! [`crate::theme`]. Text entry still rides `fltk::input::Input` (a real text
-//! editor is not worth reimplementing), but it is framed by our own field
-//! shell so it reads as part of the same grammar.
+//! language, so the drawn controls here are [`Interactive`] widgets: the
+//! paint is ours, while hover/press/focus, Tab reachability and Enter/Space
+//! activation all come from [`crate::ui::kit`]. Text entry still rides
+//! `fltk::input::Input` (a real text editor is not worth reimplementing) and
+//! menus still ride `fltk::menu::Choice` (a menu popup is a real window), but
+//! both are framed to read as part of the same grammar.
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use fltk::enums::{Align, Event};
+use fltk::enums::Align;
 use fltk::input::Input;
 use fltk::prelude::*;
 use fltk::widget::Widget;
 
 use crate::theme::{self as th, C, L, T};
+use crate::ui::kit::{Hand, Interactive, Sense, Touch};
 
 // ---------------------------------------------------------------------------
 // Button
@@ -44,15 +46,16 @@ struct BtnState {
     label: String,
     kind: BtnKind,
     enabled: bool,
-    hover: bool,
-    pressed: bool,
     on_click: Option<Box<dyn FnMut()>>,
 }
 
-/// A hand-painted button.
+/// A hand-painted button. Hover, press, focus and keyboard activation are
+/// the kit's; the click callback runs with the state cell *unborrowed*, so a
+/// handler may rebuild the UI (including this button) without tripping the
+/// `RefCell`.
 #[derive(Clone)]
 pub struct Button {
-    w: Widget,
+    it: Interactive<Rc<RefCell<BtnState>>>,
     st: Rc<RefCell<BtnState>>,
 }
 
@@ -62,65 +65,42 @@ impl Button {
             label: label.to_string(),
             kind,
             enabled: true,
-            hover: false,
-            pressed: false,
             on_click: None,
         }));
-
-        let mut w = Widget::new(x, y, width, height, None);
-        w.set_frame(fltk::enums::FrameType::NoBox);
-        w.clear_visible_focus();
-
         let st_draw = st.clone();
-        w.draw(move |w| {
-            let s = st_draw.borrow();
-            paint_button(w.x(), w.y(), w.w(), w.h(), &s);
-        });
-
-        let st_ev = st.clone();
-        w.handle(move |w, ev| {
-            let mut s = st_ev.borrow_mut();
-            if !s.enabled {
-                return false;
-            }
-            match ev {
-                Event::Enter => {
-                    s.hover = true;
-                    w.redraw();
-                    true
-                }
-                Event::Leave => {
-                    s.hover = false;
-                    s.pressed = false;
-                    w.redraw();
-                    true
-                }
-                Event::Push => {
-                    s.pressed = true;
-                    w.redraw();
-                    true
-                }
-                Event::Released => {
-                    let fire = s.pressed && s.hover;
-                    s.pressed = false;
-                    w.redraw();
-                    if fire {
-                        // Release the borrow before running user code: the
-                        // callback is allowed to rebuild the UI.
-                        drop(s);
-                        let mut cb = st_ev.borrow_mut().on_click.take();
-                        if let Some(f) = cb.as_mut() {
-                            f();
-                        }
-                        st_ev.borrow_mut().on_click = cb;
+        let it = Interactive::build(x, y, width, height, st.clone())
+            .tip(label)
+            .draw(move |w, _, sense| {
+                let s = st_draw.borrow();
+                paint_button(w.x(), w.y(), w.w(), w.h(), &s, sense);
+            })
+            .event(move |_w, cell, _, touch| match touch {
+                // A disabled button claims nothing: the event falls through
+                // to whatever is underneath, exactly as an absent button.
+                Touch::Click { .. } => {
+                    if !cell.borrow().enabled {
+                        return Hand::Ignored;
                     }
-                    true
+                    // Take the callback out, run it unborrowed (it may rebuild
+                    // the page), then put it back.
+                    let mut cb = cell.borrow_mut().on_click.take();
+                    if let Some(f) = cb.as_mut() {
+                        f();
+                    }
+                    cell.borrow_mut().on_click = cb;
+                    Hand::Claimed
                 }
-                _ => false,
-            }
-        });
-
-        Self { w, st }
+                Touch::Press { .. } if cell.borrow().enabled => Hand::Claimed,
+                Touch::Move { .. } | Touch::Exit | Touch::Release { .. } | Touch::Drag { .. } => {
+                    Hand::Claimed
+                }
+                Touch::Press { .. }
+                | Touch::Wheel(_)
+                | Touch::Key { .. }
+                | Touch::Shortcut { .. } => Hand::Ignored,
+            })
+            .install();
+        Self { it, st }
     }
 
     /// Install the click action. Replacing it is fine — pages rebuild their
@@ -138,20 +118,26 @@ impl Button {
 
     pub fn set_label(&self, label: &str) {
         self.st.borrow_mut().label = label.to_string();
+        self.it.set_tip(label);
         self.redraw();
     }
 
     pub fn redraw(&self) {
-        self.w.clone().redraw();
+        self.it.redraw();
     }
 
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
-        self.w.clone().resize(x, y, w, h);
+        self.it.resize(x, y, w, h);
+    }
+
+    /// The underlying widget, for callers that must reach FLTK directly.
+    pub fn widget(&self) -> Widget {
+        self.it.widget()
     }
 }
 
-fn paint_button(x: i32, y: i32, w: i32, h: i32, s: &BtnState) {
-    let (fill, text, border) = match (s.kind, s.enabled, s.hover) {
+fn paint_button(x: i32, y: i32, w: i32, h: i32, s: &BtnState, sense: &Sense) {
+    let (fill, text, border) = match (s.kind, s.enabled, sense.hover) {
         (_, false, _) => (th::mix(C::RAISED, C::BG, 0.45), C::TEXT_3, C::LINE),
         (BtnKind::Primary, true, false) => (C::AMBER, C::BG, C::AMBER),
         (BtnKind::Primary, true, true) => (C::AMBER_HI, C::BG, C::AMBER_HI),
@@ -163,13 +149,17 @@ fn paint_button(x: i32, y: i32, w: i32, h: i32, s: &BtnState) {
         (BtnKind::Danger, true, true) => (th::mix(C::BAD, C::BG, 0.30), C::BAD, C::BAD),
     };
 
-    let dy = if s.pressed { 1 } else { 0 };
+    let dy = if sense.pressed { 1 } else { 0 };
     th::fill_round(x, y + dy, w, h, L::RADIUS, fill);
     match s.kind {
         BtnKind::Primary => {}
         _ => th::stroke_round(x, y + dy, w, h, L::RADIUS, border),
     }
-    let align = Align::Center;
+    if sense.focused {
+        // The amber accent doubles as the keyboard focus ring: one hairline
+        // outside the button makes a Tab-cycled control unmistakable.
+        th::stroke_round(x - 2, y - 2, w + 4, h + 4, L::RADIUS + 1, C::AMBER);
+    }
     th::text(
         &s.label,
         x,
@@ -179,7 +169,7 @@ fn paint_button(x: i32, y: i32, w: i32, h: i32, s: &BtnState) {
         th::ui_font(),
         T::BODY,
         text,
-        align,
+        Align::Center,
     );
 }
 
@@ -302,16 +292,17 @@ impl Select {
 
 struct SwitchState {
     on: bool,
-    hover: bool,
     enabled: bool,
     on_change: Option<Box<dyn FnMut(bool)>>,
 }
 
 /// A boolean toggle: a short track with a travelling knob. Used for the
-/// capability kill switches, where the binary nature is the point.
+/// capability kill switches, where the binary nature is the point. Like the
+/// button its state machine is the kit's; it toggles on a *completed* click —
+/// mouse or Enter/Space — and the callback runs unborrowed.
 #[derive(Clone)]
 pub struct Switch {
-    w: Widget,
+    it: Interactive<Rc<RefCell<SwitchState>>>,
     st: Rc<RefCell<SwitchState>>,
 }
 
@@ -319,52 +310,43 @@ impl Switch {
     pub fn new(x: i32, y: i32, on: bool) -> Self {
         let st = Rc::new(RefCell::new(SwitchState {
             on,
-            hover: false,
             enabled: true,
             on_change: None,
         }));
-        let mut w = Widget::new(x, y, 38, 20, None);
-        w.set_frame(fltk::enums::FrameType::NoBox);
-
         let st_draw = st.clone();
-        w.draw(move |w| {
-            let s = st_draw.borrow();
-            paint_switch(w.x(), w.y(), w.w(), w.h(), &s);
-        });
-
-        let st_ev = st.clone();
-        w.handle(move |w, ev| {
-            let mut s = st_ev.borrow_mut();
-            if !s.enabled {
-                return false;
-            }
-            match ev {
-                Event::Enter => {
-                    s.hover = true;
-                    w.redraw();
-                    true
-                }
-                Event::Leave => {
-                    s.hover = false;
-                    w.redraw();
-                    true
-                }
-                Event::Push => {
-                    s.on = !s.on;
-                    w.redraw();
-                    drop(s);
-                    let mut cb = st_ev.borrow_mut().on_change.take();
-                    if let Some(f) = cb.as_mut() {
-                        f(st_ev.borrow().on);
+        let it = Interactive::build(x, y, 38, 20, st.clone())
+            .draw(move |w, _, sense| {
+                let s = st_draw.borrow();
+                paint_switch(w.x(), w.y(), w.w(), w.h(), &s, sense);
+            })
+            .event(move |_w, cell, _, touch| match touch {
+                Touch::Click { .. } => {
+                    if !cell.borrow().enabled {
+                        return Hand::Ignored;
                     }
-                    st_ev.borrow_mut().on_change = cb;
-                    true
+                    let v = {
+                        let mut b = cell.borrow_mut();
+                        b.on = !b.on;
+                        b.on
+                    };
+                    let mut cb = cell.borrow_mut().on_change.take();
+                    if let Some(f) = cb.as_mut() {
+                        f(v);
+                    }
+                    cell.borrow_mut().on_change = cb;
+                    Hand::Claimed
                 }
-                _ => false,
-            }
-        });
-
-        Self { w, st }
+                Touch::Press { .. } if cell.borrow().enabled => Hand::Claimed,
+                Touch::Move { .. } | Touch::Exit | Touch::Release { .. } | Touch::Drag { .. } => {
+                    Hand::Claimed
+                }
+                Touch::Press { .. }
+                | Touch::Wheel(_)
+                | Touch::Key { .. }
+                | Touch::Shortcut { .. } => Hand::Ignored,
+            })
+            .install();
+        Self { it, st }
     }
 
     pub fn on_change<F: FnMut(bool) + 'static>(&self, f: F) {
@@ -381,24 +363,24 @@ impl Switch {
     }
 
     pub fn redraw(&self) {
-        self.w.clone().redraw();
+        self.it.redraw();
     }
 
     pub fn widget(&self) -> Widget {
-        self.w.clone()
+        self.it.widget()
     }
 
     pub fn resize(&self, x: i32, y: i32) {
-        self.w.clone().resize(x, y, 38, 20);
+        self.it.resize(x, y, 38, 20);
     }
 }
 
-fn paint_switch(x: i32, y: i32, w: i32, h: i32, s: &SwitchState) {
+fn paint_switch(x: i32, y: i32, w: i32, h: i32, s: &SwitchState, sense: &Sense) {
     let track = if !s.enabled {
         th::mix(C::RAISED, C::BG, 0.5)
     } else if s.on {
         th::mix(C::AMBER, C::BG, 0.30)
-    } else if s.hover {
+    } else if sense.hover {
         C::PRESSED
     } else {
         C::RAISED
@@ -422,6 +404,10 @@ fn paint_switch(x: i32, y: i32, w: i32, h: i32, s: &SwitchState) {
         C::TEXT_2
     };
     th::dot(knob_x + knob_d / 2, y + h / 2, knob_d / 2, knob);
+    if sense.focused {
+        // Same amber hairline focus ring as the buttons.
+        th::stroke_round(x - 2, y - 2, w + 4, h + 4, (h + 4) / 2, C::AMBER);
+    }
 }
 
 // ---------------------------------------------------------------------------

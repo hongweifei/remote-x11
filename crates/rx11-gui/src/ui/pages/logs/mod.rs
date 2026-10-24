@@ -20,8 +20,9 @@ use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot};
 use crate::ui::chrome::{empty_state_in, page_header_in, PAGE_HEADER_H};
 use crate::ui::controls::{BtnKind, Button, Field};
+use crate::ui::kit::Grip;
 use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
-use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::scrollbar::ScrollBar;
 use crate::ui::{Page, PageInput};
 
 /// The filter, the unread watermark and the pixel-scroll bookkeeping — state
@@ -53,14 +54,11 @@ pub enum LogAction {
 
 struct LogState {
     view: LogView,
-    /// While dragging the list's scrollbar: pointer offset below the thumb's
-    /// top edge. Pixels — the same space `scroll_px` moves in.
-    thumb_grab: Option<i32>,
-    /// While dragging: the knob's own top edge, pointer-minus-grab clamped to
-    /// the track. The painter draws the knob *here* (not at the offset's
-    /// derived position), and the offset comes from the same number — that is
-    /// what keeps the knob under the cursor one pixel at a time.
-    drag_top: Option<i32>,
+    /// The list's scrollbar gesture — anchor-model machine in [`Grip`]. The
+    /// painter draws the knob at `grip.painting()` while held; the offset
+    /// comes from the same number through `LogView::scroll_to`, the single
+    /// write path that keeps follow and the unread watermark in sync.
+    grip: Grip,
 }
 
 /// The log page.
@@ -175,8 +173,7 @@ impl LogPage {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         let st = Rc::new(RefCell::new(LogState {
             view: LogView::default(),
-            thumb_grab: None,
-            drag_top: None,
+            grip: Grip::default(),
         }));
         let on_action: ActionSlot<LogAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -263,13 +260,16 @@ impl LogPage {
         page
     }
 
-    /// Wheel and scrollbar input for the log list.
+    /// Wheel, scrollbar-drag and keyboard input for the log list.
     ///
     /// Scrolling up leaves "follow" mode (the list stops jumping to the newest
     /// line); scrolling back to the bottom re-arms it, which is the behaviour a
     /// tail -f reader expects. Both moves go through `LogView::scroll_to`, the
     /// only writer of the offset, so the follow flag, the unread watermark and
     /// the whole-group repaint cannot desynchronise from the offset itself.
+    /// The gesture machine is the shared [`Grip`]: this page contributes the
+    /// bar (rebuilt from the same solve the painter used), the offset writes,
+    /// the wheel rhythm (`dy` rows per notch) and the repaint.
     fn install_input(&self) {
         let st = self.st.clone();
         let rect = self.rect.clone();
@@ -279,106 +279,54 @@ impl LogPage {
             let geometry = build_layout();
             let solved = geometry.solve(Rect::new(px, py, pw, ph));
             let rows = list_rows(solved.get(geometry.well).h);
-            match input {
-                PageInput::Wheel(dy) => {
-                    if dy == 0 {
-                        return false;
-                    }
-                    let mut s = st.borrow_mut();
-                    let total = s.view.visible().len();
-                    if total <= rows {
-                        return false;
-                    }
-                    let cur = s.view.effective_scroll(total, rows);
-                    let changed = s.view.scroll_to(cur + dy * ROW_LINE_H, total, rows);
-                    drop(s);
-                    if changed {
-                        page.redraw();
-                    }
-                    true
+            let mut grip = st.borrow().grip;
+            let mut bar = || log_bar(&geometry, &solved, &st.borrow());
+            let mut scroll_to = |v: i32| {
+                let mut s = st.borrow_mut();
+                let total = s.view.visible().len();
+                s.view.scroll_to(v, total, rows)
+            };
+            let mut scroll_by = |d: i32| {
+                let mut s = st.borrow_mut();
+                let total = s.view.visible().len();
+                let cur = s.view.effective_scroll(total, rows);
+                s.view.scroll_to(cur + d, total, rows)
+            };
+            let mut wheel = |dy: i32| {
+                let mut s = st.borrow_mut();
+                let total = s.view.visible().len();
+                if total <= rows {
+                    return false;
                 }
-                PageInput::Push(lx, ly) => {
-                    let Some(bar) = log_bar(&geometry, &solved, &st.borrow()) else {
-                        return false;
-                    };
-                    match bar.hit(lx + px, ly + py) {
-                        Some(Hit::Thumb { grab }) => {
-                            // Anchor the knob where it is *shown*, not where
-                            // the offset says it should be: pressing must not
-                            // move it, and from here the pointer drags it.
-                            let mut s = st.borrow_mut();
-                            s.thumb_grab = Some(grab);
-                            s.drag_top = Some(bar.thumb_top());
-                            drop(s);
-                            page.redraw();
-                            true
-                        }
-                        Some(Hit::Track { dir }) => {
-                            let mut s = st.borrow_mut();
-                            let total = s.view.visible().len();
-                            if total <= rows {
-                                return false;
-                            }
-                            let cur = s.view.effective_scroll(total, rows);
-                            // A track click pages by one viewport, the usual
-                            // scrollbar convention — in pixels, so the jump
-                            // lands row-aligned at the bottom.
-                            let changed =
-                                s.view
-                                    .scroll_to(cur + dir * rows as i32 * ROW_LINE_H, total, rows);
-                            drop(s);
-                            if changed {
-                                page.redraw();
-                            }
-                            true
-                        }
-                        None => false,
-                    }
-                }
-                PageInput::Drag(_lx, ly) => {
-                    let Some(grab) = st.borrow().thumb_grab else {
-                        return false;
-                    };
-                    let Some(bar) = log_bar(&geometry, &solved, &st.borrow()) else {
-                        return false;
-                    };
-                    // One number drives both readers: the knob is drawn at
-                    // `pointer - grab` (clamped to the track, so it follows
-                    // the cursor pixel for pixel), and the content offset is
-                    // `scroll_at` of that same position — no division by the
-                    // row height anywhere in this path. `ly + py` converts
-                    // the page-relative pointer to the bar's absolute space.
-                    let (lo, hi) = bar.knob_top_range();
-                    let knob = (ly + py - grab).clamp(lo, hi);
-                    let offset = bar.scroll_at(knob);
-                    {
-                        let mut s = st.borrow_mut();
-                        s.drag_top = Some(knob);
-                        let total = s.view.visible().len();
-                        s.view.scroll_to(offset, total, rows)
-                    };
-                    // Repaint on every drag frame, not only when the offset
-                    // moved: the knob itself is the thing under the cursor.
-                    // FLTK coalesces repeated damage within one flush, so a
-                    // frame where only the knob settled costs one repaint.
+                let cur = s.view.effective_scroll(total, rows);
+                let changed = s.view.scroll_to(cur + dy * ROW_LINE_H, total, rows);
+                drop(s);
+                if changed {
                     page.redraw();
-                    true
                 }
-                PageInput::Release => {
-                    let was = {
-                        let mut s = st.borrow_mut();
-                        s.drag_top = None;
-                        s.thumb_grab.take()
-                    };
-                    if was.is_some() {
-                        // Repaint: the knob settles onto the offset-derived
-                        // position and cools from the grabbed colour, without
-                        // waiting for the next poll.
-                        page.redraw();
-                    }
-                    was.is_some()
-                }
-            }
+                true
+            };
+            let mut repaint = || page.redraw();
+            let consumed = match input {
+                PageInput::Key(key) => grip.on_key(
+                    key,
+                    ROW_LINE_H,
+                    &mut bar,
+                    &mut scroll_by,
+                    &mut scroll_to,
+                    &mut repaint,
+                ),
+                _ => grip.on_input(
+                    input,
+                    &mut wheel,
+                    &mut bar,
+                    &mut scroll_by,
+                    &mut scroll_to,
+                    &mut repaint,
+                ),
+            };
+            st.borrow_mut().grip = grip;
+            consumed
         });
     }
 
@@ -606,7 +554,8 @@ fn paint(x: i32, y: i32, w: i32, h: i32, s: &LogState) {
     // Scrollbar for the list well. While held, the knob shows the drag
     // position, not the quantised offset's position.
     if let Some(bar) = log_bar(&geometry, &solved, s) {
-        bar.paint(s.thumb_grab.is_some(), s.drag_top);
+        let (hot, knob) = s.grip.painting();
+        bar.paint(hot, knob);
     }
 
     // The scroll position is shown by the shared scrollbar above; only the

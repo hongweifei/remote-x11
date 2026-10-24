@@ -11,7 +11,9 @@
 //!
 //! * [`action`] — the intent channel every control reports through;
 //! * [`chrome`] — the page skeleton (heading, card, statistic, empty state);
-//! * [`controls`] — the hand-drawn widgets;
+//! * [`controls`] — the hand-drawn widgets, built on the kit;
+//! * [`kit`] — the interaction machinery: one pointer/keyboard state machine,
+//!   the anchor-model scrollbar drag, the click-list sieve;
 //! * [`layout`] — the stack solver every page places itself with;
 //! * [`scope`] — the link oscilloscope;
 //! * [`shell`] — the fixed frame: rail, top bar, status bar;
@@ -25,6 +27,7 @@
 pub mod action;
 pub mod chrome;
 pub mod controls;
+pub mod kit;
 pub mod layout;
 pub mod pages;
 pub mod scope;
@@ -39,18 +42,31 @@ use crate::theme as th;
 pub use chrome::{card, card_title, empty_state, page_header, stat};
 pub use layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
 
-/// Pointer input a scrollable page receives from its background widget.
+/// Pointer and keyboard input a scrollable page receives from its background
+/// widget.
+///
+/// Every coordinate is in the **painter's space** — window-relative, the same
+/// numbers [`Layout`](layout::Layout) solves into and the paint closures
+/// draw with. FLTK 1.4.5 does not translate event coordinates for child
+/// widgets (`Fl_Group.cxx` `send()` only offsets child *windows*), and the
+/// background widget shares the page's origin, so the handler forwards
+/// `event_coords()` as-is. A page must never add or subtract its own origin
+/// to reach a bar or a hit rectangle; the rect you painted *is* the rect you
+/// hit.
 #[derive(Debug, Clone, Copy)]
 pub enum PageInput {
     /// Wheel delta; positive scrolls down.
     Wheel(i32),
-    /// Button pressed at page-relative `(x, y)` — add the page origin to get
-    /// the same coordinate space the painters use.
+    /// Button pressed at painter coordinates.
     Push(i32, i32),
-    /// Pointer moved with the button held, page-relative.
+    /// Pointer moved with the button held, painter coordinates.
     Drag(i32, i32),
     /// Button released.
     Release,
+    /// A keystroke while the page surface holds keyboard focus; the page
+    /// decides via [`kit::Grip::on_key`](kit::Grip::on_key) whether it is a
+    /// scroll key.
+    Key(fltk::enums::Key),
 }
 
 /// A page surface: an FLTK group whose first child paints the background.
@@ -98,33 +114,39 @@ impl Page {
         g.end();
     }
 
-    /// Install the pointer input handler for a scrollable page.
+    /// Install the pointer and keyboard input handler for a scrollable page.
     ///
     /// The background widget covers the whole page and is the bottom-most
     /// child, so it receives input that no control above it consumed. Only one
-    /// handler can live on a widget, so wheel, drag and release are delivered
-    /// through one closure — see [`PageInput`].
+    /// handler can live on a widget, so wheel, drag, release and keys are
+    /// delivered through one closure — see [`PageInput`]. Accepting
+    /// [`Event::Focus`](fltk::enums::Event::Focus) is what makes Tab reach the
+    /// page surface at all (FLTK's `take_focus` asks the widget first), and
+    /// puts the keystrokes on the scroll path; the surface is the first child
+    /// of the page group, so it is also the first Tab stop.
     pub fn on_input<F>(&self, f: F)
     where
         F: Fn(PageInput) -> bool + 'static,
     {
         let mut bg = self.bg.clone();
-        bg.handle(move |w, ev| {
-            let (bx, by) = (w.x(), w.y());
-            let at = || (fltk::app::event_x() - bx, fltk::app::event_y() - by);
-            match ev {
-                fltk::enums::Event::MouseWheel => f(PageInput::Wheel(fltk::app::event_dy_value())),
-                fltk::enums::Event::Push => {
-                    let (x, y) = at();
-                    f(PageInput::Push(x, y))
-                }
-                fltk::enums::Event::Drag => {
-                    let (x, y) = at();
-                    f(PageInput::Drag(x, y))
-                }
-                fltk::enums::Event::Released => f(PageInput::Release),
-                _ => false,
+        bg.handle(move |_, ev| match ev {
+            // Event coordinates are window-relative and un-translated for
+            // child widgets — the painter's space (see `PageInput` docs).
+            fltk::enums::Event::MouseWheel => f(PageInput::Wheel(fltk::app::event_dy_value())),
+            fltk::enums::Event::Push => {
+                let (x, y) = fltk::app::event_coords();
+                f(PageInput::Push(x, y))
             }
+            fltk::enums::Event::Drag => {
+                let (x, y) = fltk::app::event_coords();
+                f(PageInput::Drag(x, y))
+            }
+            fltk::enums::Event::Released => f(PageInput::Release),
+            // Accepting focus is what lets Tab stop on the page surface;
+            // keystrokes then arrive as `PageInput::Key`.
+            fltk::enums::Event::Focus => true,
+            fltk::enums::Event::KeyDown => f(PageInput::Key(fltk::app::event_key())),
+            _ => false,
         });
     }
 

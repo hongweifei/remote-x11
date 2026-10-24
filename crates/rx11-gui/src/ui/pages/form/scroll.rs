@@ -15,6 +15,8 @@ use super::*;
 ///
 /// The single write path for `scroll`: wheel, track click and drag all go
 /// through it, so clamping and relayout cannot be forgotten in one of them.
+/// Returns whether the offset actually moved — the kit's `Grip` uses that to
+/// decide when its own repaint is due.
 pub(super) fn apply_scroll(
     spec: &'static FormSpec,
     widgets: &WidgetList,
@@ -22,7 +24,7 @@ pub(super) fn apply_scroll(
     rect: &Rc<RefCell<(i32, i32, i32, i32)>>,
     page: &Page,
     value: i32,
-) {
+) -> bool {
     let changed = {
         let mut s = st.borrow_mut();
         let max = (s.content_h - s.view_h).max(0);
@@ -38,6 +40,7 @@ pub(super) fn apply_scroll(
         place_fields(spec, widgets, st, rect);
         page.redraw();
     }
+    changed
 }
 
 /// Reposition the field widgets for the current scroll offset.

@@ -35,6 +35,7 @@ pub struct ScrollBar {
     x: i32,
     top: i32,
     height: i32,
+    view: i32,
     thumb_top: i32,
     thumb_h: i32,
     max_scroll: i32,
@@ -66,6 +67,7 @@ impl ScrollBar {
             x,
             top,
             height,
+            view,
             thumb_top,
             thumb_h,
             max_scroll,
@@ -137,6 +139,13 @@ impl ScrollBar {
 
     pub fn max_scroll(&self) -> i32 {
         self.max_scroll
+    }
+
+    /// The viewport this bar represents, in content pixels — exactly the
+    /// `view` it was built with. A track click or a Page key jumps precisely
+    /// one screen of content.
+    pub fn viewport(&self) -> i32 {
+        self.view
     }
 }
 

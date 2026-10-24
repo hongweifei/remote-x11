@@ -18,7 +18,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use fltk::enums::{Align, Event};
+use fltk::enums::{Align, Shortcut};
 use fltk::prelude::*;
 use fltk::widget::Widget;
 
@@ -26,6 +26,7 @@ use crate::model::{Health, Role};
 use crate::state::{fmt_rate, fmt_uptime, AppState, Page};
 use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot, TopbarAction};
+use crate::ui::kit::{hit_index, Hand, Interactive, ListSieve, Touch};
 use crate::ui::layout::{Insets, Layout, NodeId, Rect, Size, Solved};
 
 // ---------------------------------------------------------------------------
@@ -34,7 +35,9 @@ use crate::ui::layout::{Insets, Layout, NodeId, Rect, Size, Solved};
 
 struct RailState {
     page: Page,
-    hover: Option<usize>,
+    /// Row hover/press/click — the kit's [`ListSieve`]. `Copy`, taken out
+    /// and written back per event like the pages' `Grip`.
+    sieve: ListSieve,
     /// Per-page badge: how many sessions of that role are live, 0 = none.
     badges: [u32; 6],
     /// Whether a role has unsaved config changes.
@@ -45,9 +48,13 @@ struct RailState {
 /// build footer. Rows are 40px, generous enough to click and quiet enough to
 /// stay out of the way; the selected row is marked by an amber bar on the
 /// rail edge plus a raised surface, not by a filled block of color.
+///
+/// The rail is not a Tab stop — one widget owns six rows, so row focus would
+/// need a model the kit does not carry. Page switching by keyboard rides
+/// FLTK's shortcut event instead: `Alt+1` … `Alt+6`.
 #[derive(Clone)]
 pub struct Rail {
-    w: Widget,
+    it: Interactive<Rc<RefCell<RailState>>>,
     st: Rc<RefCell<RailState>>,
     /// Selection callback: the shared intent channel, carrying the `Page` the
     /// operator picked.
@@ -58,61 +65,73 @@ impl Rail {
     pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         let st = Rc::new(RefCell::new(RailState {
             page: Page::Console,
-            hover: None,
+            sieve: ListSieve::default(),
             badges: [0; 6],
             dirty: [false; 6],
         }));
         let on_select: ActionSlot<Page> = Rc::new(RefCell::new(None));
 
-        let mut wid = Widget::new(x, y, w, h, None);
-        wid.set_frame(fltk::enums::FrameType::NoBox);
-
         let st_draw = st.clone();
-        wid.draw(move |w| paint_rail(w.x(), w.y(), w.w(), w.h(), &st_draw.borrow()));
-
-        let st_ev = st.clone();
         let sel = on_select.clone();
-        wid.handle(move |w, ev| {
-            let (_, my) = fltk::app::event_coords();
-            let geometry = build_rail_layout();
-            let solved = geometry.solve(Rect::new(w.x(), w.y(), w.w(), w.h()));
-            let idx = row_at(&geometry, &solved, my);
-            match ev {
-                Event::Move | Event::Enter | Event::Drag => {
-                    let mut s = st_ev.borrow_mut();
-                    if s.hover != idx {
-                        s.hover = idx;
-                        w.redraw();
+        let it = Interactive::build(x, y, w, h, st.clone())
+            .focus(false)
+            .draw(move |w, _, _| paint_rail(w.x(), w.y(), w.w(), w.h(), &st_draw.borrow()))
+            .event(move |wid, cell, _, touch| {
+                let rects = row_rects(wid);
+                let idx = touch.point().and_then(|(tx, ty)| hit_index(&rects, tx, ty));
+                match touch {
+                    Touch::Move { .. } | Touch::Drag { .. } => {
+                        let mut s = cell.borrow_mut();
+                        if s.sieve.move_to(idx) {
+                            Hand::Repaint
+                        } else {
+                            Hand::Claimed
+                        }
                     }
-                    true
-                }
-                Event::Leave => {
-                    st_ev.borrow_mut().hover = None;
-                    w.redraw();
-                    true
-                }
-                Event::Push => {
-                    if let Some(i) = idx {
-                        let page = Page::ALL[i];
-                        st_ev.borrow_mut().page = page;
-                        w.redraw();
-                        // The shared channel clones the handler out of the
-                        // RefCell, so user code can freely mutate the rail
-                        // while it runs.
-                        emit_action(&sel, page);
-                        return true;
+                    Touch::Exit => {
+                        let mut s = cell.borrow_mut();
+                        if s.sieve.exit() {
+                            Hand::Repaint
+                        } else {
+                            Hand::Claimed
+                        }
                     }
-                    false
+                    Touch::Press { .. } => {
+                        let mut s = cell.borrow_mut();
+                        if s.sieve.press(idx) {
+                            Hand::Claimed
+                        } else {
+                            Hand::Ignored
+                        }
+                    }
+                    Touch::Click { at } => {
+                        let fired = {
+                            let mut s = cell.borrow_mut();
+                            s.sieve.release(hit_index(&rects, at.0, at.1))
+                        };
+                        match fired {
+                            Some(i) => select(i, cell, &sel),
+                            None => Hand::Claimed,
+                        }
+                    }
+                    Touch::Release { .. } => Hand::Claimed,
+                    Touch::Shortcut { key, mods } => {
+                        // Alt+1 … Alt+6 pick a page; any other key is not ours.
+                        let bit = key.bits();
+                        let idx = ('1' as i32..'7' as i32)
+                            .position(|d| d == bit)
+                            .filter(|_| mods.contains(Shortcut::Alt));
+                        match idx {
+                            Some(i) => select(i, cell, &sel),
+                            None => Hand::Ignored,
+                        }
+                    }
+                    _ => Hand::Ignored,
                 }
-                _ => false,
-            }
-        });
+            })
+            .install();
 
-        Self {
-            w: wid,
-            st,
-            on_select,
-        }
+        Self { it, st, on_select }
     }
 
     pub fn on_select<F: Fn(Page) + 'static>(&self, f: F) {
@@ -121,7 +140,7 @@ impl Rail {
 
     pub fn set_page(&self, page: Page) {
         self.st.borrow_mut().page = page;
-        self.w.clone().redraw();
+        self.it.redraw();
     }
 
     /// Update the live-session count and dirty markers shown per row.
@@ -131,12 +150,12 @@ impl Rail {
             s.badges = counts;
             s.dirty = dirty;
             drop(s);
-            self.w.clone().redraw();
+            self.it.redraw();
         }
     }
 
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
-        self.w.clone().resize(x, y, w, h);
+        self.it.resize(x, y, w, h);
     }
 }
 
@@ -191,12 +210,22 @@ fn build_rail_layout() -> RailLayout {
     }
 }
 
-/// Which rail row is under `my`, using the solved tree.
-fn row_at(geometry: &RailLayout, solved: &Solved, my: i32) -> Option<usize> {
-    geometry
-        .rows
-        .iter()
-        .position(|&id| solved.get(id).contains(solved.get(id).x, my))
+/// Which rail row rects the solved tree produces — the same rects the
+/// highlight is drawn into, the hit-testing reads, and the labels ride in.
+fn row_rects(wid: &Widget) -> Vec<Rect> {
+    let geometry = build_rail_layout();
+    let solved = geometry.solve(Rect::new(wid.x(), wid.y(), wid.w(), wid.h()));
+    geometry.rows.iter().map(|&id| solved.get(id)).collect()
+}
+
+/// Select a rail row and announce the page. The state cell is borrowed only
+/// briefly: the intent handler re-enters `Rail::set_page` (show_page calls
+/// it), and that must not find a live borrow.
+fn select(i: usize, cell: &Rc<RefCell<RailState>>, sel: &ActionSlot<Page>) -> Hand {
+    let page = Page::ALL[i];
+    cell.borrow_mut().page = page;
+    emit_action(sel, page);
+    Hand::Repaint
 }
 
 fn paint_rail(x: i32, y: i32, w: i32, h: i32, s: &RailState) {
@@ -233,7 +262,7 @@ fn paint_rail(x: i32, y: i32, w: i32, h: i32, s: &RailState) {
     for (i, page) in Page::ALL.iter().enumerate() {
         let ry = solved.get(geometry.rows[i]).y;
         let selected = *page == s.page;
-        let hovered = s.hover == Some(i);
+        let hovered = s.sieve.hover == Some(i);
 
         if selected {
             th::fill_round(x + 12, ry, w - 24, ROW_H, L::RADIUS, C::RAISED);
@@ -354,8 +383,11 @@ pub struct TopbarData {
 struct TopbarState {
     data: TopbarData,
     actions: Vec<TopbarAction>,
-    hover: Option<usize>,
-    pressed: Option<usize>,
+    /// Action hover/press/click — the kit's [`ListSieve`], same machine as
+    /// the rail rows. (The hand-rolled version before it hit-tested with
+    /// `r.contains(mx, r.y)` — the pointer's own y was ignored, so a click
+    /// anywhere in the bar's column fired the action under it.)
+    sieve: ListSieve,
 }
 
 /// The top bar. Its center is the product's own topology drawn as a chain —
@@ -364,7 +396,7 @@ struct TopbarState {
 /// the interface states, rather than measures, what the product does.
 #[derive(Clone)]
 pub struct Topbar {
-    w: Widget,
+    it: Interactive<Rc<RefCell<TopbarState>>>,
     st: Rc<RefCell<TopbarState>>,
 }
 
@@ -373,59 +405,68 @@ impl Topbar {
         let st = Rc::new(RefCell::new(TopbarState {
             data: TopbarData::default(),
             actions: Vec::new(),
-            hover: None,
-            pressed: None,
+            sieve: ListSieve::default(),
         }));
-        let mut wid = Widget::new(x, y, w, h, None);
-        wid.set_frame(fltk::enums::FrameType::NoBox);
-
         let st_draw = st.clone();
-        wid.draw(move |w| paint_topbar(w.x(), w.y(), w.w(), w.h(), &st_draw.borrow()));
-
-        let st_ev = st.clone();
-        wid.handle(move |w, ev| {
-            let (mx, _) = fltk::app::event_coords();
-            let hit = {
-                let s = st_ev.borrow();
-                let rects = action_rects(Rect::new(w.x(), w.y(), w.w(), w.h()), &s.actions);
-                rects.iter().position(|r| r.contains(mx, r.y))
-            };
-            match ev {
-                Event::Move | Event::Enter => {
-                    let mut s = st_ev.borrow_mut();
-                    if s.hover != hit {
-                        s.hover = hit;
-                        w.redraw();
+        let it = Interactive::build(x, y, w, h, st.clone())
+            .focus(false)
+            .draw(move |w, _, _| paint_topbar(w.x(), w.y(), w.w(), w.h(), &st_draw.borrow()))
+            .event(move |wid, cell, _, touch| {
+                let idx = touch.point().and_then(|(tx, ty)| {
+                    let s = cell.borrow();
+                    let rects =
+                        action_rects(Rect::new(wid.x(), wid.y(), wid.w(), wid.h()), &s.actions);
+                    hit_index(&rects, tx, ty)
+                });
+                match touch {
+                    Touch::Move { .. } => {
+                        let mut s = cell.borrow_mut();
+                        if s.sieve.move_to(idx) {
+                            Hand::Repaint
+                        } else {
+                            Hand::Claimed
+                        }
                     }
-                    true
-                }
-                Event::Leave => {
-                    st_ev.borrow_mut().hover = None;
-                    w.redraw();
-                    true
-                }
-                Event::Push => {
-                    st_ev.borrow_mut().pressed = hit;
-                    w.redraw();
-                    hit.is_some()
-                }
-                Event::Released => {
-                    let mut s = st_ev.borrow_mut();
-                    let fire = s.pressed.is_some() && s.pressed == hit;
-                    s.pressed = None;
-                    w.redraw();
-                    if fire {
-                        let cb = s.actions[hit.unwrap()].2.clone();
-                        drop(s);
-                        cb();
+                    Touch::Exit => {
+                        let mut s = cell.borrow_mut();
+                        if s.sieve.exit() {
+                            Hand::Repaint
+                        } else {
+                            Hand::Claimed
+                        }
                     }
-                    true
+                    Touch::Press { .. } => {
+                        let mut s = cell.borrow_mut();
+                        if s.sieve.press(idx) {
+                            Hand::Claimed
+                        } else {
+                            Hand::Ignored
+                        }
+                    }
+                    Touch::Click { at } => {
+                        let tx = at.0;
+                        let ty = at.1;
+                        let fired = {
+                            let mut s = cell.borrow_mut();
+                            let rects = action_rects(
+                                Rect::new(wid.x(), wid.y(), wid.w(), wid.h()),
+                                &s.actions,
+                            );
+                            s.sieve.release(hit_index(&rects, tx, ty))
+                        };
+                        if let Some(i) = fired {
+                            let cb = cell.borrow().actions[i].2.clone();
+                            cb();
+                        }
+                        Hand::Repaint
+                    }
+                    Touch::Release { .. } => Hand::Claimed,
+                    _ => Hand::Ignored,
                 }
-                _ => false,
-            }
-        });
+            })
+            .install();
 
-        Self { w: wid, st }
+        Self { it, st }
     }
 
     pub fn set_data(&self, data: TopbarData) {
@@ -438,17 +479,17 @@ impl Topbar {
         s.data = data;
         drop(s);
         if changed {
-            self.w.clone().redraw();
+            self.it.redraw();
         }
     }
 
     pub fn set_actions(&self, actions: Vec<TopbarAction>) {
         self.st.borrow_mut().actions = actions;
-        self.w.clone().redraw();
+        self.it.redraw();
     }
 
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
-        self.w.clone().resize(x, y, w, h);
+        self.it.resize(x, y, w, h);
     }
 }
 
@@ -508,8 +549,8 @@ fn paint_topbar(x: i32, y: i32, w: i32, h: i32, s: &TopbarState) {
     let bar = Rect::new(x, y, w, h);
     for (i, rect) in action_rects(bar, &s.actions).iter().enumerate() {
         let (label, enabled, _) = &s.actions[i];
-        let hovered = s.hover == Some(i);
-        let pressed = s.pressed == Some(i);
+        let hovered = s.sieve.hover == Some(i);
+        let pressed = s.sieve.pressed == Some(i);
         let (fill, text, border) = if !*enabled {
             (C::BG, C::TEXT_3, C::LINE)
         } else if pressed {

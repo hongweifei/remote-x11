@@ -14,7 +14,7 @@
 //! continuously, but never carries a live button.
 
 use super::*;
-use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::scrollbar::ScrollBar;
 use crate::ui::PageInput;
 
 /// One row's hit geometry. Recomputed whenever the visible window moves, so
@@ -112,37 +112,26 @@ pub(super) fn reflow_rows(st: &RefCell<ConsoleState>, geometry: &ConsoleLayout, 
     st.borrow_mut().rows = hits;
 }
 
-/// Move the offset by a wheel/track delta; re-hit-test and repaint on change.
-fn scroll_and_repaint(
+/// Move the offset: clamp and store, re-run hit testing, report the move.
+///
+/// The one offset write the pointer path and the keyboard path share. It
+/// repaints nothing itself — the kit's `Grip` owns when a repaint is due
+/// (every real move, every drag frame), and the wheel closure repaints on
+/// its own change, so exactly one `group.redraw()` lands per frame that
+/// actually differs.
+fn move_offset(
     st: &RefCell<ConsoleState>,
-    page: &Page,
-    geometry: &ConsoleLayout,
-    solved: &Solved,
-    fit: usize,
-    delta_px: i32,
-) -> bool {
-    let cur = st.borrow().scroll_px;
-    apply_offset_and_repaint(st, page, geometry, solved, fit, cur + delta_px)
-}
-
-/// Store an absolute offset; re-hit-test and repaint on change. The one place
-/// a scroll write reaches FLTK: a real move always ends in exactly one
-/// `group.redraw()`, so the whole page — canvas and controls — repaints in
-/// the same frame the offset moved.
-fn apply_offset_and_repaint(
-    st: &RefCell<ConsoleState>,
-    page: &Page,
     geometry: &ConsoleLayout,
     solved: &Solved,
     fit: usize,
     value: i32,
 ) -> bool {
-    let mut s = st.borrow_mut();
-    let changed = apply_table_scroll(&mut s, value, fit);
-    drop(s);
+    let changed = {
+        let mut s = st.borrow_mut();
+        apply_table_scroll(&mut s, value, fit)
+    };
     if changed {
         reflow_rows(st, geometry, solved);
-        page.redraw();
     }
     changed
 }
@@ -169,15 +158,17 @@ pub(super) fn session_bar(card: Rect, area: Rect, s: &ConsoleState) -> Option<Sc
 }
 
 impl ConsolePage {
-    /// Wheel and scrollbar input for the session table.
+    /// Wheel, scrollbar and keyboard input for the session table.
     ///
     /// The table is the only scrolling surface on this page, so the wheel works
-    /// anywhere on it; the bar sits at the table's right edge and is draggable.
-    /// Every offset write goes through `apply_table_scroll`, the single place
-    /// the pixel offset is clamped. After any real move the row hit rectangles
-    /// are rebuilt from the same solve and the whole page group is repainted —
-    /// so a half-scrolled row never carries a live 「停止」 button, and the
-    /// thumb cools on release without waiting for the next poll.
+    /// anywhere on it; the bar sits at the table's right edge and is draggable;
+    /// with the page surface focused, arrows/Page/Home/End scroll it too. All
+    /// of it is the kit's [`Grip`] — the anchor model, the per-frame knob, the
+    /// release cooldown — over `move_offset`, the one write that clamps the
+    /// pixel offset and re-runs hit testing from the same solve the pointer
+    /// handler (and the painter) used. So a half-scrolled row never carries a
+    /// live 「停止」 button, and the thumb cools on release without waiting
+    /// for the next poll.
     pub(super) fn install_input(&self) {
         let st = self.st.clone();
         let rect = self.rect.clone();
@@ -191,96 +182,49 @@ impl ConsolePage {
             let card = geometry.session_card(&solved);
             let area = geometry.row_area(&solved);
             let fit = list_rows(area);
-            match input {
-                PageInput::Wheel(dy) => {
-                    if dy == 0 {
-                        return false;
-                    }
-                    // One row per notch — the same rhythm the row-index wheel
-                    // had. Pixels are for the thumb, not for the wheel.
-                    let step = if dy > 0 {
-                        Metrics::ROW_H
-                    } else {
-                        -Metrics::ROW_H
-                    };
-                    scroll_and_repaint(&st, &page, &geometry, &solved, fit, step)
-                }
-                PageInput::Push(lx, ly) => {
-                    let Some(bar) = session_bar(card, area, &st.borrow()) else {
-                        return false;
-                    };
-                    match bar.hit(lx + px, ly + py) {
-                        Some(Hit::Thumb { grab }) => {
-                            // Anchor the knob where it is shown: pressing
-                            // must not move it; from there the pointer drags
-                            // it and the offset follows.
-                            let mut s = st.borrow_mut();
-                            s.thumb_grab = Some(grab);
-                            s.drag_top = Some(bar.thumb_top());
-                            drop(s);
-                            page.redraw();
-                            true
-                        }
-                        Some(Hit::Track { dir }) => {
-                            // A track click pages by one viewport.
-                            scroll_and_repaint(
-                                &st,
-                                &page,
-                                &geometry,
-                                &solved,
-                                fit,
-                                dir * fit as i32 * Metrics::ROW_H,
-                            )
-                        }
-                        None => false,
-                    }
-                }
-                PageInput::Drag(_lx, ly) => {
-                    let Some(grab) = st.borrow().thumb_grab else {
-                        return false;
-                    };
-                    let Some(bar) = session_bar(card, area, &st.borrow()) else {
-                        return false;
-                    };
-                    // One number drives both readers: the knob is drawn at
-                    // `pointer - grab` (clamped to the track, so it follows
-                    // the cursor pixel for pixel), and the content offset is
-                    // `scroll_at` of that same position — there is no
-                    // division by the row height anywhere in this path.
-                    // `ly + py` converts the page-relative pointer to the
-                    // bar's absolute space.
-                    let (lo, hi) = bar.knob_top_range();
-                    let knob = (ly + py - grab).clamp(lo, hi);
-                    let target = bar.scroll_at(knob);
-                    let changed = {
-                        let mut s = st.borrow_mut();
-                        s.drag_top = Some(knob);
-                        apply_table_scroll(&mut s, target, fit)
-                    };
-                    if changed {
-                        reflow_rows(&st, &geometry, &solved);
-                    }
-                    // Repaint on every drag frame, not only when the offset
-                    // moved: the knob itself is the thing under the cursor.
+            let mut grip = st.borrow().grip;
+            let mut bar = || session_bar(card, area, &st.borrow());
+            let mut scroll_to = |v: i32| move_offset(&st, &geometry, &solved, fit, v);
+            let mut scroll_by = |d: i32| {
+                let cur = st.borrow().scroll_px;
+                move_offset(&st, &geometry, &solved, fit, cur + d)
+            };
+            let mut wheel = |dy: i32| {
+                let cur = st.borrow().scroll_px;
+                // One row per notch — the same rhythm the row-index wheel
+                // had. Pixels are for the thumb, not for the wheel.
+                let step = if dy > 0 {
+                    Metrics::ROW_H
+                } else {
+                    -Metrics::ROW_H
+                };
+                let changed = move_offset(&st, &geometry, &solved, fit, cur + step);
+                if changed {
                     page.redraw();
-                    // The drag belongs to the thumb whether or not the offset
-                    // moved (at an edge it must not fall through to widgets).
-                    true
                 }
-                PageInput::Release => {
-                    let was = {
-                        let mut s = st.borrow_mut();
-                        s.drag_top = None;
-                        s.thumb_grab.take()
-                    };
-                    if was.is_some() {
-                        // The knob settles onto the offset-derived position
-                        // and cools from the grabbed colour immediately.
-                        page.redraw();
-                    }
-                    was.is_some()
-                }
-            }
+                changed
+            };
+            let mut repaint = || page.redraw();
+            let consumed = match input {
+                PageInput::Key(key) => grip.on_key(
+                    key,
+                    Metrics::ROW_H,
+                    &mut bar,
+                    &mut scroll_by,
+                    &mut scroll_to,
+                    &mut repaint,
+                ),
+                _ => grip.on_input(
+                    input,
+                    &mut wheel,
+                    &mut bar,
+                    &mut scroll_by,
+                    &mut scroll_to,
+                    &mut repaint,
+                ),
+            };
+            st.borrow_mut().grip = grip;
+            consumed
         });
     }
 }

@@ -24,8 +24,9 @@ use crate::theme::{self as th, C, L, T};
 use crate::ui::action::{emit_action, set_handler, ActionSlot};
 use crate::ui::chrome::{card, card_title, page_header, PAGE_HEADER_H};
 use crate::ui::controls::{BtnKind, Button, Field, Select, Switch};
+use crate::ui::kit::Grip;
 use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
-use crate::ui::scrollbar::{Hit, ScrollBar};
+use crate::ui::scrollbar::ScrollBar;
 use crate::ui::{Page, PageInput};
 
 /// One field's live widgets, in creation order.
@@ -129,8 +130,6 @@ struct RowGeom {
     /// Caption baseline.
     label_y: i32,
     hint_y: i32,
-    /// Row top, for hover and separators.
-    row_y: i32,
 }
 
 /// Where one section card lives.
@@ -184,7 +183,6 @@ fn geometry(
                 // hint read as belonging to the row below it. `+31` flips that:
                 // a small gap above, a larger one below.
                 hint_y: ry + 31,
-                row_y: ry,
             }
         })
         .collect();
@@ -308,13 +306,10 @@ struct FormState {
     content_h: i32,
     /// Viewport height.
     view_h: i32,
-    hover_row: Option<usize>,
-    /// While dragging the scrollbar: how far below the thumb's top edge the
-    /// pointer grabbed it. `None` when not dragging.
-    thumb_grab: Option<i32>,
-    /// While dragging: the knob's drawn top edge — pointer minus grab,
-    /// clamped to the track. The offset is derived from the same number.
-    drag_top: Option<i32>,
+    /// The scrollbar gesture, machine and all — see [`Grip`]. Press anchor,
+    /// dragged knob position, release cooldown: nothing page-side touches the
+    /// fields anymore, and the paint pass asks `grip.painting()`.
+    grip: Grip,
 }
 
 /// A settings page: a scrolling field form on the left, an action column on
@@ -348,9 +343,7 @@ impl FormPage {
             scroll: 0,
             content_h: 0,
             view_h: h,
-            hover_row: None,
-            thumb_grab: None,
-            drag_top: None,
+            grip: Grip::default(),
         }));
         let on_action: ActionSlot<FormAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -665,13 +658,19 @@ impl FormPage {
         place_fields(self.spec, &self.widgets, &self.st, &self.rect);
     }
 
-    /// Wheel, track-click and thumb-drag input for the field column.
+    /// Wheel, track-click, thumb-drag and keyboard input for the field column.
     ///
     /// The form is taller than the window on the runtime page (20 fields), and
     /// `scroll` was already threaded through `geometry`/`place_fields` — only
     /// the input was missing, so everything below the fold used to be
     /// unreachable. A wheel is invisible, so the bar is both the affordance and
-    /// the second way to use it: drag the thumb, or click the track to page.
+    /// the second way to use it: drag the thumb, click the track to page, or —
+    /// once Tab has reached the page surface — arrows and Page/Home/End.
+    ///
+    /// The gesture machine itself is [`Grip`]: the page supplies the bar (the
+    /// same solve the painter used) and the single offset write path, and the
+    /// kit makes the press anchor, the per-frame knob and the release
+    /// cooldown. Coordinates need no conversion — see [`PageInput`].
     fn install_input(&self) {
         let spec = self.spec;
         let widgets = self.widgets.clone();
@@ -689,79 +688,44 @@ impl FormPage {
                     h: r.3,
                 }
             };
-            let bar = scroll_bar(page_rect, &st.borrow());
-            let scrollable = bar.is_some();
-            match input {
-                PageInput::Wheel(dy) => {
-                    if dy == 0 || !scrollable {
-                        return false;
-                    }
-                    let cur = st.borrow().scroll;
-                    // A notch is FLTK's `dy`; move about one and a half rows.
-                    apply_scroll(spec, &widgets, &st, &rect, &page, cur + dy * ROW_H * 3 / 2);
-                    true
+            let mut grip = st.borrow().grip;
+            let mut bar = || scroll_bar(page_rect, &st.borrow());
+            let mut scroll_to = |v: i32| apply_scroll(spec, &widgets, &st, &rect, &page, v);
+            let mut scroll_by = |d: i32| {
+                let cur = st.borrow().scroll;
+                apply_scroll(spec, &widgets, &st, &rect, &page, cur + d)
+            };
+            let mut wheel = |dy: i32| {
+                let scrollable = st.borrow().content_h > st.borrow().view_h;
+                if !scrollable {
+                    return false;
                 }
-                PageInput::Push(px, py) => {
-                    let Some(bar) = bar else { return false };
-                    // `PageInput` is page-relative; the bar lives in the same
-                    // absolute space as the painters.
-                    match bar.hit(px + page_rect.x, py + page_rect.y) {
-                        Some(Hit::Thumb { grab }) => {
-                            // Anchor the knob where it is shown: pressing
-                            // must not move it; from there the pointer drags
-                            // it and the offset follows.
-                            let mut s = st.borrow_mut();
-                            s.thumb_grab = Some(grab);
-                            s.drag_top = Some(bar.thumb_top());
-                            drop(s);
-                            page.redraw();
-                            true
-                        }
-                        Some(Hit::Track { dir }) => {
-                            // Click above/below the thumb pages by one viewport,
-                            // the usual scrollbar convention.
-                            let (cur, view) = {
-                                let s = st.borrow();
-                                (s.scroll, s.view_h)
-                            };
-                            apply_scroll(spec, &widgets, &st, &rect, &page, cur + dir * view);
-                            true
-                        }
-                        None => false,
-                    }
-                }
-                PageInput::Drag(_px, py) => {
-                    let Some(grab) = st.borrow().thumb_grab else {
-                        return false;
-                    };
-                    let Some(bar) = bar else { return false };
-                    // One number drives both readers: the knob is drawn at
-                    // `pointer - grab` (clamped to the track), the content
-                    // offset is `scroll_at` of the same position. `PageInput`
-                    // is page-relative, the bar is absolute — convert, or
-                    // every drag offsets by the page origin.
-                    let (lo, hi) = bar.knob_top_range();
-                    let knob = (py + page_rect.y - grab).clamp(lo, hi);
-                    st.borrow_mut().drag_top = Some(knob);
-                    apply_scroll(spec, &widgets, &st, &rect, &page, bar.scroll_at(knob));
-                    // Repaint on every drag frame: the knob itself moved even
-                    // where the offset did not. FLTK coalesces damage within
-                    // one flush, so this costs no extra pass.
-                    page.redraw();
-                    true
-                }
-                PageInput::Release => {
-                    let was = {
-                        let mut s = st.borrow_mut();
-                        s.drag_top = None;
-                        s.thumb_grab.take()
-                    };
-                    if was.is_some() {
-                        page.redraw();
-                    }
-                    was.is_some()
-                }
-            }
+                // A notch is FLTK's `dy`; move about one and a half rows.
+                let cur = st.borrow().scroll;
+                apply_scroll(spec, &widgets, &st, &rect, &page, cur + dy * ROW_H * 3 / 2);
+                true
+            };
+            let mut repaint = || page.redraw();
+            let consumed = match input {
+                PageInput::Key(key) => grip.on_key(
+                    key,
+                    ROW_H,
+                    &mut bar,
+                    &mut scroll_by,
+                    &mut scroll_to,
+                    &mut repaint,
+                ),
+                _ => grip.on_input(
+                    input,
+                    &mut wheel,
+                    &mut bar,
+                    &mut scroll_by,
+                    &mut scroll_to,
+                    &mut repaint,
+                ),
+            };
+            st.borrow_mut().grip = grip;
+            consumed
         });
     }
 }
@@ -834,19 +798,6 @@ fn paint(spec: &FormSpec, rect: PageRect, s: &FormState, origin_x: i32) {
             if !row_fits(g, clip_top, clip_bottom) {
                 continue;
             }
-            let hovered = s
-                .hover_row
-                .is_some_and(|i| rows[i].key == f.key && rows[i].row_y == g.row_y);
-            if hovered {
-                th::fill_round(
-                    ix - 8,
-                    g.row_y - 6,
-                    iw + 16,
-                    ROW_H - 6,
-                    L::RADIUS,
-                    th::mix(C::RAISED, C::PANEL, 0.55),
-                );
-            }
             // Label column, then the hint under the input. The label and its
             // dirty marker are both laid out from one line box.
             let dirty = s.dirty.iter().any(|k| k == f.key);
@@ -888,7 +839,8 @@ fn paint(spec: &FormSpec, rect: PageRect, s: &FormState, origin_x: i32) {
     // derives its own geometry from the page rect.
     let _ = (content_x, content_w);
     if let Some(bar) = scroll_bar(rect, s) {
-        bar.paint(s.thumb_grab.is_some(), s.drag_top);
+        let (hot, knob) = s.grip.painting();
+        bar.paint(hot, knob);
     }
     paint_side(
         spec,

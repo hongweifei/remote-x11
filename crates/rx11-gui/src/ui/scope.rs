@@ -19,12 +19,12 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use fltk::enums::{Align, Event};
+use fltk::enums::Align;
 use fltk::prelude::*;
-use fltk::widget::Widget;
 
 use crate::state::{fmt_rate, Sample, SCOPE_SAMPLES};
 use crate::theme::{self as th, C, T};
+use crate::ui::kit::{Hand, Interactive, Touch};
 
 /// What the scope is told to draw each frame.
 #[derive(Clone, Default)]
@@ -78,8 +78,7 @@ struct ScopeState {
 /// [`set_data`]: Scope::set_data
 #[derive(Clone)]
 pub struct Scope {
-    w: Widget,
-    st: Rc<RefCell<ScopeState>>,
+    it: Interactive<Rc<RefCell<ScopeState>>>,
 }
 
 impl Scope {
@@ -88,42 +87,36 @@ impl Scope {
             data: ScopeData::default(),
             hover_x: None,
         }));
-        let mut wid = Widget::new(x, y, w, h, None);
-        wid.set_frame(fltk::enums::FrameType::NoBox);
-
         let st_draw = st.clone();
-        wid.draw(move |w| {
-            let s = st_draw.borrow();
-            paint(w.x(), w.y(), w.w(), w.h(), &s);
-        });
-
         let st_ev = st.clone();
-        wid.handle(move |w, ev| match ev {
-            Event::Enter | Event::Move | Event::Drag => {
-                let (mx, _) = fltk::app::event_coords();
-                let mut s = st_ev.borrow_mut();
-                s.hover_x = Some(mx - w.x());
-                w.redraw();
-                true
-            }
-            Event::Leave => {
-                st_ev.borrow_mut().hover_x = None;
-                w.redraw();
-                true
-            }
-            _ => false,
-        });
-
-        Self { w: wid, st }
+        let it = Interactive::build(x, y, w, h, st.clone())
+            // The scope is a measurement surface, not a control: Tab must
+            // pass over it, and the pointer only moves the readout cursor.
+            .focus(false)
+            .draw(move |w, _, _| paint(w.x(), w.y(), w.w(), w.h(), &st_draw.borrow()))
+            .event(move |w, _, _, touch| match touch {
+                Touch::Move { at } => {
+                    st_ev.borrow_mut().hover_x = Some(at.0 - w.x());
+                    Hand::Repaint
+                }
+                Touch::Exit => {
+                    st_ev.borrow_mut().hover_x = None;
+                    Hand::Repaint
+                }
+                _ => Hand::Ignored,
+            })
+            .install();
+        Self { it }
     }
 
     pub fn set_data(&self, data: ScopeData) {
-        self.st.borrow_mut().data = data;
-        self.w.clone().redraw();
+        self.it.update(|cell| {
+            cell.borrow_mut().data = data;
+        });
     }
 
     pub fn resize(&self, x: i32, y: i32, w: i32, h: i32) {
-        self.w.clone().resize(x, y, w, h);
+        self.it.resize(x, y, w, h);
     }
 }
 

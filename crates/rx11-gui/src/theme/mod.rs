@@ -73,6 +73,17 @@ pub fn init() {
     // we did not paint by hand (text inputs, menus, tooltips) matches.
     app::set_font(ui_font());
     app::set_font_size(T::BODY);
+
+    // Tooltips are the one FLTK-drawn surface we let float above the console;
+    // they must read as part of the same language. A hairline of the amber
+    // accent as the box colour would shout, so: sunk surface, body text,
+    // slightly quicker than FLTK's default so it feels connected to hover.
+    fltk::misc::Tooltip::set_color(rgb(C::SUNKEN));
+    fltk::misc::Tooltip::set_text_color(rgb(C::TEXT));
+    fltk::misc::Tooltip::set_font(ui_font());
+    fltk::misc::Tooltip::set_font_size(T::SMALL);
+    fltk::misc::Tooltip::set_delay(0.6);
+    fltk::misc::Tooltip::enable(true);
 }
 
 /// Match the display's scale factor so text renders at device resolution

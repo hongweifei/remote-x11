@@ -43,7 +43,7 @@ fn geometry_stacks_sections_without_gaps() {
     assert_eq!(sections.len(), 1);
     assert_eq!(rows.len(), 2);
     // Second row is exactly one row height below the first.
-    assert_eq!(rows[1].row_y - rows[0].row_y, ROW_H);
+    assert_eq!(rows[1].input_y - rows[0].input_y, ROW_H);
     // Section is tall enough for its head plus every row.
     assert_eq!(sections[0].h, SECTION_HEAD + 2 * ROW_H + 12);
 }
@@ -52,7 +52,7 @@ fn geometry_stacks_sections_without_gaps() {
 fn geometry_offsets_follow_scroll() {
     let (_, a) = geometry(&SPEC, 0, 0, 1000, 700, 0);
     let (_, b) = geometry(&SPEC, 0, 0, 1000, 700, 40);
-    assert_eq!(a[0].row_y - b[0].row_y, 40);
+    assert_eq!(a[0].input_y - b[0].input_y, 40);
 }
 
 /// The scrollable content height must equal the shipped sum: every card plus the

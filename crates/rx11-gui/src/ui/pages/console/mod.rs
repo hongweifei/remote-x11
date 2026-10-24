@@ -27,6 +27,7 @@ use crate::ui::chrome::{
     card_in, card_title_in, empty_state_in, page_header_in, stat_in, CARD_TITLE_H, PAGE_HEADER_H,
 };
 use crate::ui::controls::{BtnKind, Button};
+use crate::ui::kit::{Grip, ListSieve};
 use crate::ui::layout::{Axis, Insets, Layout, NodeId, Rect, Size, Solved};
 use crate::ui::scope::{Scope, ScopeData};
 use crate::ui::Page;
@@ -107,20 +108,17 @@ impl ConsoleData {
 struct ConsoleState {
     data: ConsoleData,
     rows: Vec<RowHit>,
-    hover_stop: Option<usize>,
-    pressed_stop: Option<usize>,
+    /// The 「停止」 buttons' hover/press/click machine — the kit's
+    /// [`ListSieve`], fed the row hit list after each scroll.
+    sieve: ListSieve,
     /// Scroll offset of the table in **pixels**. The launcher keeps every
     /// session; the table is windowed onto them. Pixels rather than a row
     /// index because a thumb drag produces a pixel offset: quantising it to
     /// whole rows is what made the thumb lag up to 46 units behind the
     /// pointer.
     scroll_px: i32,
-    /// While dragging the table's scrollbar: pointer offset below the thumb's
-    /// top edge. `None` when not dragging.
-    thumb_grab: Option<i32>,
-    /// While dragging: the knob's drawn top edge — pointer minus grab,
-    /// clamped to the track. The offset is derived from the same number.
-    drag_top: Option<i32>,
+    /// The table's scrollbar gesture — anchor-model machine in [`Grip`].
+    grip: Grip,
 }
 
 /// The overview page.
@@ -143,11 +141,9 @@ impl ConsolePage {
         let st = Rc::new(RefCell::new(ConsoleState {
             data: ConsoleData::default(),
             rows: Vec::new(),
-            hover_stop: None,
-            pressed_stop: None,
+            sieve: ListSieve::default(),
             scroll_px: 0,
-            thumb_grab: None,
-            drag_top: None,
+            grip: Grip::default(),
         }));
         let on_action: ActionSlot<ConsoleAction> = Rc::new(RefCell::new(None));
         let rect = Rc::new(RefCell::new((x, y, w, h)));
@@ -196,46 +192,45 @@ impl ConsolePage {
             let mut wid = page.widget();
             wid.handle(move |w, ev| {
                 let (mx, my) = fltk::app::event_coords();
-                let hit = st_ev.borrow().rows.iter().position(|r| {
-                    r.stop.is_some_and(|(sx, sy, sw, sh)| {
-                        mx >= sx && mx <= sx + sw && my >= sy && my <= sy + sh
+                // Row index into the very hit list the painter used, so a
+                // button can only be clicked where it is also drawn; the
+                // hover/press/fire machine itself is the kit's [`ListSieve`].
+                let hit = {
+                    let s = st_ev.borrow();
+                    s.rows.iter().position(|r| {
+                        r.stop.is_some_and(|(sx, sy, sw, sh)| {
+                            Rect::new(sx, sy, sw, sh).contains(mx, my)
+                        })
                     })
-                });
-                match ev {
-                    Event::Move | Event::Enter => {
-                        let mut s = st_ev.borrow_mut();
-                        if s.hover_stop != hit {
-                            s.hover_stop = hit;
-                            w.redraw();
-                        }
-                        true
-                    }
-                    Event::Leave => {
-                        let mut s = st_ev.borrow_mut();
-                        s.hover_stop = None;
-                        s.pressed_stop = None;
-                        w.redraw();
-                        true
-                    }
+                };
+                let mut sieve = st_ev.borrow().sieve;
+                let dirty = match ev {
+                    Event::Move | Event::Enter => sieve.move_to(hit),
+                    Event::Leave => sieve.exit(),
                     Event::Push => {
-                        st_ev.borrow_mut().pressed_stop = hit;
+                        let claimed = sieve.press(hit);
+                        st_ev.borrow_mut().sieve = sieve;
                         w.redraw();
-                        hit.is_some()
+                        return claimed;
                     }
                     Event::Released => {
-                        let mut s = st_ev.borrow_mut();
-                        let fire = s.pressed_stop.is_some() && s.pressed_stop == hit;
-                        s.pressed_stop = None;
+                        let pressed = sieve.pressed;
+                        let fired = sieve.release(hit);
+                        st_ev.borrow_mut().sieve = sieve;
                         w.redraw();
-                        drop(s);
-                        if fire {
-                            let id = st_ev.borrow().rows[hit.unwrap()].session_id;
+                        if let Some(i) = fired {
+                            let id = st_ev.borrow().rows[i].session_id;
                             emit_action(&act, ConsoleAction::StopSession(id));
                         }
-                        true
+                        return pressed.is_some();
                     }
-                    _ => false,
+                    _ => return false,
+                };
+                if dirty {
+                    st_ev.borrow_mut().sieve = sieve;
+                    w.redraw();
                 }
+                true
             });
         }
 
@@ -750,8 +745,8 @@ fn paint_sessions(geometry: &ConsoleLayout, solved: &Solved, s: &ConsoleState) {
         let row_cols = geometry.column_rects(solved, slot);
         paint_session_row(&row_cols, ry, row);
         if let Some((sx, sy, sw, sh)) = s.rows.get(slot).and_then(|r| r.stop) {
-            let hovered = s.hover_stop == Some(slot);
-            let pressed = s.pressed_stop == Some(slot);
+            let hovered = s.sieve.hover == Some(slot);
+            let pressed = s.sieve.pressed == Some(slot);
             let (fill, text) = if pressed {
                 (th::mix(C::BAD, C::PANEL, 0.34), C::BAD)
             } else if hovered {
@@ -784,7 +779,8 @@ fn paint_sessions(geometry: &ConsoleLayout, solved: &Solved, s: &ConsoleState) {
     th::pop_clip();
 
     if let Some(bar) = session_bar(card, area, s) {
-        bar.paint(s.thumb_grab.is_some(), s.drag_top);
+        let (hot, knob) = s.grip.painting();
+        bar.paint(hot, knob);
     }
 }
 

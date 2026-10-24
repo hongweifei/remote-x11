@@ -162,11 +162,9 @@ fn apply_table_scroll_clamps_and_only_reports_real_moves() {
             ..ConsoleData::default()
         },
         rows: Vec::new(),
-        hover_stop: None,
-        pressed_stop: None,
+        sieve: Default::default(),
         scroll_px: 0,
-        thumb_grab: None,
-        drag_top: None,
+        grip: Default::default(),
     };
     assert!(!apply_table_scroll(&mut s, 0, 2), "不动不算变化");
     assert!(apply_table_scroll(&mut s, 40, 2));
