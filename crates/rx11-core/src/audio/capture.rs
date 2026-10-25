@@ -315,41 +315,6 @@ fn string_prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) ->
         .to_string()
 }
 
-/// The capture command for ONE application.
-///
-/// The stream starts unlinked (`--target=0`) and receives the application
-/// through a link; `node.name` is unique so the capture stream can be told
-/// apart from the application's own node.
-///
-/// The sample format is `s16`, NOT `s16le`: `pw-cat` names the format
-/// `s16` (see `pw-cat --list-formats`), and `s16le` — the spelling
-/// `parec`/`paplay` use — makes the capture stream refuse to start with
-/// "open failed: invalid argument". The byte order is the host's, so the
-/// PCM is still interleaved little-endian s16.
-///
-/// The output is the standard output (the `-` argument): a pipe, a FIFO
-/// and a regular file all carry the capture (measured: 581632 bytes to a
-/// pipe, 598016 to a file).
-///
-/// The returned vector holds the ARGUMENTS only, not the program name:
-/// the caller spells the program (`Command::new("pw-cat")`). Passing the
-/// program name as well would make `pw-cat` take it for the output FILE
-/// name — the capture would then write to a file called "pw-cat" and
-/// leave the pipe empty (measured, and the reason a stray multi-megabyte
-/// "pw-cat" file appeared in the working directory).
-pub fn capture_stream_arguments(node_name: &str) -> Vec<String> {
-    vec![
-        "--record".to_string(),
-        "--target=0".to_string(),
-        "--raw".to_string(),
-        "--format=s16".to_string(),
-        "--rate=48000".to_string(),
-        "--channels=2".to_string(),
-        format!("--properties=node.name={node_name}"),
-        "-".to_string(),
-    ]
-}
-
 /// The capture command for ONE application, pointed at that application.
 ///
 /// The target is the application's `object.serial` — the stable identity of
@@ -368,8 +333,22 @@ pub fn capture_stream_arguments(node_name: &str) -> Vec<String> {
 /// already bound to the application — there is no separate link step and
 /// no window in which the two ends have to be matched up.
 ///
-/// The returned vector holds the ARGUMENTS only, not the program name —
-/// see [`capture_stream_arguments`] for why.
+/// The sample format is `s16`, NOT `s16le`: `pw-cat` names the format
+/// `s16` (see `pw-cat --list-formats`), and `s16le` — the spelling
+/// `parec`/`paplay` use — makes the capture stream refuse to start with
+/// "open failed: invalid argument". The byte order is the host's, so the
+/// PCM is still interleaved little-endian s16.
+///
+/// The output is the standard output (the `-` argument): a pipe, a FIFO
+/// and a regular file all carry the capture (measured: 581632 bytes to a
+/// pipe, 598016 to a file).
+///
+/// The returned vector holds the ARGUMENTS only, not the program name:
+/// the caller spells the program (`Command::new("pw-cat")`). Passing the
+/// program name as well would make `pw-cat` take it for the output FILE
+/// name — the capture would then write to a file called "pw-cat" and
+/// leave the pipe empty (measured, and the reason a stray multi-megabyte
+/// "pw-cat" file appeared in the working directory).
 pub fn capture_command_for_application(target_serial: u32) -> Vec<String> {
     vec![
         "--record".to_string(),
@@ -431,8 +410,12 @@ fn process_start_time_seconds(pid: u32) -> u64 {
         .unwrap_or(0)
 }
 
-/// The command that links an application's output port into the capture
-/// stream's input port.
+/// The command that links two ports of the audio graph.
+///
+/// This is NOT part of the per-application capture route: that route points
+/// the capture at the application's stream by its serial, and needs no
+/// link. The function stays because linking two ports BY NUMBER is a
+/// distinct operation (and a diagnostic one).
 ///
 /// Both ends are port NUMBERS: names are ambiguous across applications.
 ///
@@ -449,12 +432,13 @@ pub fn link_command(output_port: u32, input_port: u32) -> Vec<String> {
     vec![output_port.to_string(), input_port.to_string()]
 }
 
-/// Whether this host can capture per application at all: it needs the two
-/// PipeWire tools and a `pw-dump` to read the graph.
+/// Whether this host can capture per application at all.
+///
+/// It needs `pw-cat` (the capture) and `pw-dump` (the graph). It does NOT
+/// need `pw-link`: the capture is pointed at the application's stream by
+/// its serial, and PipeWire links it itself.
 pub fn per_app_capture_available() -> bool {
-    super::program_exists("pw-cat")
-        && super::program_exists("pw-link")
-        && super::program_exists("pw-dump")
+    super::program_exists("pw-cat") && super::program_exists("pw-dump")
 }
 
 #[cfg(test)]
@@ -462,8 +446,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_command_is_unlinked_raw_and_uniquely_named() {
-        let argv = capture_stream_arguments("rx11-cap-7");
+    fn the_capture_command_speaks_the_host_format() {
+        let argv = capture_command_for_application(11086);
         // The ARGUMENTS only: a leading program name would be taken by
         // `pw-cat` as the output FILE name, and the pipe would stay empty.
         assert!(
@@ -471,8 +455,6 @@ mod tests {
             "the program name is not an argument: {argv:?}"
         );
         assert!(argv.iter().any(|a| a == "--record"));
-        // Unlinked: the application arrives through a link, not a target.
-        assert!(argv.iter().any(|a| a == "--target=0"));
         // Raw PCM: without --raw the output carries a container header.
         assert!(argv.iter().any(|a| a == "--raw"));
         // The format is `s16`, not `s16le`: `pw-cat` refuses `s16le`.
@@ -480,10 +462,6 @@ mod tests {
         assert!(!argv.iter().any(|a| a == "--format=s16le"));
         assert!(argv.iter().any(|a| a == "--rate=48000"));
         assert!(argv.iter().any(|a| a == "--channels=2"));
-        // The unique name is what tells the capture stream apart later.
-        assert!(argv
-            .iter()
-            .any(|a| a == "--properties=node.name=rx11-cap-7"));
         // The output is the standard output.
         assert_eq!(argv.last().map(String::as_str), Some("-"));
     }
