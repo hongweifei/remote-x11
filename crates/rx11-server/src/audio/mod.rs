@@ -113,11 +113,21 @@ impl AudioHub {
         self.inner.state.lock().expect("audio hub state")
     }
 
-    /// Whether the whole-desktop mix is in force: the runtime profile
-    /// turned per-application audio off, or the host cannot capture per
-    /// application at all.
+    /// Whether the whole-desktop mix is in force.
+    ///
+    /// Three reasons send the session to the mix:
+    ///
+    /// - the runtime profile turned per-application audio off;
+    /// - the host cannot capture per application (no `pw-cat` / `pw-link`
+    ///   / `pw-dump`);
+    /// - the operator set an explicit recorder command. That command is
+    ///   the whole-desktop recorder — per-application capture needs a
+    ///   graph lookup and a port link, which one argv cannot express — so
+    ///   an override pins the session to the mix it names.
     pub(crate) fn mix_only(&self) -> bool {
-        !self.inner.runtime.audio_per_app || !rx11_core::audio::per_app_capture_available()
+        !self.inner.runtime.audio_per_app
+            || self.inner.runtime.audio_record_command.is_some()
+            || !rx11_core::audio::per_app_capture_available()
     }
 
     /// Subscribe a client to the whole-desktop mix.
