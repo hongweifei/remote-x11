@@ -330,9 +330,15 @@ fn string_prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) ->
 /// The output is the standard output (the `-` argument): a pipe, a FIFO
 /// and a regular file all carry the capture (measured: 581632 bytes to a
 /// pipe, 598016 to a file).
-pub fn capture_stream_command(node_name: &str) -> Vec<String> {
+///
+/// The returned vector holds the ARGUMENTS only, not the program name:
+/// the caller spells the program (`Command::new("pw-cat")`). Passing the
+/// program name as well would make `pw-cat` take it for the output FILE
+/// name — the capture would then write to a file called "pw-cat" and
+/// leave the pipe empty (measured, and the reason a stray multi-megabyte
+/// "pw-cat" file appeared in the working directory).
+pub fn capture_stream_arguments(node_name: &str) -> Vec<String> {
     vec![
-        "pw-cat".to_string(),
         "--record".to_string(),
         "--target=0".to_string(),
         "--raw".to_string(),
@@ -361,9 +367,11 @@ pub fn capture_stream_command(node_name: &str) -> Vec<String> {
 /// The capture stream is created with `--target=<serial>`, so it starts
 /// already bound to the application — there is no separate link step and
 /// no window in which the two ends have to be matched up.
+///
+/// The returned vector holds the ARGUMENTS only, not the program name —
+/// see [`capture_stream_arguments`] for why.
 pub fn capture_command_for_application(target_serial: u32) -> Vec<String> {
     vec![
-        "pw-cat".to_string(),
         "--record".to_string(),
         format!("--target={target_serial}"),
         "--raw".to_string(),
@@ -430,12 +438,12 @@ fn process_start_time_seconds(pid: u32) -> u64 {
 /// exit of the `pw-link` process (measured: the capture node keeps
 /// running and keeps carrying audio after `pw-link` exited). Adding `-L`
 /// to a pair of ports that are already linked fails with "file exists".
+///
+/// The returned vector holds the ARGUMENTS only, not the program name:
+/// `pw-link` takes the output port as its FIRST argument, so a leading
+/// program name would be read as a port number.
 pub fn link_command(output_port: u32, input_port: u32) -> Vec<String> {
-    vec![
-        "pw-link".to_string(),
-        output_port.to_string(),
-        input_port.to_string(),
-    ]
+    vec![output_port.to_string(), input_port.to_string()]
 }
 
 /// Whether this host can capture per application at all: it needs the two
@@ -452,8 +460,13 @@ mod tests {
 
     #[test]
     fn capture_command_is_unlinked_raw_and_uniquely_named() {
-        let argv = capture_stream_command("rx11-cap-7");
-        assert_eq!(argv.first().map(String::as_str), Some("pw-cat"));
+        let argv = capture_stream_arguments("rx11-cap-7");
+        // The ARGUMENTS only: a leading program name would be taken by
+        // `pw-cat` as the output FILE name, and the pipe would stay empty.
+        assert!(
+            !argv.iter().any(|a| a == "pw-cat"),
+            "the program name is not an argument: {argv:?}"
+        );
         assert!(argv.iter().any(|a| a == "--record"));
         // Unlinked: the application arrives through a link, not a target.
         assert!(argv.iter().any(|a| a == "--target=0"));
@@ -475,11 +488,10 @@ mod tests {
     #[test]
     fn link_command_addresses_ports_by_number() {
         let argv = link_command(75, 106);
-        assert_eq!(argv, vec!["pw-link", "75", "106"]);
-        // Numbers, not names: several applications share a node name.
-        assert!(argv
-            .iter()
-            .all(|a| a.chars().all(|c| c.is_ascii_digit()) || a == "pw-link"));
+        // The ARGUMENTS only: `pw-link` reads the output port as its first
+        // argument, so a leading program name would be read as a port.
+        assert_eq!(argv, vec!["75", "106"]);
+        assert!(argv.iter().all(|a| a.chars().all(|c| c.is_ascii_digit())));
     }
 
     #[test]
@@ -766,7 +778,12 @@ mod tests {
     #[test]
     fn the_application_capture_is_pointed_at_the_nodes_serial() {
         let argv = capture_command_for_application(11086);
-        assert_eq!(argv.first().map(String::as_str), Some("pw-cat"));
+        // The ARGUMENTS only — a leading program name would become the
+        // output FILE name and the pipe would stay empty.
+        assert!(
+            !argv.iter().any(|a| a == "pw-cat"),
+            "the program name is not an argument: {argv:?}"
+        );
         assert!(argv.iter().any(|a| a == "--record"));
         // The target is the object's SERIAL: the graph's own id is
         // recycled, and a target given as an id resolves to the sink mix.
