@@ -136,6 +136,19 @@ impl ApplicationCapture {
         self.channels.lock().expect("audio channels").is_empty()
     }
 
+    /// The channels this application speaks on: one per X11 connection.
+    #[cfg(test)]
+    pub(crate) fn channel_ids(&self) -> Vec<Channel> {
+        self.channels.lock().expect("audio channels").clone()
+    }
+
+    /// Ship one packet on every channel of this application.
+    #[cfg(test)]
+    pub(crate) fn fan_out(&mut self, seq: u32, packet: &[u8]) {
+        let mut channels = self.channels.lock().expect("audio channels");
+        fan_out(&mut channels, seq, packet);
+    }
+
     /// Start capturing this application.
     ///
     /// The capture is started in the background: a failure is reported and

@@ -41,6 +41,7 @@ use rx11_core::types::ConnectionId;
 
 /// One audio channel: a subscriber's real-time lane, plus the X11
 /// connection whose application this sound belongs to.
+#[derive(Clone)]
 pub(crate) struct Channel {
     /// The audio channel's own id. A DIFFERENT namespace from the X11
     /// connection ids: the client routes audio frames by this id.
@@ -203,5 +204,179 @@ impl AudioHub {
             let capture = st.applications.remove(index);
             capture.stop();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rx11_core::audio::ProcessTree;
+    use rx11_core::protocol::Frame;
+    use rx11_core::queue::outbound_channel;
+
+    /// This process's application root: a real, readable application, so
+    /// the tests use the same identity the production path produces.
+    fn own_app() -> ApplicationId {
+        ProcessTree::of_self()
+            .and_then(|tree| tree.application_root())
+            .expect("this process has an application")
+    }
+
+    /// A real priority lane and its receiver: the tests read the frames
+    /// the hub actually puts on the wire.
+    fn lane() -> (OutboundSender, rx11_core::queue::OutboundReceiver) {
+        outbound_channel(16, 64 * 1024)
+    }
+
+    #[tokio::test]
+    async fn a_clients_lane_is_found_by_its_subscription_id() {
+        let hub = AudioHub::new(RuntimeConfig::default());
+        let (tx, _rx) = lane();
+        let id = ConnectionId::new(77);
+        hub.attach_per_app(tx.clone(), id);
+        assert!(
+            hub.client_lane(id).is_some(),
+            "the subscription id finds the lane"
+        );
+        assert!(
+            hub.client_lane(ConnectionId::new(78)).is_none(),
+            "another id finds nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn one_application_serves_several_connections_on_one_capture() {
+        let hub = AudioHub::new(RuntimeConfig::default());
+        let (tx, _rx) = lane();
+        let client = ConnectionId::new(77);
+        hub.attach_per_app(tx.clone(), client);
+
+        let application = own_app();
+        // Two X11 connections of the same application.
+        let first = ConnectionId::new(11);
+        let second = ConnectionId::new(12);
+        hub.attach_connection(application, first, tx.clone());
+        hub.attach_connection(application, second, tx.clone());
+
+        // ONE capture for the application, shared by both connections.
+        let captures = hub.state().applications.len();
+        assert_eq!(captures, 1, "one capture per application, not per client");
+
+        // The channels are per X11 connection, each with its own channel
+        // id and its own application label.
+        let channels = hub.state().applications[0].channel_ids();
+        assert_eq!(channels.len(), 2, "one channel per X11 connection");
+        assert_ne!(
+            channels[0].audio_channel_id, channels[1].audio_channel_id,
+            "the audio channels have their own ids"
+        );
+        assert_ne!(
+            channels[0].audio_channel_id, first,
+            "the audio channel id is not the X11 connection id"
+        );
+        assert_eq!(channels[0].app_connection_id, first);
+        assert_eq!(channels[1].app_connection_id, second);
+    }
+
+    #[tokio::test]
+    async fn the_first_packet_opens_every_channel_with_its_application_label() {
+        let hub = AudioHub::new(RuntimeConfig::default());
+        let (tx, mut rx) = lane();
+        hub.attach_per_app(tx.clone(), ConnectionId::new(77));
+
+        let application = own_app();
+        let x11_connection = ConnectionId::new(11);
+        hub.attach_connection(application, x11_connection, tx.clone());
+
+        // The fan-out with a real packet: the channel opens with the
+        // application label, then the data follows on the same channel.
+        let capture = &mut hub.state().applications[0];
+        capture.fan_out(7, &[1, 2, 3]);
+
+        let opened = rx.try_recv_priority().expect("the channel opens");
+        let Frame::ChannelOpen(open) = opened else {
+            panic!("the first frame opens the channel");
+        };
+        assert_eq!(open.kind, rx11_core::protocol::ChannelKind::audio());
+        assert_eq!(
+            open.app,
+            Some(x11_connection),
+            "the channel carries the X11 connection it speaks for"
+        );
+        assert_eq!(
+            open.connection_id,
+            capture.channel_ids()[0].audio_channel_id,
+            "the data follows the channel the open named"
+        );
+
+        let data = rx.try_recv_priority().expect("the packet follows");
+        let Frame::StreamData(payload) = data else {
+            panic!("the second frame carries the packet");
+        };
+        assert_eq!(payload.connection_id, open.connection_id);
+        assert_eq!(payload.sequence_id, 7);
+        assert_eq!(payload.data.as_ref(), &[1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn detaching_the_last_connection_stops_the_capture() {
+        let hub = AudioHub::new(RuntimeConfig::default());
+        let (tx, _rx) = lane();
+        hub.attach_per_app(tx.clone(), ConnectionId::new(77));
+
+        let application = own_app();
+        let first = ConnectionId::new(11);
+        let second = ConnectionId::new(12);
+        hub.attach_connection(application, first, tx.clone());
+        hub.attach_connection(application, second, tx.clone());
+        assert_eq!(hub.state().applications.len(), 1);
+
+        // One connection gone: the application keeps its capture.
+        hub.detach_connection(application, first);
+        assert_eq!(
+            hub.state().applications.len(),
+            1,
+            "the application still has a connection"
+        );
+
+        // The last one gone: the capture stops.
+        hub.detach_connection(application, second);
+        assert!(
+            hub.state().applications.is_empty(),
+            "the application's capture stopped with its last connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mix_is_in_force_when_per_application_audio_is_off() {
+        let runtime = RuntimeConfig {
+            audio_per_app: false,
+            ..RuntimeConfig::default()
+        };
+        let hub = AudioHub::new(runtime);
+        assert!(
+            hub.mix_only(),
+            "the runtime profile turned per-application audio off"
+        );
+
+        let runtime = RuntimeConfig::default();
+        let hub = AudioHub::new(runtime);
+        assert!(
+            !hub.mix_only(),
+            "on a host with the per-application tools, the tier is available"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_recorder_command_pins_the_session_to_the_mix() {
+        let runtime = RuntimeConfig {
+            audio_record_command: Some(vec!["cat".into(), "pcm".into()]),
+            ..RuntimeConfig::default()
+        };
+        let hub = AudioHub::new(runtime);
+        assert!(
+            hub.mix_only(),
+            "an explicit recorder names the whole-desktop recorder"
+        );
     }
 }
