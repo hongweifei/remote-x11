@@ -3,25 +3,22 @@
 //!
 //! The route, as measured on a PipeWire host:
 //!
-//! - `pw-cat --record --raw --target=0` starts a capture stream that is
-//!   linked to nothing (`--target=0`). It carries NO
-//!   `application.process.id`, so it is recognised by the unique
-//!   `node.name` this module gives it.
 //! - The application's own PipeWire stream (the node with
 //!   `application.process.id` equal to one of the application's pids) is
-//!   found in the graph, and its output ports are linked into the capture
-//!   stream's input ports with `pw-link`.
-//! - The links survive the `pw-link` process exiting, so linking is a
-//!   one-shot action.
+//!   found in the graph. It exists only while the application makes a
+//!   sound: an application that opens its stream on demand (a browser's
+//!   audio service) has no node while it is silent.
+//! - The capture is pointed at that stream by its **object serial**:
+//!   `pw-cat --record --raw --target=<serial>`. The serial is PipeWire's
+//!   stable identity for the stream; the graph's object id is not stable
+//!   (it is recycled), and a target given as an id captures the SINK MIX
+//!   (measured: with the id the capture carries both applications' sounds,
+//!   6752 against 6312; with the serial it carries only the wanted one,
+//!   10882 against 3.8).
 //!
-//! `--target=0` matters: pointing `pw-cat --target` at an application
-//! node captures the SINK MIX, not that application — the measured result
-//! of `--target` and of a port-linked capture differ completely.
-//!
-//! Port NUMBERS are used, not port names: every `paplay` instance names
-//! its node "paplay", so "paplay:output_FL" does not say WHICH
-//! application. The ports are paired by channel suffix (`output_FL` to
-//! `input_FL`) so the capture stays stereo.
+//! Pointing the capture at the serial means no port pairing and no link
+//! step: the capture starts already bound to the application, and it keeps
+//! flowing (a port-linked capture stops after about 200 KB).
 //!
 //! The capture is SHARED: one application, one recorder, one encoder —
 //! however many X11 connections it holds and however many clients watch
@@ -45,7 +42,7 @@ use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
 use rx11_core::audio::{
-    capture_stream_command, link_command, ApplicationId, FormatGate, Packetizer, PipeWireTopology,
+    capture_command_for_application, ApplicationId, FormatGate, Packetizer, PipeWireTopology,
     ProcessTree,
 };
 use rx11_core::protocol::{
@@ -60,6 +57,63 @@ use super::Channel;
 /// frames regardless of how the pipe chunks.
 const READ_CHUNK: usize = 8 * 1024;
 
+/// How often the PipeWire graph is re-read while waiting for something to
+/// appear in it.
+const GRAPH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Wait for the application's output stream to appear in the graph, and
+/// return its object serial.
+///
+/// The application's PipeWire node exists only while the application
+/// makes a sound: an application that opens its stream on demand (a
+/// browser's audio service) has NO node while it is silent. Waiting for
+/// it is what makes "the application starts playing" work, and the wait is
+/// unbounded — it ends when the application goes away, not when a
+/// deadline passes. A capture that started before the application made a
+/// sound would carry the wrong sound (the sink mix) or nothing at all.
+///
+/// The serial is PipeWire's STABLE identity for the stream. The graph's
+/// object id is not stable — it is recycled — and a target given as an id
+/// resolves to the sink MIX (measured: with the id the capture carries
+/// both applications' sounds, 6752 against 6312; with the serial it
+/// carries only the wanted one, 10882 against 3.8).
+async fn wait_for_application_serial(
+    sound_root: rx11_core::audio::ApplicationId,
+    stop: &AtomicBool,
+) -> Result<u32, String> {
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            return Err("the application went away before it made a sound".to_string());
+        }
+        if let Ok(topology) = PipeWireTopology::read() {
+            for node in topology.application_output_nodes() {
+                let Some(node_pid) = node.process_id else {
+                    continue;
+                };
+                let Some(node_root) =
+                    ProcessTree::of(node_pid).and_then(|tree| tree.application_root())
+                else {
+                    continue;
+                };
+                if node_root != sound_root {
+                    continue;
+                }
+                let Some(serial) = node.object_serial else {
+                    continue;
+                };
+                info!(
+                    "audio: the application's node {} (process {node_pid}, media {:?}) is application {} with serial {serial}",
+                    node.id,
+                    node.media_name,
+                    node_root.get()
+                );
+                return Ok(serial);
+            }
+        }
+        tokio::time::sleep(GRAPH_POLL_INTERVAL).await;
+    }
+}
+
 /// One application being captured.
 ///
 /// The capture child and the Opus encoder belong to the APPLICATION: every
@@ -68,10 +122,6 @@ const READ_CHUNK: usize = 8 * 1024;
 pub(crate) struct ApplicationCapture {
     /// The application's identity (its application root).
     pub(crate) app: ApplicationId,
-    /// The unique name of this application's capture stream. The capture
-    /// node carries no process id, so this is how it is found in the
-    /// graph.
-    node_name: String,
     /// The audio channels this application's sound is shipped on: one per
     /// X11 connection of the application, each tagged with its own X11
     /// connection.
@@ -86,17 +136,14 @@ pub(crate) struct ApplicationCapture {
 }
 
 impl ApplicationCapture {
-    pub(crate) fn new(app: ApplicationId, sequence: u64) -> Self {
-        let node_name = format!("rx11-audio-app-{}-{}", app.get(), sequence);
+    pub(crate) fn new(app: ApplicationId, _sequence: u64) -> Self {
         Self {
             app,
-            node_name,
             channels: Arc::new(Mutex::new(Vec::new())),
             task: None,
             stop: Arc::new(AtomicBool::new(false)),
         }
     }
-
     /// Add an X11 connection's channel to this application's sound.
     pub(crate) fn add_channel(
         &mut self,
@@ -158,13 +205,12 @@ impl ApplicationCapture {
             return;
         }
         let app = self.app;
-        let node_name = self.node_name.clone();
         let stop = Arc::clone(&self.stop);
         let channels = Arc::clone(&self.channels);
         let bitrate = runtime.audio_bitrate_kbps;
         let sound_pid = app.get();
         self.task = Some(tokio::spawn(async move {
-            let outcome = capture_loop(&node_name, bitrate, sound_pid, channels, &stop).await;
+            let outcome = capture_loop(bitrate, sound_pid, channels, &stop).await;
             match outcome {
                 Ok(packets) => {
                     info!(
@@ -186,83 +232,75 @@ impl ApplicationCapture {
     }
 }
 
-/// The capture body: start the child, link the application into it,
-/// encode, and fan out until the child ends or the application is stopped.
+/// The capture body: wait for the application to make a sound, start the
+/// capture child pointed at it, encode, and fan out until the child ends
+/// or the application is stopped.
 async fn capture_loop(
-    node_name: &str,
     bitrate_kbps: u32,
     sound_pid: i32,
     channels: Arc<Mutex<Vec<Channel>>>,
     stop: &AtomicBool,
 ) -> Result<u64, String> {
+    // The application root of the process that holds the X11 connection.
+    // The sound comes from a DESCENDANT of it (a browser's audio
+    // service), so the root is what identifies the application on both
+    // sides — PipeWire reports the playing process, the X11 connection
+    // reports the holding process, and both resolve to the same root.
+    let sound_root = ProcessTree::of(sound_pid)
+        .and_then(|tree| tree.application_root())
+        .ok_or_else(|| format!("process {sound_pid} has no application"))?;
+
+    // The application opens its PipeWire stream when it makes a sound, and
+    // closes it when it stops. Waiting for that node is what makes "the
+    // application starts playing" work; the wait ends when the
+    // application goes away, not when a deadline passes.
+    let serial = wait_for_application_serial(sound_root, stop).await?;
+
+    // The capture is pointed at the application's stream by its serial, so
+    // it starts already bound to it: no port pairing, no link step, and
+    // no window in which the two ends have to be matched up.
     let mut child = Command::new("pw-cat")
-        .args(capture_stream_command(node_name))
+        .args(capture_command_for_application(serial))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        // The child's stderr is kept, not discarded: it is the only place
+        // the reason for a failed capture shows up, and "the capture ended
+        // with no packets" is otherwise undiagnosable.
+        .stderr(Stdio::piped())
+        // The capture child inherits the server's working directory, and
+        // PipeWire's client writes a state file into it. Running the
+        // server from a source tree would litter that tree with `pw-cat`
+        // files. The child's directory is the system temporary directory,
+        // where such files belong.
+        .current_dir(std::env::temp_dir())
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| format!("capture child failed to start: {e}"))?;
 
-    let topology =
-        PipeWireTopology::read().map_err(|e| format!("reading the audio graph failed: {e}"))?;
-    let capture_node = topology
-        .node_named(node_name)
-        .map(|node| node.id)
-        .ok_or_else(|| format!("capture stream '{node_name}' never appeared in the graph"))?;
-
-    // The PipeWire node's process id is the process that PLAYS the sound
-    // (a browser's audio service), not the process that holds the X11
-    // connection (the browser's main process). They belong to the same
-    // application, so the APPLICATION ROOT is what compares them.
-    let sound_root = ProcessTree::of(sound_pid)
-        .and_then(|tree| tree.application_root())
-        .ok_or_else(|| format!("process {sound_pid} has no application"))?;
-    let mut pairs = Vec::new();
-    for node in topology.application_output_nodes() {
-        let Some(node_pid) = node.process_id else {
-            continue;
-        };
-        let node_root = match ProcessTree::of(node_pid).and_then(|tree| tree.application_root()) {
-            Some(root) => root,
-            None => continue,
-        };
-        if node_root != sound_root {
-            continue;
-        }
-        pairs.extend(topology.pair_channels(node.id, capture_node));
-    }
-    if pairs.is_empty() {
-        return Err(format!(
-            "application {sound_pid} has no output port to capture"
-        ));
-    }
-    for (output_port, input_port) in pairs {
-        let argv = link_command(output_port, input_port);
-        let Some((program, args)) = argv.split_first() else {
-            continue;
-        };
-        let status = Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .await
-            .map_err(|e| format!("linking port {output_port} failed to start: {e}"))?;
-        if !status.success() {
-            return Err(format!(
-                "linking application port {output_port} into the capture failed: {status}"
-            ));
-        }
-    }
-
-    let mut packetizer =
-        Packetizer::new(bitrate_kbps).map_err(|e| format!("opus encoder init failed: {e}"))?;
+    // The pipe is taken at once, BEFORE the waits below: the capture
+    // writes continuously, and a pipe nobody reads fills up and blocks
+    // the child — which would stop it from registering its node at all.
     let mut stdout = child
         .stdout
         .take()
         .ok_or_else(|| "capture child has no stdout".to_string())?;
+    // The child's stderr is read alongside the audio: a capture that ends
+    // without a byte says nothing on its own, and the reason is in the
+    // child's own diagnostics.
+    let mut child_stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "capture child has no stderr".to_string())?;
+
+    info!("audio: the capture of serial {serial} is reading");
+
+    // The link exists, but the audio needs a moment to travel into the
+    // capture stream. Reading straight away would report an empty
+    // capture for a link that is in fact good.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    let mut packetizer =
+        Packetizer::new(bitrate_kbps).map_err(|e| format!("opus encoder init failed: {e}"))?;
     let mut gate = FormatGate::default();
     let mut buf = vec![0u8; READ_CHUNK];
     let mut sent: u64 = 0;
@@ -275,7 +313,15 @@ async fn capture_loop(
             .await
             .map_err(|e| format!("capture read failed: {e}"))?;
         if n == 0 {
-            break;
+            // The child ended. Its stderr says why — without it, "the
+            // capture ended with no packets" has no cause.
+            let mut detail = String::new();
+            let _ = child_stderr.read_to_string(&mut detail).await;
+            let status = child.wait().await;
+            return Err(format!(
+                "the capture child ended after {sent} packets (status {status:?}): {}",
+                detail.trim()
+            ));
         }
         let pcm = gate.feed(&buf[..n]);
         packetizer.push(&pcm, |seq, packet| {

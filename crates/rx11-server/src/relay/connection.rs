@@ -688,14 +688,17 @@ async fn handle_x11_event(
                 && ctx.dataplane.features.supports(Capability::AudioForward)
                 && !ctx.audio.mix_only()
             {
-                if let Some(app) = ctx
+                let app = ctx
                     .session_mgr
                     .application_of_connection(connection_id)
-                    .await
-                {
-                    if let Some(lane) = ctx.audio.client_lane(*ctx.audio_client_id) {
-                        ctx.audio.attach_connection(app, connection_id, lane);
-                    }
+                    .await;
+                let lane = ctx.audio.client_lane(*ctx.audio_client_id);
+                if let (Some(app), Some(lane)) = (app, lane) {
+                    info!(
+                        "audio: X11 connection {connection_id} joins application {}",
+                        app.get()
+                    );
+                    ctx.audio.attach_connection(app, connection_id, lane);
                 }
             }
             send_outbound(
