@@ -10,3 +10,7 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 rand = { workspace = true }
 bytes = { workspace = true }
+# The X11 wire protocol, for the focus monitor: it asks the local X server
+# which window holds the input focus, and reads the setup reply's resource
+# range. The library does the framing; no X11 byte is parsed by hand here.
+x11rb-protocol = "0.14"

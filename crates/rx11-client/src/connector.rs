@@ -545,6 +545,14 @@ impl LocalConnector {
         let authorization = Arc::new(tokio::sync::Mutex::new(
             crate::audioout::Authorization::default(),
         ));
+        // The resident monitor connection: one connection to the local X
+        // server, asked about the focus every tick and kept between the
+        // questions. A connection per question would take a resource
+        // range from the server every time.
+        let mut monitor = crate::audioout::ResidentMonitor::new(
+            &self.local_x11_addr,
+            crate::audioout::Authorization::default(),
+        );
         // Pump → serve resume-edge reports: small and rare (hysteresis
         // bounded); drops are reconciled from the meters by the tick.
         let (flow_edge_tx, flow_edge_rx) =
@@ -597,6 +605,7 @@ impl LocalConnector {
                 audio: &mut audio_outlets,
                 ranges: &ranges,
                 authorization: &authorization,
+                monitor: &mut monitor,
                 focus_interval: Duration::from_millis(500),
                 flow: &mut flow,
             };

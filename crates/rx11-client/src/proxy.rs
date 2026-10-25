@@ -75,50 +75,6 @@ pub(crate) struct ProxyDeps<'a> {
 }
 
 /// The resource range a connection owns, read from the local X server's
-/// setup reply.
-///
-/// The reply's fixed part (after the 8-byte prefix) begins with the
-/// release number, the base of the client's resource id range and the
-/// mask that gives its size:
-///
-/// ```text
-///  8   prefix: success(1) unused(1) protocol-major(2) protocol-minor(2) length(2)
-///  8   release-number(4) resource-id-base(4) resource-id-mask(4)
-/// ```
-///
-/// Only the base and the mask are needed: together they give the range
-/// of ids this connection may create, and a window id inside that range
-/// belongs to this connection.
-fn setup_reply_range(data: &[u8]) -> Option<crate::audioout::ResourceRange> {
-    // The fixed part is 8 bytes of prefix plus 12 bytes of setup, and the
-    // server may send it in pieces — a range is only known once the
-    // fixed part has arrived whole.
-    const PREFIX: usize = 8;
-    const BASE_OFFSET: usize = PREFIX + 4;
-    const MASK_OFFSET: usize = PREFIX + 8;
-    const NEEDED: usize = MASK_OFFSET + 4;
-    if data.len() < NEEDED {
-        return None;
-    }
-    // The success byte: 0 means the setup was refused.
-    if data[0] != 1 {
-        return None;
-    }
-    let base = u32::from_le_bytes([
-        data[BASE_OFFSET],
-        data[BASE_OFFSET + 1],
-        data[BASE_OFFSET + 2],
-        data[BASE_OFFSET + 3],
-    ]);
-    let mask = u32::from_le_bytes([
-        data[MASK_OFFSET],
-        data[MASK_OFFSET + 1],
-        data[MASK_OFFSET + 2],
-        data[MASK_OFFSET + 3],
-    ]);
-    Some(crate::audioout::ResourceRange::new(base, mask))
-}
-
 /// Open the local X server socket for a relayed `ChannelOpen` and spawn the
 /// pump task. Connection errors are logged and reported to the relay; only
 /// socket option failures abort the session (matching previous behavior).
@@ -188,6 +144,9 @@ pub(crate) async fn spawn_local_connection(
             flow_edges,
             ranges: ranges.clone(),
             authorization: authorization.clone(),
+            setup_request: crate::audioout::SetupRequestWatcher::new(),
+            setup_reply: crate::audioout::SetupReplyWatcher::new(),
+            setup_order: Arc::new(tokio::sync::Mutex::new(None)),
         };
         pump_local_x11_connection(ctx).await;
 
@@ -237,6 +196,16 @@ struct ProxyContext<'a> {
     /// The shared index of resource ranges; the pump registers this
     /// connection's range when the local X server's setup reply arrives.
     ranges: Arc<tokio::sync::Mutex<crate::audioout::ResourceIndex>>,
+    /// Watches the head of the application→server stream for the setup
+    /// request, which names the authorization the local X server wants.
+    setup_request: crate::audioout::SetupRequestWatcher,
+    /// Watches the head of the server→application stream for the setup
+    /// reply, which carries the connection's resource range.
+    setup_reply: crate::audioout::SetupReplyWatcher,
+    /// The byte order the setup request announced. The setup reply is
+    /// read in that order, and the two arms of the pump meet here: the
+    /// request travels one way, the reply the other.
+    setup_order: Arc<tokio::sync::Mutex<Option<crate::audioout::ByteOrder>>>,
     /// The authorization the local X server expects; the pump records it
     /// from the application's setup request.
     authorization: Arc<tokio::sync::Mutex<crate::audioout::Authorization>>,
@@ -272,7 +241,14 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
         flow_edges,
         ranges,
         authorization,
+        mut setup_request,
+        mut setup_reply,
+        setup_order,
     } = ctx;
+    // The two arms of the pump meet at the byte order: the request
+    // travels one way, the reply the other, and the reply is read in
+    // the order the request announced.
+    let setup_order_uplink = Arc::clone(&setup_order);
     let dp_up = dataplane;
     let dp_down = dataplane;
 
@@ -310,8 +286,19 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
                     // window id is traced back to the application that
                     // created it. The bytes are forwarded unchanged; only
                     // a copy of the range is taken.
-                    if let Some(range) = setup_reply_range(&data) {
-                        ranges.lock().await.register(conn_id, range);
+                    //
+                    // The reply may arrive in pieces, so the watcher
+                    // accumulates until it is whole. The reply carries no
+                    // byte-order byte of its own: it is read in the order
+                    // the setup REQUEST announced, which is the order the
+                    // local server answered in.
+                    if let Some(order) = *setup_order_uplink.lock().await {
+                        if let Some((base, mask)) = setup_reply.observe(&data, order) {
+                            ranges
+                                .lock()
+                                .await
+                                .register(conn_id, crate::audioout::ResourceRange::new(base, mask));
+                        }
                     }
                     // The relay could not apply one of our previous diffs:
                     // forget the base so this payload ships whole and future
@@ -348,14 +335,6 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
     let downlink = async move {
         while let Some(data) = relay_rx.recv().await {
             let len = data.len();
-            // The application's SETUP REQUEST travels this way (relay →
-            // application). It names the authorization the local X server
-            // expects; the client keeps a copy so its own monitor
-            // connection can present the same one. The bytes themselves
-            // are forwarded unchanged.
-            if let Some(auth) = crate::audioout::Authorization::from_setup_request(&data) {
-                *authorization.lock().await = auth;
-            }
             // With `x11_recode` the downstream payloads are framed units
             // (raw spans / image containers); the local X server must
             // receive the ORIGINAL request bytes. An unexpandable
@@ -372,6 +351,25 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
             } else {
                 data
             };
+            // The application's SETUP REQUEST travels this way (relay →
+            // application). It names the authorization the local X server
+            // expects; the client keeps a copy so its own monitor
+            // connection can present the same one. The bytes themselves
+            // are forwarded unchanged.
+            //
+            // The request is read from the EXPANDED bytes: with
+            // `x11_recode` the relay's payload is a framed unit whose
+            // first byte is the unit's kind, not the setup request's
+            // byte-order byte. Reading the raw payload would never find
+            // a setup request at all, and the authorization — and with it
+            // the whole focus query — would silently never be available.
+            //
+            // The request may arrive in pieces, so the watcher
+            // accumulates until it is whole.
+            if let Some(auth) = setup_request.observe(&out) {
+                *authorization.lock().await = auth.clone();
+                *setup_order.lock().await = setup_request.order();
+            }
             if local_write.write_all(&out).await.is_err() || local_write.flush().await.is_err() {
                 break;
             }

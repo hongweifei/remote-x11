@@ -12,6 +12,12 @@
 //! client's byte stream already carries: the application's setup request
 //! names the authorization protocol and its data.
 //!
+//! The monitor connection RESIDES. It is opened once and asked again and
+//! again; a broken one is replaced. Opening a connection per question
+//! would be wrong twice over: every connection takes a resource range
+//! from the server (ranges are only recycled slowly), and a connection
+//! every poll interval is a storm against the local X server.
+//!
 //! The monitor's own resource range is deliberately NOT registered: it
 //! owns no application window, and a window id in its range must not be
 //! traced to an application.
@@ -22,162 +28,224 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// How long to wait for the focus answer before giving up. The answer is
-/// a single reply; a local server answers immediately.
+use x11rb_protocol::connect::Connect;
+use x11rb_protocol::connection::{Connection, ReplyFdKind};
+use x11rb_protocol::packet_reader::PacketReader;
+use x11rb_protocol::protocol::xproto::{GetInputFocusReply, GetInputFocusRequest};
+use x11rb_protocol::x11_utils::TryParse;
+use x11rb_protocol::SequenceNumber;
+
+use super::x11wire::Authorization;
+
+/// How long to wait for the server's answer before giving up. The answer
+/// is a single reply; a local server answers immediately.
 const FOCUS_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// The authorization a connection must present to the local X server.
+/// The monitor connection to the local X server.
 ///
-/// The bytes are taken verbatim from the application's setup request: the
-/// authorization protocol name and its data, exactly as the server will
-/// read them.
-#[derive(Debug, Clone, Default)]
-pub(crate) struct Authorization {
-    /// The authorization protocol name (e.g. `MIT-MAGIC-COOKIE-1`).
-    pub name: Vec<u8>,
-    /// The authorization data.
-    pub data: Vec<u8>,
+/// It holds the protocol state of one connection: the sequence-number
+/// bookkeeping and the framing of the server's replies. The connection
+/// itself lives in the task that owns it.
+pub(crate) struct Monitor {
+    /// The stream to the local X server.
+    stream: TcpStream,
+    /// The protocol state: which replies are still outstanding.
+    connection: Connection,
+    /// The framing of the server's stream: a reply is 32 bytes plus four
+    /// per length unit, and events may arrive in between.
+    reader: PacketReader,
 }
 
-impl Authorization {
-    /// Whether there is anything to present.
-    pub(crate) fn is_empty(&self) -> bool {
-        self.name.is_empty()
+impl Monitor {
+    /// Open a monitor connection to the local X server.
+    ///
+    /// The authorization is the one the application's setup request named:
+    /// the local server expects the same one from every client.
+    pub(crate) async fn connect(
+        address: &str,
+        authorization: &Authorization,
+    ) -> std::io::Result<Self> {
+        let mut stream = TcpStream::connect(address).await?;
+        stream.set_nodelay(true)?;
+
+        // The library builds the setup request and knows its length; the
+        // authorization is presented exactly as the application presents
+        // it.
+        let (connect, setup) =
+            Connect::with_authorization(authorization.name.clone(), authorization.data.clone());
+        stream.write_all(&setup).await?;
+        stream.flush().await?;
+
+        // The setup reply: the library reads it and hands back the
+        // connection's resource range, which the monitor does not need.
+        let reply = read_setup_reply(&mut stream, connect)
+            .await
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "the local X server did not answer the monitor's setup",
+                )
+            })?;
+        debug!(
+            "audio: monitor connection to the local X server established \
+             (resource base {:#x}, mask {:#x})",
+            reply.resource_id_base, reply.resource_id_mask
+        );
+
+        Ok(Self {
+            stream,
+            connection: Connection::new(),
+            reader: PacketReader::new(),
+        })
     }
 
-    /// Read the authorization out of an X11 setup request.
+    /// Ask which window has the input focus.
     ///
-    /// The setup request is:
-    ///
-    /// ```text
-    ///  1  byte-order ('B' or 'l')
-    ///  1  unused
-    ///  2  protocol-major
-    ///  2  protocol-minor
-    ///  2  authorization-protocol-name length
-    ///  2  authorization-protocol-data length
-    ///  1  unused
-    ///  *  padded name
-    ///  *  padded data
-    /// ```
-    pub(crate) fn from_setup_request(request: &[u8]) -> Option<Self> {
-        const HEADER: usize = 12;
-        if request.len() < HEADER {
+    /// `None` when the server did not answer, or answered with an error.
+    /// The connection stays usable either way: a lost reply is not a lost
+    /// connection.
+    pub(crate) async fn ask_focus(&mut self) -> Option<u32> {
+        // The library serializes the request and knows its length field
+        // (GetInputFocus takes no arguments, so the length is one unit).
+        let (bufs, _fds) = GetInputFocusRequest.serialize();
+        let buf: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+        self.stream.write_all(&buf).await.ok()?;
+        self.stream.flush().await.ok()?;
+
+        let sequence = self.connection.send_request(ReplyFdKind::ReplyWithoutFDs)?;
+
+        // The reply arrives among the server's events; the framing
+        // separates them.
+        let reply = tokio::time::timeout(FOCUS_TIMEOUT, self.read_reply(sequence))
+            .await
+            .ok()??;
+        Some(reply.focus)
+    }
+
+    /// Read packets from the server until the reply arrives.
+    async fn read_reply(&mut self, sequence: SequenceNumber) -> Option<GetInputFocusReply> {
+        loop {
+            let packet = self.read_packet().await?;
+            self.connection.enqueue_packet(packet);
+            match self.connection.poll_for_reply(sequence) {
+                x11rb_protocol::connection::PollReply::Reply(reply) => {
+                    let (reply, _) = GetInputFocusReply::try_parse(&reply).ok()?;
+                    return Some(reply);
+                }
+                x11rb_protocol::connection::PollReply::NoReply => return None,
+                x11rb_protocol::connection::PollReply::TryAgain => {}
+            }
+        }
+    }
+
+    /// Read one framed packet from the server.
+    async fn read_packet(&mut self) -> Option<Vec<u8>> {
+        loop {
+            if self.reader.buffer().is_empty() {
+                return None;
+            }
+            let read = tokio::time::timeout(FOCUS_TIMEOUT, self.stream.read(self.reader.buffer()))
+                .await
+                .ok()?
+                .ok()?;
+            if read == 0 {
+                return None; // the server closed the connection
+            }
+            if let Some(packet) = self.reader.advance(read) {
+                return Some(packet);
+            }
+        }
+    }
+}
+
+/// Read the setup reply and parse it with the protocol library.
+async fn read_setup_reply(
+    stream: &mut TcpStream,
+    mut connect: Connect,
+) -> Option<x11rb_protocol::protocol::xproto::Setup> {
+    loop {
+        let buffer = connect.buffer();
+        if buffer.is_empty() {
             return None;
         }
-        let big_endian = match request[0] {
-            b'B' => true,
-            b'l' => false,
-            _ => return None,
-        };
-        let name_len = u16_at(request, 6, big_endian) as usize;
-        let data_len = u16_at(request, 8, big_endian) as usize;
-        let padded_name = name_len.next_multiple_of(4);
-        let padded_data = data_len.next_multiple_of(4);
-        let end = HEADER + padded_name + padded_data;
-        if request.len() < end {
-            return None;
-        }
-        let name = request[HEADER..HEADER + name_len].to_vec();
-        let data_start = HEADER + padded_name;
-        let data = request[data_start..data_start + data_len].to_vec();
-        Some(Self { name, data })
-    }
-
-    /// The setup request for a connection that presents this
-    /// authorization.
-    pub(crate) fn setup_request(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(12 + self.name.len() + self.data.len());
-        out.push(b'l'); // little-endian
-        out.push(0); // unused
-        out.extend_from_slice(&11u16.to_le_bytes()); // protocol major
-        out.extend_from_slice(&0u16.to_le_bytes()); // protocol minor
-        out.extend_from_slice(&(self.name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(self.data.len() as u16).to_le_bytes());
-        out.extend_from_slice(&[0u8, 0]); // the trailing unused pair
-        out.extend_from_slice(&self.name);
-        let name_pad = self.name.len().next_multiple_of(4) - self.name.len();
-        out.extend(std::iter::repeat_n(0u8, name_pad));
-        out.extend_from_slice(&self.data);
-        let data_pad = self.data.len().next_multiple_of(4) - self.data.len();
-        out.extend(std::iter::repeat_n(0u8, data_pad));
-        out
-    }
-}
-
-/// Read a 16-bit field in the connection's byte order.
-fn u16_at(bytes: &[u8], at: usize, big_endian: bool) -> u16 {
-    let pair = [bytes[at], bytes[at + 1]];
-    if big_endian {
-        u16::from_be_bytes(pair)
-    } else {
-        u16::from_le_bytes(pair)
-    }
-}
-
-/// Ask the local X server which window has the input focus.
-///
-/// Returns the window id, or `None` when the server does not answer or
-/// answers with something that is not a reply.
-pub(crate) async fn ask_focus(address: &str, authorization: &Authorization) -> Option<u32> {
-    let mut stream = TcpStream::connect(address).await.ok()?;
-    stream.set_nodelay(true).ok()?;
-    stream
-        .write_all(&authorization.setup_request())
-        .await
-        .ok()?;
-    stream.flush().await.ok()?;
-
-    // The setup reply: 8 bytes of prefix, then the fixed part, then the
-    // variable part. The fixed part carries the resource range, which
-    // the monitor does not need — only the success byte matters.
-    let mut head = [0u8; 8];
-    tokio::time::timeout(FOCUS_TIMEOUT, stream.read_exact(&mut head))
-        .await
-        .ok()?
-        .ok()?;
-    if head[0] != 1 {
-        return None; // the setup was refused
-    }
-    let extra = u16::from_le_bytes([head[6], head[7]]) as usize * 4;
-    if extra > 0 {
-        let mut skip = vec![0u8; extra];
-        tokio::time::timeout(FOCUS_TIMEOUT, stream.read_exact(&mut skip))
+        let read = tokio::time::timeout(FOCUS_TIMEOUT, stream.read(buffer))
             .await
             .ok()?
             .ok()?;
+        if read == 0 {
+            return None;
+        }
+        connect.advance(read);
+        if connect.buffer().is_empty() {
+            break;
+        }
     }
-
-    // GetInputFocus: opcode 43, length 1 (in 4-byte units).
-    stream.write_all(&[43, 0, 1, 0]).await.ok()?;
-    stream.flush().await.ok()?;
-
-    // The reply: 32 bytes plus 4 per length unit. The focused window id
-    // sits at bytes 8..12.
-    let mut reply = [0u8; 32];
-    tokio::time::timeout(FOCUS_TIMEOUT, stream.read_exact(&mut reply))
-        .await
-        .ok()?
-        .ok()?;
-    if reply[0] != 1 {
-        return None; // an error packet
-    }
-    Some(u32::from_le_bytes([
-        reply[8], reply[9], reply[10], reply[11],
-    ]))
+    connect.into_setup().ok()
 }
 
-/// The focus of the local X server, or `None` when it cannot be read.
-pub(crate) async fn focus_window(address: &str, authorization: &Authorization) -> Option<u32> {
-    if authorization.is_empty() {
-        debug!("audio: no authorization for the local X server; focus unknown");
-        return None;
+/// The resident monitor: one connection to the local X server, asked
+/// again and again.
+///
+/// The connection is opened when it is first needed and kept. Opening one
+/// per question would be wrong twice over: every connection takes a
+/// resource range from the X server, and the ranges are recycled slowly,
+/// so a connection per poll would wear them out; and a connection per
+/// poll is a storm against the local X server.
+pub(crate) struct ResidentMonitor {
+    /// The address of the local X server.
+    address: String,
+    /// The authorization it expects.
+    authorization: Authorization,
+    /// The connection, while it is alive.
+    connection: Option<Monitor>,
+}
+
+impl ResidentMonitor {
+    /// A monitor for the local X server at this address.
+    pub(crate) fn new(address: &str, authorization: Authorization) -> Self {
+        Self {
+            address: address.to_string(),
+            authorization,
+            connection: None,
+        }
     }
-    match ask_focus(address, authorization).await {
-        Some(focus) => Some(focus),
-        None => {
-            debug!("audio: the local X server did not answer the focus query");
-            None
+
+    /// Replace the authorization, and drop the connection: the server may
+    /// want a different one now.
+    pub(crate) fn set_authorization(&mut self, authorization: Authorization) {
+        if authorization != self.authorization {
+            self.authorization = authorization;
+            self.connection = None;
+        }
+    }
+
+    /// Which window has the input focus.
+    ///
+    /// `None` when the server did not answer. The connection is replaced
+    /// when it breaks, so the next question opens a fresh one.
+    pub(crate) async fn focus_window(&mut self) -> Option<u32> {
+        if self.authorization.is_empty() {
+            debug!("audio: no authorization for the local X server; focus unknown");
+            return None;
+        }
+        if self.connection.is_none() {
+            match Monitor::connect(&self.address, &self.authorization).await {
+                Ok(connection) => self.connection = Some(connection),
+                Err(e) => {
+                    debug!("audio: cannot open the monitor connection: {e}");
+                    return None;
+                }
+            }
+        }
+        let connection = self.connection.as_mut()?;
+        match connection.ask_focus().await {
+            Some(focus) => Some(focus),
+            None => {
+                // The connection is broken or the server did not answer.
+                // Drop it: the next question opens a fresh one.
+                self.connection = None;
+                None
+            }
         }
     }
 }
@@ -186,69 +254,34 @@ pub(crate) async fn focus_window(address: &str, authorization: &Authorization) -
 mod tests {
     use super::*;
 
-    fn setup_request(name: &[u8], data: &[u8]) -> Vec<u8> {
-        let mut out = vec![b'l', 0];
-        out.extend_from_slice(&11u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&(name.len() as u16).to_le_bytes());
-        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
-        out.extend_from_slice(&[0u8, 0]); // the trailing unused pair
-        out.extend_from_slice(name);
-        // The padding brings the name to a multiple of four.
-        let name_padded = name.len().next_multiple_of(4);
-        out.resize(out.len() + (name_padded - name.len()), 0);
-        out.extend_from_slice(data);
-        let data_padded = data.len().next_multiple_of(4);
-        out.resize(out.len() + (data_padded - data.len()), 0);
-        out
-    }
-
-    /// The setup request of the real X clients: a name whose length is
-    /// not a multiple of four, so the padding is exercised.
-    const COOKIE_NAME: &[u8] = b"MIT-MAGIC-COOKIE-1";
-
     #[test]
-    fn the_authorization_is_read_out_of_the_setup_request() {
-        let request = setup_request(COOKIE_NAME, &[0xAB; 16]);
-        let auth = Authorization::from_setup_request(&request).expect("an authorization");
-        assert_eq!(auth.name, COOKIE_NAME);
-        assert_eq!(auth.data.len(), 16);
-        assert_eq!(auth.data[0], 0xAB);
+    fn the_setup_request_of_the_library_matches_the_authorization() {
+        // The library builds the request; the authorization it carries is
+        // the one that was handed in.
+        let auth = Authorization {
+            name: b"MIT-MAGIC-COOKIE-1".to_vec(),
+            data: vec![0xAB; 16],
+        };
+        let (_connect, request) = x11rb_protocol::connect::Connect::with_authorization(
+            auth.name.clone(),
+            auth.data.clone(),
+        );
+        let parsed = Authorization::from_setup_request(&request).expect("an authorization");
+        assert_eq!(parsed, auth, "the authorization survives the round trip");
     }
 
     #[test]
-    fn a_setup_request_without_authorization_yields_an_empty_one() {
-        let request = setup_request(b"", b"");
-        let auth = Authorization::from_setup_request(&request).expect("parsed");
-        assert!(auth.is_empty());
-    }
-
-    #[test]
-    fn a_truncated_setup_request_yields_none() {
-        assert!(Authorization::from_setup_request(&[b'l', 0, 11]).is_none());
-    }
-
-    #[test]
-    fn the_setup_request_round_trips_through_the_authorization() {
-        let original = setup_request(COOKIE_NAME, &[0x01; 16]);
-        let auth = Authorization::from_setup_request(&original).expect("an authorization");
-        let rebuilt = auth.setup_request();
-        assert_eq!(rebuilt, original, "the rebuilt request is byte-identical");
-    }
-
-    #[test]
-    fn a_big_endian_setup_request_is_read_too() {
-        let mut original = vec![b'B', 0];
-        original.extend_from_slice(&11u16.to_be_bytes());
-        original.extend_from_slice(&0u16.to_be_bytes());
-        original.extend_from_slice(&4u16.to_be_bytes());
-        original.extend_from_slice(&2u16.to_be_bytes());
-        original.extend_from_slice(&[0u8, 0]);
-        original.extend_from_slice(b"TEST");
-        original.extend_from_slice(&[0x09, 0x08]);
-        original.extend_from_slice(&[0u8, 0]); // the data is padded to four
-        let auth = Authorization::from_setup_request(&original).expect("an authorization");
-        assert_eq!(auth.name, b"TEST");
-        assert_eq!(auth.data, vec![0x09, 0x08]);
+    fn the_focus_request_is_four_bytes_with_a_length_of_one() {
+        // GetInputFocus takes no arguments, so its length field is one
+        // four-byte unit. A length of two is refused by the server.
+        let (bufs, _fds) = GetInputFocusRequest.serialize();
+        let buf: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+        assert_eq!(buf.len(), 4);
+        assert_eq!(buf[0], 43, "the opcode of GetInputFocus");
+        assert_eq!(
+            u16::from_le_bytes([buf[2], buf[3]]),
+            1,
+            "the length field counts one unit"
+        );
     }
 }

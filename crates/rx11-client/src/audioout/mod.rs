@@ -14,13 +14,15 @@
 mod focus;
 mod monitor;
 mod table;
+mod x11wire;
 
 pub(crate) use focus::{foreground_connection, ResourceIndex, ResourceRange};
-pub(crate) use monitor::{focus_window, Authorization};
+pub(crate) use monitor::ResidentMonitor;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 pub(crate) use table::OutletTable;
+pub(crate) use x11wire::{Authorization, ByteOrder, SetupReplyWatcher, SetupRequestWatcher};
 
 use bytes::Bytes;
 use tokio::io::AsyncWriteExt;
