@@ -7,6 +7,7 @@
 //! the priority lane, and the relay's uplink pauses flip the per-channel
 //! egress gates the proxy pumps await.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -23,7 +24,7 @@ use rx11_core::protocol::{
 use rx11_core::transport::Rx11TransportReadHalf;
 use rx11_core::types::{ConnectionId, DisplayNumber};
 
-use crate::audioout::{start_audio_outlet, AudioOutlet};
+use crate::audioout::{start_audio_outlet, OutletTable};
 use crate::proxy::{send_data_to_local, spawn_local_connection, ProxyDeps};
 
 /// Client side of the flow-control brain. The serve loop is its only owner;
@@ -60,9 +61,20 @@ pub(crate) struct ServeCtx<'a> {
     pub incremental_cache: &'a mut ConnectionDataCache,
     pub display: DisplayNumber,
     pub read_timeout: Duration,
-    /// The one open audio channel, if any (the server opens at most one
-    /// per connection). Data for its id bypasses the dataplane entirely.
-    pub audio: &'a mut Option<AudioOutlet>,
+    /// The open audio channels, and the rule that decides which of them
+    /// are audible. The relay opens one audio channel per X11 connection
+    /// of an application; each carries the tag of the X11 connection whose
+    /// application produces the sound. Data for an audio channel bypasses
+    /// the dataplane entirely.
+    pub audio: &'a mut OutletTable,
+    /// The resource ranges of the application connections, and the
+    /// authorization the local X server expects: together they let the
+    /// client ask the server which window has the focus, and hence which
+    /// application the user is looking at.
+    pub ranges: &'a Arc<tokio::sync::Mutex<crate::audioout::ResourceIndex>>,
+    pub authorization: &'a Arc<tokio::sync::Mutex<crate::audioout::Authorization>>,
+    /// How often the focus of the local X server is checked.
+    pub focus_interval: Duration,
     pub flow: &'a mut ServeFlow,
 }
 
@@ -73,8 +85,16 @@ impl ServeCtx<'_> {
 }
 
 pub(crate) async fn serve(ctx: &mut ServeCtx<'_>) -> anyhow::Result<()> {
+    let mut focus_ticker = tokio::time::interval(ctx.focus_interval);
+    focus_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // The first tick completes immediately: the foreground is worth
+    // knowing before the first audio packet arrives.
+    focus_ticker.tick().await;
     loop {
         tokio::select! {
+            _ = focus_ticker.tick() => {
+                update_focus(ctx).await;
+            }
             frame_result = tokio::time::timeout(
                 ctx.read_timeout,
                 ctx.read_half.recv_frame()
@@ -116,6 +136,36 @@ pub(crate) async fn serve(ctx: &mut ServeCtx<'_>) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Ask the local X server which window has the focus, and tell the audio
+/// table which application that is.
+///
+/// The focus is the server's global state, so it is asked on a monitor
+/// connection of the client's own — never on an application connection,
+/// whose request counter would be thrown off. When the question cannot be
+/// answered, the foreground is unknown and every application is audible:
+/// the desktop-mix behaviour, which is always better than silence.
+async fn update_focus(ctx: &mut ServeCtx<'_>) {
+    let address = ctx.proxy.local_x11_addr.to_string();
+    let authorization = ctx.authorization.lock().await.clone();
+    let focus = crate::audioout::focus_window(&address, &authorization).await;
+    let foreground = match focus {
+        Some(focus) => {
+            let ranges = ctx.ranges.lock().await;
+            crate::audioout::foreground_connection(focus, &ranges)
+        }
+        None => None,
+    };
+    if foreground != ctx.audio.foreground() {
+        info!(
+            "audio: foreground application is now {:?} ({} of {} channels audible)",
+            foreground.map(|c| c.get()),
+            ctx.audio.audible().len(),
+            ctx.audio.len(),
+        );
+        ctx.audio.set_foreground(foreground);
+    }
 }
 
 /// Put one flow edge on the wire via the real-time lane: pauses must not
@@ -184,9 +234,11 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
                 ctx.proxy.stats.inc_x11_connections();
                 spawn_local_connection(msg.connection_id, &ctx.proxy).await?;
             } else if msg.kind.is_audio() {
-                // Audio channel: gated by the negotiated capability, one
-                // outlet per connection. Starting the player is best-effort;
-                // audio failures never touch the X11 session.
+                // Audio channel: gated by the negotiated capability. The
+                // relay opens one channel per X11 connection of an
+                // application, each tagged with the connection whose
+                // application produces the sound. Starting the player is
+                // best-effort; audio failures never touch the X11 session.
                 if !ctx
                     .proxy
                     .dataplane
@@ -194,13 +246,18 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
                     .supports(Capability::AudioForward)
                 {
                     warn!("Relay opened audio without negotiated capability; ignoring");
-                } else if ctx.audio.is_some() {
-                    warn!("Duplicate audio channel ({}); ignoring", msg.connection_id);
                 } else {
                     match start_audio_outlet(msg.connection_id, ctx.proxy.runtime) {
                         Some(outlet) => {
-                            info!("audio: playing to local sink ({})", msg.connection_id);
-                            *ctx.audio = Some(outlet);
+                            info!(
+                                "audio: playing to local sink ({}) for application {:?}",
+                                msg.connection_id, msg.app
+                            );
+                            ctx.audio.insert(outlet, msg.app);
+                            // A new channel must obey the selection rule
+                            // from the start: only the foreground
+                            // application's sound is heard.
+                            ctx.audio.refresh_audibility();
                         }
                         None => {
                             warn!("audio: no local player available; channel ignored")
@@ -218,19 +275,21 @@ async fn dispatch_frame(ctx: &mut ServeCtx<'_>, frame: Frame) -> anyhow::Result<
         | Frame::CompressedStreamData(_)
         | Frame::IncrementalStreamData(_)
         | Frame::CompressedIncrementalStreamData(_)) => {
-            // Real-time bypass: frames on the open audio channel go
+            // Real-time bypass: frames on an open audio channel go
             // straight to the local player — the diff cache, compression
             // chain and X connection routing never see them.
             if let Frame::StreamData(msg) = &frame {
-                if ctx
-                    .audio
-                    .as_ref()
-                    .is_some_and(|a| a.conn_id == msg.connection_id)
-                {
-                    let alive = ctx.audio.as_ref().unwrap().deliver(msg.data.clone());
+                if ctx.audio.owns(msg.connection_id) {
+                    // EVERY audio channel is fed: the Opus decoder carries
+                    // state across packets, so a channel that skipped
+                    // packets would sound wrong once it became audible
+                    // again. Which PLAYER is fed is decided by the
+                    // selection rule — the foreground application's sound
+                    // only.
+                    let alive = ctx.audio.deliver(msg.connection_id, msg.data.clone());
                     if !alive {
                         warn!("audio: player gone; outlet removed");
-                        *ctx.audio = None;
+                        ctx.audio.remove(msg.connection_id);
                     }
                     return Ok(());
                 }
@@ -314,15 +373,11 @@ async fn on_other_frame(ctx: &mut ServeCtx<'_>, frame: Frame) {
             info!("Session destroyed for display {}", msg.display);
         }
         Frame::ChannelClose(msg) => {
-            if ctx
-                .audio
-                .as_ref()
-                .is_some_and(|a| a.conn_id == msg.connection_id)
-            {
+            if ctx.audio.owns(msg.connection_id) {
                 info!("audio channel ({}) closed by relay", msg.connection_id);
                 // Dropping the outlet closes its buffer: the player task
                 // sees EOF, flushes and reaps the child (kill_on_drop).
-                *ctx.audio = None;
+                ctx.audio.remove(msg.connection_id);
             } else {
                 debug!("Remote X11 client disconnected ({})", msg.connection_id);
                 let mut conns = ctx.proxy.x11_connections.lock().await;
@@ -455,7 +510,9 @@ mod tests {
         cache: ConnectionDataCache,
         dataplane: DataPlane,
         rt: RuntimeConfig,
-        audio: Option<crate::audioout::AudioOutlet>,
+        audio: crate::audioout::OutletTable,
+        ranges: Arc<tokio::sync::Mutex<crate::audioout::ResourceIndex>>,
+        authorization: Arc<tokio::sync::Mutex<crate::audioout::Authorization>>,
         flow: ServeFlow,
         // Kept alive so `flow.edges` never sees a close; tests may also
         // report edges through it like the pump does.
@@ -488,7 +545,15 @@ mod tests {
                     &RuntimeConfig::default(),
                 ),
                 rt: RuntimeConfig::default(),
-                audio: None,
+                audio: crate::audioout::OutletTable::new(
+                    features.supports(rx11_core::protocol::Capability::AudioPerApp),
+                ),
+                ranges: Arc::new(tokio::sync::Mutex::new(
+                    crate::audioout::ResourceIndex::default(),
+                )),
+                authorization: Arc::new(tokio::sync::Mutex::new(
+                    crate::audioout::Authorization::default(),
+                )),
                 flow: ServeFlow::new(&features, flow_edge_rx),
                 flow_edge_tx,
             }
@@ -511,11 +576,16 @@ mod tests {
                     local_x11_addr: "127.0.0.1:0",
                     runtime: &self.rt,
                     flow_edges: &self.flow_edge_tx,
+                    ranges: self.ranges.clone(),
+                    authorization: self.authorization.clone(),
                 },
                 incremental_cache: &mut self.cache,
                 display: DisplayNumber::new(0).unwrap(),
                 read_timeout: Duration::from_secs(1),
                 audio: &mut self.audio,
+                ranges: &self.ranges,
+                authorization: &self.authorization,
+                focus_interval: Duration::from_secs(3600),
                 flow: &mut self.flow,
             }
         }
@@ -848,6 +918,16 @@ mod tests {
         })
     }
 
+    /// The same, but tagged with the application the sound belongs to.
+    fn audio_open_for_app(conn: ConnectionId, app: ConnectionId) -> Frame {
+        Frame::ChannelOpen(rx11_core::protocol::ChannelOpenMessage {
+            connection_id: conn,
+            kind: rx11_core::protocol::ChannelKind::audio(),
+            display: None,
+            app: Some(app),
+        })
+    }
+
     #[tokio::test]
     async fn audio_channel_open_ignored_without_capability() {
         let mut h = Harness::new(None).await;
@@ -857,7 +937,7 @@ mod tests {
             dispatch_frame(&mut ctx, audio_open(conn(20)))
                 .await
                 .unwrap();
-            assert!(ctx.audio.is_none(), "ungated audio channel must not start");
+            assert!(ctx.audio.len() == 0, "ungated audio channel must not start");
         }
         h.assert_nothing_emitted().await;
     }
@@ -873,8 +953,27 @@ mod tests {
             dispatch_frame(&mut ctx, audio_open(conn(21)))
                 .await
                 .unwrap();
-            assert!(ctx.audio.is_some(), "gated audio channel starts player");
-            assert_eq!(ctx.audio.as_ref().unwrap().conn_id, conn(21));
+            assert_eq!(ctx.audio.len(), 1, "gated audio channel starts player");
+            assert!(ctx.audio.owns(conn(21)));
+        }
+    }
+
+    #[tokio::test]
+    async fn several_audio_channels_are_open_at_once() {
+        // The relay opens one audio channel per X11 connection of an
+        // application. The second one must NOT be refused as a duplicate.
+        let mut h = Harness::new(None).await;
+        h.dataplane.features = Features::from_list(&["audio_forward".to_string()]);
+        h.rt.audio_play_command = Some(vec!["cat".to_string()]);
+        {
+            let mut ctx = h.ctx();
+            dispatch_frame(&mut ctx, audio_open_for_app(conn(30), conn(5)))
+                .await
+                .unwrap();
+            dispatch_frame(&mut ctx, audio_open_for_app(conn(31), conn(6)))
+                .await
+                .unwrap();
+            assert_eq!(ctx.audio.len(), 2, "both channels are open");
         }
     }
 
@@ -882,7 +981,7 @@ mod tests {
     async fn audio_frames_bypass_the_dataplane_entirely() {
         let mut h = Harness::new(Some(CompressionAlgo::Zstd)).await;
         let (outlet, mut packets) = crate::audioout::AudioOutlet::for_test(conn(22));
-        h.audio = Some(outlet);
+        h.audio.insert(outlet, None);
         let mut local_rx = h.register_local(conn(22)).await;
         {
             let mut ctx = h.ctx();
@@ -919,7 +1018,7 @@ mod tests {
         let mut h = Harness::new(None).await;
         let (outlet, rx) = crate::audioout::AudioOutlet::for_test(conn(23));
         drop(rx); // player task gone
-        h.audio = Some(outlet);
+        h.audio.insert(outlet, None);
         {
             let mut ctx = h.ctx();
             dispatch_frame(
@@ -933,7 +1032,7 @@ mod tests {
             .await
             .unwrap();
             assert!(
-                ctx.audio.is_none(),
+                ctx.audio.len() == 0,
                 "closed outlet is removed after delivery"
             );
         }
@@ -944,7 +1043,7 @@ mod tests {
         let mut h = Harness::new(None).await;
         h.cache.update_cache(conn(24), 1, &[0u8; 64]);
         let (outlet, _rx) = crate::audioout::AudioOutlet::for_test(conn(24));
-        h.audio = Some(outlet);
+        h.audio.insert(outlet, None);
         {
             let mut ctx = h.ctx();
             dispatch_frame(
@@ -955,7 +1054,7 @@ mod tests {
             )
             .await
             .unwrap();
-            assert!(ctx.audio.is_none());
+            assert_eq!(ctx.audio.len(), 0);
         }
         // An x11 conn close still uses the registry path untouched.
         let _rx2 = h.register_local(conn(25)).await;

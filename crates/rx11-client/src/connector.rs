@@ -527,7 +527,24 @@ impl LocalConnector {
         let stats = self.stats.clone();
         let seq_counter = Arc::new(AtomicU32::new(1));
         let mut incremental_cache = ConnectionDataCache::from_runtime(&self.runtime);
-        let mut audio_outlet: Option<crate::audioout::AudioOutlet> = None;
+        // The open audio channels: one per X11 connection of an
+        // application, and the rule that decides which of them are heard.
+        let mut audio_outlets = crate::audioout::OutletTable::new(
+            dataplane
+                .features
+                .supports(rx11_core::protocol::Capability::AudioPerApp),
+        );
+        // The resource ranges of the application connections: the local X
+        // server gives each connection a disjoint range of ids, and a
+        // window id inside a range belongs to the connection that owns it.
+        let ranges = Arc::new(tokio::sync::Mutex::new(
+            crate::audioout::ResourceIndex::default(),
+        ));
+        // The authorization the local X server expects, learned from the
+        // application's setup request.
+        let authorization = Arc::new(tokio::sync::Mutex::new(
+            crate::audioout::Authorization::default(),
+        ));
         // Pump → serve resume-edge reports: small and rare (hysteresis
         // bounded); drops are reconciled from the meters by the tick.
         let (flow_edge_tx, flow_edge_rx) =
@@ -571,11 +588,16 @@ impl LocalConnector {
                     local_x11_addr: &self.local_x11_addr,
                     runtime: &self.runtime,
                     flow_edges: &flow_edge_tx,
+                    ranges: ranges.clone(),
+                    authorization: authorization.clone(),
                 },
                 incremental_cache: &mut incremental_cache,
                 display: actual_display,
                 read_timeout: self.runtime.client_read_timeout,
-                audio: &mut audio_outlet,
+                audio: &mut audio_outlets,
+                ranges: &ranges,
+                authorization: &authorization,
+                focus_interval: Duration::from_millis(500),
                 flow: &mut flow,
             };
             tokio::select! {

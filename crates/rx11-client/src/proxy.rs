@@ -62,6 +62,61 @@ pub(crate) struct ProxyDeps<'a> {
     /// the advertiser between loop iterations, so it reports and the serve
     /// loop decides).
     pub flow_edges: &'a mpsc::Sender<FlowEdge>,
+    /// The resource ranges of the application connections: the local X
+    /// server hands each connection a disjoint range of resource ids, and
+    /// a window id inside a range belongs to the connection that owns it.
+    /// The focus of the local X server is what tells the client which
+    /// application the user is looking at.
+    pub ranges: Arc<tokio::sync::Mutex<crate::audioout::ResourceIndex>>,
+    /// The authorization the local X server expects, taken from the
+    /// application's setup request. The client's own monitor connection
+    /// presents the same one to ask the server about the focus.
+    pub authorization: Arc<tokio::sync::Mutex<crate::audioout::Authorization>>,
+}
+
+/// The resource range a connection owns, read from the local X server's
+/// setup reply.
+///
+/// The reply's fixed part (after the 8-byte prefix) begins with the
+/// release number, the base of the client's resource id range and the
+/// mask that gives its size:
+///
+/// ```text
+///  8   prefix: success(1) unused(1) protocol-major(2) protocol-minor(2) length(2)
+///  8   release-number(4) resource-id-base(4) resource-id-mask(4)
+/// ```
+///
+/// Only the base and the mask are needed: together they give the range
+/// of ids this connection may create, and a window id inside that range
+/// belongs to this connection.
+fn setup_reply_range(data: &[u8]) -> Option<crate::audioout::ResourceRange> {
+    // The fixed part is 8 bytes of prefix plus 12 bytes of setup, and the
+    // server may send it in pieces — a range is only known once the
+    // fixed part has arrived whole.
+    const PREFIX: usize = 8;
+    const BASE_OFFSET: usize = PREFIX + 4;
+    const MASK_OFFSET: usize = PREFIX + 8;
+    const NEEDED: usize = MASK_OFFSET + 4;
+    if data.len() < NEEDED {
+        return None;
+    }
+    // The success byte: 0 means the setup was refused.
+    if data[0] != 1 {
+        return None;
+    }
+    let base = u32::from_le_bytes([
+        data[BASE_OFFSET],
+        data[BASE_OFFSET + 1],
+        data[BASE_OFFSET + 2],
+        data[BASE_OFFSET + 3],
+    ]);
+    let mask = u32::from_le_bytes([
+        data[MASK_OFFSET],
+        data[MASK_OFFSET + 1],
+        data[MASK_OFFSET + 2],
+        data[MASK_OFFSET + 3],
+    ]);
+    Some(crate::audioout::ResourceRange::new(base, mask))
 }
 
 /// Open the local X server socket for a relayed `ChannelOpen` and spawn the
@@ -105,6 +160,8 @@ pub(crate) async fn spawn_local_connection(
     let seq = Arc::clone(deps.seq);
     let dataplane = deps.dataplane.clone(); // Owned by the spawned task.
     let flow_edges = deps.flow_edges.clone();
+    let ranges = deps.ranges.clone();
+    let authorization = deps.authorization.clone();
     let pump_meter = Arc::clone(&meter);
     let pump_gate = Arc::clone(&gate);
     let pump_reset = Arc::clone(&uplink_reset);
@@ -129,6 +186,8 @@ pub(crate) async fn spawn_local_connection(
             uplink_reset: pump_reset,
             uplink_runtime,
             flow_edges,
+            ranges: ranges.clone(),
+            authorization: authorization.clone(),
         };
         pump_local_x11_connection(ctx).await;
 
@@ -138,6 +197,9 @@ pub(crate) async fn spawn_local_connection(
             }))
             .await;
         conns.lock().await.remove(&conn_id.get());
+        // The connection's resource range dies with it: a window id in it
+        // must no longer be traced to a connection that is gone.
+        ranges.lock().await.forget(conn_id);
         stats.dec_x11_connections();
     });
 
@@ -172,6 +234,12 @@ struct ProxyContext<'a> {
     /// its per-connection base cache from it.
     uplink_runtime: Option<rx11_core::config::RuntimeConfig>,
     flow_edges: mpsc::Sender<FlowEdge>,
+    /// The shared index of resource ranges; the pump registers this
+    /// connection's range when the local X server's setup reply arrives.
+    ranges: Arc<tokio::sync::Mutex<crate::audioout::ResourceIndex>>,
+    /// The authorization the local X server expects; the pump records it
+    /// from the application's setup request.
+    authorization: Arc<tokio::sync::Mutex<crate::audioout::Authorization>>,
 }
 
 /// Relay both directions until either side closes; buffers grow
@@ -202,6 +270,8 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
         uplink_reset,
         uplink_runtime,
         flow_edges,
+        ranges,
+        authorization,
     } = ctx;
     let dp_up = dataplane;
     let dp_down = dataplane;
@@ -234,6 +304,15 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
                 Ok(0) => break,
                 Ok(_) => {
                     let data = buf.split().freeze();
+                    // The local X server's SETUP REPLY travels this way
+                    // (local server → application). It carries the
+                    // resource range this connection owns, which is how a
+                    // window id is traced back to the application that
+                    // created it. The bytes are forwarded unchanged; only
+                    // a copy of the range is taken.
+                    if let Some(range) = setup_reply_range(&data) {
+                        ranges.lock().await.register(conn_id, range);
+                    }
                     // The relay could not apply one of our previous diffs:
                     // forget the base so this payload ships whole and future
                     // diffs re-apply against it. The swap consumes the flag,
@@ -269,6 +348,14 @@ async fn pump_local_x11_connection(ctx: ProxyContext<'_>) {
     let downlink = async move {
         while let Some(data) = relay_rx.recv().await {
             let len = data.len();
+            // The application's SETUP REQUEST travels this way (relay →
+            // application). It names the authorization the local X server
+            // expects; the client keeps a copy so its own monitor
+            // connection can present the same one. The bytes themselves
+            // are forwarded unchanged.
+            if let Some(auth) = crate::audioout::Authorization::from_setup_request(&data) {
+                *authorization.lock().await = auth;
+            }
             // With `x11_recode` the downstream payloads are framed units
             // (raw spans / image containers); the local X server must
             // receive the ORIGINAL request bytes. An unexpandable
