@@ -730,6 +730,7 @@ dependencies = [
  "rx11-core",
  "tokio",
  "tracing",
+ "x11rb-protocol",
 ]
 
 [[package]]
@@ -1249,6 +1250,12 @@ checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "x11rb-protocol"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
 
 [[package]]
 name = "zlib-rs"
