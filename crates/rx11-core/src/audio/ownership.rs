@@ -72,6 +72,12 @@ impl ApplicationId {
     }
 }
 
+impl std::fmt::Display for ApplicationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "app#{}", self.0)
+    }
+}
+
 /// The ancestry of one process: itself plus every ancestor up to init.
 ///
 /// The tree is the raw material for the application root; it is also the
