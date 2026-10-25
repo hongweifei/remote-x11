@@ -602,6 +602,13 @@ mod tests {
         }
     }
 
+    /// This process's pid, used as the peer process of a registered X11
+    /// connection: a real, readable process, so the application registry
+    /// resolves a real application.
+    fn own_pid() -> i32 {
+        std::process::id() as i32
+    }
+
     async fn seeded_manager(disp: u16, client: &str) -> (SessionManager, Session) {
         let mgr = test_manager();
         mgr.set_x11_listener(Arc::new(MockBinder)).await;
@@ -701,7 +708,7 @@ mod tests {
         let conn_id = ConnectionId::new(42);
         let disp = DisplayNumber::new(1).unwrap();
 
-        mgr.register_x11_connection(conn_id, disp, tx, test_flow())
+        mgr.register_x11_connection(conn_id, disp, tx, test_flow(), Some(own_pid()))
             .await
             .unwrap();
 
@@ -725,9 +732,15 @@ mod tests {
 
         for i in 0..ServerDefaults::MAX_X11_CONNECTIONS_PER_DISPLAY {
             let (tx, _rx) = tokio::sync::mpsc::channel(16);
-            mgr.register_x11_connection(ConnectionId::new(i as u32 + 1), disp, tx, test_flow())
-                .await
-                .unwrap();
+            mgr.register_x11_connection(
+                ConnectionId::new(i as u32 + 1),
+                disp,
+                tx,
+                test_flow(),
+                Some(own_pid()),
+            )
+            .await
+            .unwrap();
         }
 
         let (tx, _rx) = tokio::sync::mpsc::channel(16);
@@ -737,6 +750,7 @@ mod tests {
                 disp,
                 tx,
                 test_flow(),
+                Some(own_pid()),
             )
             .await;
         assert!(result.is_err());
@@ -868,7 +882,7 @@ mod tests {
         };
         let meter = Arc::clone(&flow.upmeter);
         let conn = ConnectionId::new(77);
-        mgr.register_x11_connection(conn, disp, tx, flow)
+        mgr.register_x11_connection(conn, disp, tx, flow, Some(own_pid()))
             .await
             .unwrap();
 
@@ -910,7 +924,7 @@ mod tests {
         let gate = Arc::clone(&flow.egress);
         let meter = Arc::clone(&flow.upmeter);
         let conn = ConnectionId::new(78);
-        mgr.register_x11_connection(conn, disp, tx, flow)
+        mgr.register_x11_connection(conn, disp, tx, flow, Some(own_pid()))
             .await
             .unwrap();
 
@@ -957,6 +971,7 @@ mod tests {
                 DisplayNumber::new(23).unwrap(),
                 tx,
                 test_flow(),
+                Some(own_pid()),
             )
             .await
             .unwrap();
@@ -967,6 +982,7 @@ mod tests {
             DisplayNumber::new(24).unwrap(),
             tx,
             test_flow(),
+            Some(own_pid()),
         )
         .await
         .unwrap();
