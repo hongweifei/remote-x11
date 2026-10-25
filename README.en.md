@@ -8,15 +8,19 @@ Supports **TCP direct** and **SSH tunnel** modes.
 
 ## How It Works
 
-```
- Remote Server (public)                         Local Machine (NAT)
- ┌────────────────────────┐                  ┌────────────────────────┐
- │  GUI App (X11 Client)  │                  │  X Server              │
- │         ↓              │                  │  (VcXsrv / Xorg)       │
- │  rx11 server           │  ◄── rx11 proto ─►│  rx11 client           │
- │  ├─ Relay  :7000       │     (TCP / SSH)  │  └─ connects to :6000  │
- │  └─ X11 Proxy :6000+N  │                  │                        │
- └────────────────────────┘                  └────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph remote["Remote server (public network)"]
+        app["GUI application<br/>(X11 client)"]
+        server["rx11 server<br/>relay :7000<br/>X11 proxy :6000+N"]
+        app --> server
+    end
+    subgraph local["Local machine (private network)"]
+        client["rx11 client"]
+        xserver["X Server<br/>(VcXsrv / Xorg) :6000"]
+        client --> xserver
+    end
+    server <-->|"rx11 protocol<br/>TCP direct / SSH tunnel"| client
 ```
 
 **Core flow:**
@@ -38,7 +42,7 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **WAN queue discipline** — the outbound queue towards the relay is capped by **in-flight bytes** (default 1 MB), not frame count, so a 3 Mbit/s link never accumulates minutes of bufferbloat; an optional `SO_SNDBUF` cap tames the kernel buffer too
 - **Image re-encoding (on by default)** — the `x11_recode` capability recognizes large core `PutImage` requests (ZPixmap, depth 24/32) and ships them as JPEG (lossy, 10–50× smaller) or lossless PNG on the wire; the client re-expands them into the original request bytes before the local X server sees anything. Non-image traffic passes byte-for-byte. On by default with the **lossless** PNG tier; either end setting `image_recode = false` forces byte-for-byte passthrough, and the lossy JPEG tier only exists as an explicit `image_recode_codec = "jpeg"` choice. Honest edge: GL-rendered video and Xv extension paths are out of recognition scope — that's framebuffer territory (Xpra/x2go), not a transparent forwarder's
 - **Desktop audio forwarding (on by default)** — the `audio` channel: the server captures its default output sink's monitor, encodes with Opus (**pure-Rust** port, 48 kHz stereo, no system library build requirements) and streams it on the **real-time priority lane**; the client decodes and feeds `paplay`. The capture is **shared process-wide** — one recorder and one encoder fanned out to every client: N clients never spawn N `parec`s, late joiners pick up at the next packet, and the recorder stops itself when the last listener leaves. 64 kbit/s ≈ 2% of a 3 Mbit/s link; the lane bypasses the outbound byte budget, so audio latency under an image flood is bounded by one write chunk. On by default; `audio_forward = false` on either end disables it, and endpoints without a capture/playback stack (parec/paplay) degrade to silence without touching the session. Honest edge: playback only — no microphone back-channel, no lip sync
-- **Per-application audio forwarding (on by default)** — the `audio_per_app` capability: the server attributes each sound stream to the application producing it (by process ownership) and gives every application its own `audio` channel, tagged with that application's X11 connection; the client then plays **only the sound of the application it currently renders** instead of dumping the whole remote desktop's audio at once. `audio_per_app = false` on either end falls back to the whole-desktop mix, and so does a host that cannot capture per application — the sound still arrives, mixed rather than split
+- **Per-application audio forwarding (on by default)** — the `audio_per_app` capability: the server attributes each sound stream to the application producing it (by process ownership) and opens one `audio` channel per X11 connection of that application, tagged with the X11 connection the sound comes from (an application holding several connections ships the same sound on each of them, encoded once); the client then plays **only the sound of the application it currently renders** instead of dumping the whole remote desktop's audio at once. `audio_per_app = false` on either end falls back to the whole-desktop mix, and so does a host that cannot capture per application — the sound still arrives, mixed rather than split
 - **Per-channel flow control (on by default)** — the `flow_control` capability: when a receiver's accepted-but-unconsumed backlog crosses the watermark (default 2 MB), it advertises `Pause` for that channel (`connection_id` granularity, each leg gauged separately); the sender's bulk pump stops reading its source socket, so the stall retreats into kernel buffers and the producing application's own `write()` — lossless by construction, not one byte discarded. Draining below the low watermark (default 256 KB) advertises `Resume`. Flow-control frames ride the **real-time priority lane** and are re-advertised periodically: the signal never queues behind a redraw burst, and a lane drop self-heals by the next re-advertisement; control frames and the audio lane are never gated. A channel congested in both directions at once gates only the uplink — the downlink advertisement yields, because gating both legs freezes an X11 conversation while deferring fresh requests never does. Either end setting `flow_control = false` returns the chain to plain transport-level backpressure (the byte-budgeted queue)
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed), in BOTH directions: the picture downstream and the request stream upstream (the client→relay leg is gated separately by `incremental_uplink`); **a payload that did not change at all becomes a zero-chunk reference frame — 29 bytes on the wire (11-byte frame header + 18-byte diff header), none of the content travels twice** (the frame itself still goes out: the X11 byte stream is positional, so the sequence number must advance); a receiver auto-requests full frames when its diff cache goes stale
 - **Capability negotiation** — incremental/uplink-incremental/resync/flow-control/recode/audio/per-application-audio features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
@@ -155,7 +159,22 @@ The window is four regions: a navigation rail (overview / server / client / SSH 
 
 Two switches exist for demos and for taking screenshots: `RX11_GUI_DEMO=1` opens the console on fixed sample data (no config reads or writes, no network), and `RX11_GUI_PAGE=logs` opens a specific page.
 
-The code is organised as six layers with one-way dependencies: `settings`/`launcher` (domain) → `model` (the cross-layer contract) → `theme`/`state`/`ui` (presentation) → `backend`/`demo` (port implementations) → `app` (composition root), with a one-line `main.rs`. UI and data layer speak only flat `key → string` values, so a page never learns the config schema and a new runtime knob costs one field declaration. The direction of those dependencies is asserted by `crates/rx11-gui/tests/architecture.rs` rather than agreed verbally. Structure, design rationale and verification notes: [`crates/rx11-gui/DESIGN.md`](crates/rx11-gui/DESIGN.md).
+The code is organised as six layers with one-way dependencies, with a one-line `main.rs`:
+
+```mermaid
+flowchart TD
+    settings["settings / launcher<br/>domain: config model<br/>sessions and log ring"]
+    model["model<br/>cross-layer contract<br/>the Backend port and data types"]
+    present["theme / state / ui<br/>presentation: visuals<br/>view state and pages"]
+    ports["backend / demo<br/>two port implementations<br/>real and sample data"]
+    app["app<br/>composition root<br/>window, routing, polling, actions"]
+    settings --> model
+    model --> present
+    present --> ports
+    ports --> app
+```
+
+UI and data layer speak only flat `key → string` values, so a page never learns the config schema and a new runtime knob costs one field declaration. The direction of those dependencies is asserted by `crates/rx11-gui/tests/architecture.rs` rather than agreed verbally. Structure, design rationale and verification notes: [`crates/rx11-gui/DESIGN.md`](crates/rx11-gui/DESIGN.md).
 
 ## Command Reference
 
@@ -372,15 +391,15 @@ After the 60-second grace period expires, the server automatically destroys the 
 
 ## Protocol Format
 
-rx11 uses a custom binary frame protocol. Each frame:
+rx11 uses a custom binary frame protocol. Every frame has an 11-byte header:
 
-```
-┌──────────┬─────────┬───────────┬────────────┬─────────────┐
-│ Magic    │ Version │ Type      │ Length     │ Payload     │
-│ 4 bytes  │ 1 byte  │ 2 bytes   │ 4 bytes    │ N bytes     │
-│ RX11     │ (u8=1)  │ (BE u16)  │ (BE u32)   │             │
-└──────────┴─────────┴───────────┴────────────┴─────────────┘
-```
+| Field | Size | Value | Purpose |
+|---|---|---|---|
+| Magic | 4 bytes | `RX11` | Magic marker, byte-order anchor |
+| Version | 1 byte | `u8 = 1` | Protocol version, checked per frame |
+| Type | 2 bytes | BE `u16` | Frame type tag, see the table below |
+| Length | 4 bytes | BE `u32` | Payload byte count, excluding the header |
+| Payload | N bytes | — | Payload: JSON for control frames, binary for data-plane frames |
 
 Frame types:
 
@@ -409,58 +428,78 @@ Frame types:
 
 The current protocol version is **1**, enforced twice: a frame-header version octet and `Hello.version`; any mismatch fails the handshake immediately.
 
-**Tag band convention**: `0x01-0x0F` handshake, `0x10-0x1F` JSON control (session/channel/resync), `0x20-0x2F` binary data-plane (0x24+ reserved for diff variants), `0x30-0x3F` keepalive, `0x40-0x4F` flow control, `0xF0-0xFF` errors. The Type field is **u16** (65536 slots): every tag allocated today sits in the low byte (pinned by test); `0x0100+` is held in reserve for future major partitions.
+**Tag band convention**: the Type field is **u16** (65536 slots) and every tag must fall into exactly one band:
+
+| Band | Range | Payload | Members |
+|---|---|---|---|
+| Handshake | `0x01-0x0F` | JSON | Hello, HelloAck, AuthRequest, AuthResponse |
+| Session and channel control | `0x10-0x1F` | JSON | SessionCreate, SessionAck, SessionDestroy, SessionResume, SessionAutoCreate, ChannelOpen, ChannelClose, StreamResyncRequest |
+| Data plane | `0x20-0x2F` | binary | StreamData, CompressedStreamData, IncrementalStreamData, CompressedIncrementalStreamData (`0x24`+ reserved for diff variants) |
+| Keepalive | `0x30-0x3F` | empty | Heartbeat, HeartbeatAck |
+| Flow control | `0x40-0x4F` | JSON | FlowControl |
+| Error | `0xF0-0xFF` | JSON | Error |
+
+Every tag allocated today sits in the low byte (pinned by test); `0x0100+` is held in reserve for future major partitions.
 
 Bands are not a gentlemen's agreement — a `TagBand` registry plus a per-band roster test enforce them: **minting a frame requires registering its band and updating that band's expected roster, or CI goes red**, and squatting a tag in no-man's-land (0x05, 0x2C, …) fails the same way.
 
-**Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
-feature names (`incremental`, `incremental_uplink`, `request_resync`, `flow_control`,
-`audio_per_app`, …) and the server
-replies with the intersection. Features outside the intersection are never used by
-either side (`incremental` gates the picture downlink, `incremental_uplink` opens
-diffing of the client's request stream; a receiver refuses diff shapes its direction
-never negotiated); unrecognized names are ignored — shipping a new frame type later only
-requires minting a new capability name, not a protocol bump.
+**Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise feature names and the server replies with the intersection:
 
-Control frame payloads use JSON encoding. Binary `StreamData` frames look like:
+| Capability name | What it enables | Default | How to turn it off |
+|---|---|---|---|
+| `request_resync` | A receiver may ask the peer to fall back to full frames (self-heal) | on | — |
+| `incremental` | A sender may emit incremental diff frames | on | — |
+| `incremental_uplink` | The client's uplink request stream is diffed too | on | `[runtime] incremental_uplink = false` |
+| `flow_control` | Per-channel bulk pause/resume | on | `[runtime] flow_control = false` |
+| `x11` | The `x11` channel kind may be opened | on | — |
+| `x11_recode` | The x11 channel may re-encode large PutImage payloads | on | `[runtime] image_recode = false` |
+| `audio_forward` | The `audio` channel kind may be opened | on | `[runtime] audio_forward = false` |
+| `audio_per_app` | Audio is split per application instead of mixed as a whole desktop | on | `[runtime] audio_per_app = false` |
 
-```
-┌───────────────┬─────────────┬─────────────────┐
-│ Connection ID │ Sequence ID │ X11 Data        │
-│ 4 bytes       │ 4 bytes     │ remaining bytes │
-│ (BE u32)      │ (BE u32)    │                 │
-└───────────────┴─────────────┴─────────────────┘
-```
+Features outside the intersection are never used by either side (`incremental` gates the picture downlink, `incremental_uplink` opens diffing of the client's request stream; a receiver refuses diff shapes its direction never negotiated); unrecognized names are ignored — shipping a new frame type later only requires minting a new capability name, not a protocol bump.
 
-`CompressedStreamData` frames add an original-length field used to validate decompression:
+Control frame payloads use JSON encoding; data-plane frames use binary encoding. The `StreamData` payload layout:
 
-```
-┌───────────────┬─────────────┬──────────────┬─────────────────┐
-│ Connection ID │ Sequence ID │ Original Len │ Compressed Data │
-│ 4 bytes       │ 4 bytes     │ 4 bytes      │ remaining bytes │
-│ (BE u32)      │ (BE u32)    │ (BE u32)     │                 │
-└───────────────┴─────────────┴──────────────┴─────────────────┘
-```
+| Field | Size | Purpose |
+|---|---|---|
+| Connection ID | 4 bytes (BE `u32`) | Channel id, the multiplexing discriminator |
+| Sequence ID | 4 bytes (BE `u32`) | Per-channel sequence number, the alignment base for diffs and resync |
+| Data | remaining bytes | Channel payload |
+
+`CompressedStreamData` adds an original-length field used to validate decompression:
+
+| Field | Size | Purpose |
+|---|---|---|
+| Connection ID | 4 bytes (BE `u32`) | Channel id |
+| Sequence ID | 4 bytes (BE `u32`) | Per-channel sequence number |
+| Original Len | 4 bytes (BE `u32`) | Byte count after decompression, used as a size bound |
+| Compressed Data | remaining bytes | Compressed payload |
 
 `IncrementalStreamData` frames start with `[conn][seq][base_seq][total_len][chunk_count: u16]` followed by `[offset][length][chunk]` per chunk; the receiver matches `base_seq` against its cache and sends `StreamResyncRequest` to resynchronize when it falls out of step — in either direction. Stacked compression wraps the whole encoded diff in `CompressedIncrementalStreamData`, decompressed before parsing.
 
-`X11Connect` / `X11Disconnect` frames carry `{display, connection_id}` to notify the peer of X11 application connect/disconnect events. Multiple connections are multiplexed via `connection_id`.
+`ChannelOpen` / `ChannelClose` carry `{connection_id, kind}` to open and close multiplexed channels; `ChannelOpen` may additionally carry an optional `display` (the display number of an x11 channel) and an optional `app` (the X11 connection an audio channel's sound comes from). An audio channel's own `connection_id` names that channel while `app` names the X11 connection producing the sound — the two are not the same thing: one application may hold several X11 connections, each with its own audio channel. Multiple connections are multiplexed via `connection_id`.
 
 Connection establishment flow:
 
-```
-Client                          Server
-  │─── Hello ──────────────────►│  (may carry resume_session_id)
-  │◄── HelloAck ────────────────│
-  │─── AuthRequest ────────────►│
-  │◄── AuthResponse ────────────│
-  │─── SessionCreate ──────────►│  (or SessionResume / SessionAutoCreate)
-  │◄── SessionAck ──────────────│  (includes session_id)
-  │◄──► ChannelOpen/Close ────│  (channel open/close, kind=x11)
-  │◄──► StreamData (bidirectional)►│  (X11 data relay, includes connection_id)
-  │◄──► StreamResyncRequest ────►│  (self-heal: request full frames, either direction)
-  │◄──► Heartbeat / HeartbeatAck│  (server-driven keepalive)
-  │─── SessionDestroy ──────────►│  (optional, explicit destroy)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant S as Server
+    C->>S: Hello (may carry resume_session_id)
+    S-->>C: HelloAck (version, capability intersection, session id)
+    C->>S: AuthRequest
+    S-->>C: AuthResponse
+    C->>S: SessionCreate (or SessionResume / SessionAutoCreate)
+    S-->>C: SessionAck (session_id and the assigned display)
+    Note over C,S: the data plane starts here
+    C->>S: ChannelOpen / ChannelClose
+    S->>C: ChannelOpen / ChannelClose
+    C->>S: StreamData (bidirectional, carries connection_id)
+    S->>C: StreamData (bidirectional, carries connection_id)
+    C->>S: StreamResyncRequest (uplink diff out of step)
+    S->>C: StreamResyncRequest (downlink diff out of step)
+    S->>C: Heartbeat / HeartbeatAck (server-driven keepalive)
+    C->>S: SessionDestroy (optional, explicit destroy)
 ```
 
 ---
@@ -473,46 +512,78 @@ remote-x11/
 ├── LICENSE                       # MIT license
 ├── .github/workflows/ci.yml      # CI: fmt / clippy / test / release build
 └── crates/
-    ├── rx11-core/                # Core lib: protocol, transport, auth, stats
-    │   └── src/
-    │       ├── protocol/         # Protocol layer
-    │       │   ├── mod.rs        #   Frame constants and module facade
-    │       │   ├── messages.rs   #   Payload structs for every frame kind
-    │       │   ├── message_type.rs #  On-wire message type tags
-    │       │   ├── binary.rs     #   Binary codecs for X11 data frames
-    │       │   ├── frame.rs      #   Frame enum, derive macro, frame (de)serialization
-    │       │   └── handshake.rs  #   Hello/Auth negotiation (shared by both sides)
-    │       ├── transport.rs      # Async transport (frame sync recovery, buffer limits)
-    │       ├── compress.rs       # Data compression (zstd/lz4/zlib negotiation)
-    │       ├── incremental.rs    # Incremental diff encoding
-    │       ├── auth.rs           # Token generation & verification (constant-time compare)
-    │       ├── types.rs          # Validated newtypes (SessionId/Token/DisplayNumber, …)
-    │       ├── stats.rs          # Connection stats (bytes, frames, active connections)
-    │       ├── config.rs         # Centralized default constants (timeouts/ports/buffers)
-    │       └── error.rs          # Error types (with retryable error support)
+    ├── rx11-core/                # Core lib: protocol, transport, data-plane policy, auth, stats
+    │   ├── src/
+    │   │   ├── protocol/         # Protocol layer
+    │   │   │   ├── mod.rs        #   Frame constants and module facade
+    │   │   │   ├── messages.rs   #   Payload structs for every frame kind
+    │   │   │   ├── message_type.rs #  On-wire type tags and the band registry
+    │   │   │   ├── binary.rs     #   Binary codecs for data-plane frames
+    │   │   │   ├── frame.rs      #   Frame enum, derive macro, frame (de)serialization
+    │   │   │   ├── capability.rs #   Capability registry and negotiated intersection
+    │   │   │   └── handshake.rs  #   Hello/Auth negotiation (shared by both sides)
+    │   │   ├── transport.rs      # Async transport (frame sync recovery, buffer limits)
+    │   │   ├── dataplane.rs      # Data-plane policy chain: capability-gated diff/compression
+    │   │   ├── compress.rs       # Data compression (zstd/lz4/zlib negotiation)
+    │   │   ├── incremental.rs    # Incremental diff encoding
+    │   │   ├── flow.rs           # Per-channel flow-control primitives (meter, gate, advertiser)
+    │   │   ├── queue.rs          # Byte-budgeted outbound queue + real-time priority lane
+    │   │   ├── x11recode/        # PutImage re-encoding for the x11 channel (PNG / JPEG)
+    │   │   ├── audio/            # Audio channel wire contract and shared primitives
+    │   │   │   ├── mod.rs        #   Codec state machines and capture/playback candidates
+    │   │   │   ├── ownership.rs  #   Which application an X11 connection belongs to
+    │   │   │   └── capture.rs    #   Capture shapes that isolate one application's sound
+    │   │   ├── auth.rs           # Token generation & verification (constant-time compare)
+    │   │   ├── types.rs          # Validated newtypes (SessionId/Token/DisplayNumber, …)
+    │   │   ├── stats.rs          # Connection stats (bytes, frames, active connections)
+    │   │   ├── config.rs         # Centralized default constants (timeouts/ports/buffers)
+    │   │   └── error.rs          # Error types (with retryable error support)
+    │   └── tests/                # Protocol end-to-end (duplex) and bulk-protocol harnesses
     ├── rx11-server/              # Remote side: relay server + X11 listener
-    │   └── src/
-    │       ├── relay/
-    │       │   ├── mod.rs        #   RelayServer: accept loop & connection cap
-    │       │   └── connection.rs #   Per-client connection task (sessions, heartbeat, forwarding)
-    │       ├── session/
-    │       │   ├── mod.rs        #   Session manager (grace period, auto display)
-    │       │   ├── events.rs     #   Channel messages between listener and relay
-    │       │   └── xauth.rs      #   xauth entry management
-    │       └── x11_listener.rs   # X11 port listener & proxy (multi-connection multiplexing)
+    │   ├── src/
+    │   │   ├── relay/
+    │   │   │   ├── mod.rs        #   RelayServer: accept loop & connection cap
+    │   │   │   └── connection.rs #   Per-client connection task (sessions, heartbeat, forwarding)
+    │   │   ├── session/
+    │   │   │   ├── mod.rs        #   Session manager (grace period, auto display)
+    │   │   │   ├── events.rs     #   Channel messages between listener and relay
+    │   │   │   ├── xauth.rs      #   xauth entry management
+    │   │   │   └── application.rs #  Which application an X11 connection belongs to
+    │   │   ├── audio/            # Audio capture and fan-out
+    │   │   │   ├── mod.rs        #   Two capture modes and one fan-out surface
+    │   │   │   ├── mix.rs        #   Whole-desktop mix: one capture, one encoder
+    │   │   │   └── per_app.rs    #   Per application: one capture and encoder each
+    │   │   └── x11_listener.rs   # X11 port listener & proxy (multi-connection multiplexing)
+    │   └── tests/                # Audio / flow-control / loopback performance harnesses
     ├── rx11-client/              # Local side: relay connection + local X Server proxy
     │   └── src/
     │       ├── connector.rs      # Connection, session create/resume, reconnect backoff
     │       ├── serve.rs          # Relay receive loop and frame dispatch
     │       ├── proxy.rs          # Local X11 app connections and socket pumps
+    │       ├── audioout.rs       # Audio channel decoding and local playback
     │       └── ssh.rs            # SSH tunnel client (health check + auto-rebuild)
-    └── rx11-cli/                 # Unified CLI entry point
-        └── src/
-            ├── main.rs           # Logging init + subcommand dispatch
-            ├── cli.rs            # clap argument definitions
-            ├── settings.rs       # TOML config loading and template
-            ├── util.rs           # X Server probing, port waiting
-            └── commands/         # server / client / ssh / run / gen-token / config
+    ├── rx11-cli/                 # Unified CLI entry point
+    │   └── src/
+    │       ├── main.rs           # Logging init + subcommand dispatch
+    │       ├── cli.rs            # clap argument definitions
+    │       ├── settings.rs       # TOML config loading and template
+    │       ├── util.rs           # X Server probing, port waiting
+    │       └── commands/         # server / client / ssh / run / gen-token / config
+    └── rx11-gui/                 # Native FLTK console (rx11-gui)
+        ├── src/
+        │   ├── lib.rs            # Crate root: layer declarations and the run() entry
+        │   ├── main.rs           # One-line entry (rx11_gui::run())
+        │   ├── model.rs          # Cross-layer contract: Backend port and data types
+        │   ├── settings/         # Config data layer (io, validation, flat key-value bridge)
+        │   ├── launcher/         # In-process session orchestration and log ring
+        │   ├── theme/            # Design tokens and drawing primitives
+        │   ├── state.rs          # View state owned by the UI thread
+        │   ├── ui/               # Shell, self-drawn controls, layout tree and six pages
+        │   ├── backend.rs        # The real Backend implementation
+        │   ├── demo.rs           # The sample-data Backend implementation
+        │   └── app/              # Composition root: window, routing, polling, actions
+        ├── tests/architecture.rs # Assertions on the layer dependency directions
+        └── DESIGN.md             # Design rationale, structure notes and verification record
 ```
 
 ---

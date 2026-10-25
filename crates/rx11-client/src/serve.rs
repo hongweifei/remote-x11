@@ -844,6 +844,7 @@ mod tests {
             connection_id: conn,
             kind: rx11_core::protocol::ChannelKind::audio(),
             display: None,
+            app: None,
         })
     }
 
