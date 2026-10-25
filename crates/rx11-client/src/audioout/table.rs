@@ -60,6 +60,16 @@ impl OutletTable {
         }
     }
 
+    /// Whether the relay ships per-application channels.
+    ///
+    /// It is decided by the negotiated capability, which is known before
+    /// the first channel arrives; the setter exists for the tests, whose
+    /// harness changes the negotiated features after the table is built.
+    #[cfg(test)]
+    pub(crate) fn set_per_application(&mut self, per_application: bool) {
+        self.per_application = per_application;
+    }
+
     /// Register an open audio channel.
     ///
     /// A channel that is already known is refused: the relay does not open

@@ -510,6 +510,82 @@ async fn several_audio_channels_are_open_at_once() {
 }
 
 #[tokio::test]
+async fn only_the_foreground_applications_channel_is_audible() {
+    // The relay opens one audio channel per X11 connection, each tagged
+    // with the connection whose application produced the sound. The
+    // application the user is looking at is the one that must be heard —
+    // the other channels stay open but silent.
+    let mut h = Harness::new(None).await;
+    h.dataplane.features =
+        Features::from_list(&["audio_forward".to_string(), "audio_per_app".to_string()]);
+    h.rt.audio_play_command = Some(vec!["cat".to_string()]);
+    // The harness builds the table before the negotiated features are
+    // changed, so the per-application mode is set here.
+    h.audio.set_per_application(true);
+    {
+        let mut ctx = h.ctx();
+        dispatch_frame(&mut ctx, audio_open_for_app(conn(30), conn(5)))
+            .await
+            .unwrap();
+        dispatch_frame(&mut ctx, audio_open_for_app(conn(31), conn(6)))
+            .await
+            .unwrap();
+
+        // The foreground is the application behind X11 connection 5.
+        ctx.audio.set_foreground(Some(conn(5)));
+        assert!(
+            ctx.audio.is_audible(conn(30)),
+            "the foreground application's channel is audible"
+        );
+        assert!(
+            !ctx.audio.is_audible(conn(31)),
+            "another application's channel stays silent"
+        );
+        assert_eq!(ctx.audio.audible(), vec![30]);
+
+        // The focus moves to the other application: the roles swap.
+        ctx.audio.set_foreground(Some(conn(6)));
+        assert!(!ctx.audio.is_audible(conn(30)));
+        assert!(ctx.audio.is_audible(conn(31)));
+        assert_eq!(ctx.audio.audible(), vec![31]);
+    }
+}
+
+#[tokio::test]
+async fn without_a_foreground_every_application_is_heard_once() {
+    // The focus could not be determined. Every application is then
+    // audible — but each of them ONCE: the relay sends the same sound on
+    // every channel of an application, and playing two of them would
+    // double the volume.
+    let mut h = Harness::new(None).await;
+    h.dataplane.features =
+        Features::from_list(&["audio_forward".to_string(), "audio_per_app".to_string()]);
+    h.rt.audio_play_command = Some(vec!["cat".to_string()]);
+    // The harness builds the table before the negotiated features are
+    // changed, so the per-application mode is set here.
+    h.audio.set_per_application(true);
+    {
+        let mut ctx = h.ctx();
+        dispatch_frame(&mut ctx, audio_open_for_app(conn(30), conn(5)))
+            .await
+            .unwrap();
+        dispatch_frame(&mut ctx, audio_open_for_app(conn(31), conn(5)))
+            .await
+            .unwrap();
+        dispatch_frame(&mut ctx, audio_open_for_app(conn(32), conn(6)))
+            .await
+            .unwrap();
+
+        ctx.audio.set_foreground(None);
+        assert_eq!(
+            ctx.audio.audible(),
+            vec![30, 32],
+            "one channel per application, never two of the same"
+        );
+    }
+}
+
+#[tokio::test]
 async fn audio_frames_bypass_the_dataplane_entirely() {
     let mut h = Harness::new(Some(CompressionAlgo::Zstd)).await;
     let (outlet, mut packets) = crate::audioout::AudioOutlet::for_test(conn(22));
