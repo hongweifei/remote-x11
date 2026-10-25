@@ -194,6 +194,12 @@ impl AudioHub {
                                 connection_id: sub.conn,
                                 kind: ChannelKind::audio(),
                                 display: None,
+                                // The whole-desktop mix belongs to no single
+                                // application: it carries every application's
+                                // sound at once, so it carries no application
+                                // tag. Only a per-application channel names the
+                                // X11 connection that owns the sound.
+                                app: None,
                             }))
                             .is_err()
                         {

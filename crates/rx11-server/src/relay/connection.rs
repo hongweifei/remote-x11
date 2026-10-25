@@ -666,6 +666,9 @@ async fn handle_x11_event(
                     connection_id,
                     kind: ChannelKind::x11(),
                     display: Some(display),
+                    // An X11 channel belongs to no single application tag:
+                    // the application label is the audio channel's field.
+                    app: None,
                 }),
             )
             .await
