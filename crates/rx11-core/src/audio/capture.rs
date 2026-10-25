@@ -200,6 +200,25 @@ impl PipeWireTopology {
             .collect()
     }
 
+    /// Every application's output stream node — the `Stream/Output/Audio`
+    /// nodes that carry a process id.
+    ///
+    /// The process id is the process that PLAYS the sound (a browser's
+    /// audio service), NOT the process that holds the X11 connection (the
+    /// browser's main process). The two are different processes, so
+    /// looking a node up by the connection's process id finds nothing;
+    /// the caller instead takes each node's process id, resolves the
+    /// application it belongs to, and compares applications.
+    ///
+    /// Nodes without a process id are left out: they belong to no
+    /// application, so no application can claim them.
+    pub fn application_output_nodes(&self) -> Vec<&PipeWireNode> {
+        self.nodes
+            .iter()
+            .filter(|n| n.is_application_output() && n.process_id.is_some())
+            .collect()
+    }
+
     /// The node with this name — the capture stream is found by its own
     /// unique name, because a capture process carries no process id in the
     /// graph.
@@ -413,5 +432,148 @@ mod tests {
             process_id: None,
         };
         assert!(!node.belongs_to(42));
+    }
+
+    #[test]
+    fn application_output_nodes_carry_a_process_id() {
+        // The list the capture path walks: every application's output
+        // stream, each naming the process that PLAYS the sound.
+        let topology = PipeWireTopology {
+            nodes: vec![
+                PipeWireNode {
+                    id: 78,
+                    name: "paplay".into(),
+                    media_class: "Stream/Output/Audio".into(),
+                    process_id: Some(52075),
+                },
+                PipeWireNode {
+                    id: 79,
+                    name: "paplay".into(),
+                    media_class: "Stream/Output/Audio".into(),
+                    process_id: Some(52076),
+                },
+                PipeWireNode {
+                    id: 57,
+                    name: "sink".into(),
+                    media_class: "Audio/Sink".into(),
+                    process_id: None,
+                },
+                PipeWireNode {
+                    id: 90,
+                    name: "rx11-cap-7".into(),
+                    media_class: "Stream/Input/Audio".into(),
+                    process_id: None,
+                },
+                PipeWireNode {
+                    id: 91,
+                    name: "orphan".into(),
+                    media_class: "Stream/Output/Audio".into(),
+                    process_id: None,
+                },
+            ],
+            ports: Vec::new(),
+        };
+
+        let nodes = topology.application_output_nodes();
+        assert_eq!(nodes.len(), 2, "only the output streams with a process");
+        assert!(nodes.iter().all(|n| n.is_application_output()));
+        assert!(nodes.iter().all(|n| n.process_id.is_some()));
+        let ids: Vec<u32> = nodes.iter().map(|n| n.id).collect();
+        assert!(ids.contains(&78) && ids.contains(&79));
+        // The sink and our own capture stream are not application outputs.
+        assert!(!ids.contains(&57) && !ids.contains(&90) && !ids.contains(&91));
+    }
+
+    #[test]
+    fn channels_are_paired_by_suffix_not_by_position() {
+        // An application whose ports are listed FR first must still pair
+        // FL with FL and FR with FR.
+        let topology = PipeWireTopology {
+            nodes: Vec::new(),
+            ports: vec![
+                PipeWirePort {
+                    id: 10,
+                    node_id: 1,
+                    is_output: true,
+                    name: "output_FR".into(),
+                },
+                PipeWirePort {
+                    id: 11,
+                    node_id: 1,
+                    is_output: true,
+                    name: "output_FL".into(),
+                },
+                PipeWirePort {
+                    id: 20,
+                    node_id: 2,
+                    is_output: false,
+                    name: "input_FL".into(),
+                },
+                PipeWirePort {
+                    id: 21,
+                    node_id: 2,
+                    is_output: false,
+                    name: "input_FR".into(),
+                },
+            ],
+        };
+
+        let pairs = topology.pair_channels(1, 2);
+        assert_eq!(pairs.len(), 2, "both channels are paired");
+        assert!(
+            pairs.contains(&(11, 20)),
+            "output_FL pairs with input_FL: {pairs:?}"
+        );
+        assert!(
+            pairs.contains(&(10, 21)),
+            "output_FR pairs with input_FR: {pairs:?}"
+        );
+        // The pairing is by suffix, so the order of the ports does not
+        // matter and no channel is crossed.
+        for (out_port, in_port) in &pairs {
+            let out_suffix = topology
+                .ports
+                .iter()
+                .find(|p| p.id == *out_port)
+                .expect("output port")
+                .channel_suffix();
+            let in_suffix = topology
+                .ports
+                .iter()
+                .find(|p| p.id == *in_port)
+                .expect("input port")
+                .channel_suffix();
+            assert_eq!(out_suffix, in_suffix, "channels must not cross");
+        }
+    }
+
+    #[test]
+    fn a_mono_application_pairs_only_one_channel() {
+        let topology = PipeWireTopology {
+            nodes: Vec::new(),
+            ports: vec![
+                PipeWirePort {
+                    id: 10,
+                    node_id: 1,
+                    is_output: true,
+                    name: "output_FL".into(),
+                },
+                PipeWirePort {
+                    id: 20,
+                    node_id: 2,
+                    is_output: false,
+                    name: "input_FL".into(),
+                },
+                PipeWirePort {
+                    id: 21,
+                    node_id: 2,
+                    is_output: false,
+                    name: "input_FR".into(),
+                },
+            ],
+        };
+
+        let pairs = topology.pair_channels(1, 2);
+        assert_eq!(pairs, vec![(10, 20)], "only the FL channel exists");
     }
 }
