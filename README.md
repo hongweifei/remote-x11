@@ -42,9 +42,10 @@
 - **公网排队治理** — 发往中继的出站队列按**字节预算**封顶（默认 1 MB），慢链路不会积累分钟级积压；配合可选 `SO_SNDBUF` 上限，交互延迟预算 ≈ 队列+内核缓冲 ÷ 链路速率
 - **图像流量重编码（默认开启）** — `x11_recode` 能力：识别 X 协议里的大块 `PutImage` 请求（ZPixmap 24/32 位），在线路上换成 JPEG（有损，省 10~50 倍）或无损 PNG，收端展开后以原始请求字节写回本地 X server；非图像请求逐字节透传。默认开启（PNG 无损档）：任一端 `[runtime] image_recode = false` 即整链逐字节透传；JPEG 有损档只有显式 `image_recode_codec = "jpeg"` 才会启用。边界：GL 渲染的视频、Xv 扩展路径不在识别范围——那是帧缓冲模式（Xpra/x2go 的领域），不是透明转发器该假装的
 - **桌面音频转发（默认开启）** — `audio` 通道：服务端采集默认输出 sink 的 monitor，Opus（**纯 Rust** 移植，48 kHz 立体声，构建零系统库要求）编码后走**实时优先道**下推，收端解码交给 `paplay` 播放。全服务**一份采集一份编码**扇出给所有客户端：多客户端不重复起 parec、不重复编码；迟到者从下一帧接上；最后一个监听者离开后录音器自动停。64 kbit/s 约占 3 Mbps 链路 2%；优先道不受出站字节预算排队，图像洪峰下音频延迟以单个写块为界。默认开启，任一端 `audio_forward = false` 即关；端点没有采集/播放栈（parec/paplay）时自动静默降级不影响会话。边界：只放声音，不做麦克风反向输入，不做唇音同步
+- **按应用转发音频（默认开启）** — `audio_per_app` 能力：服务端把每一路声音归属到产生它的那个应用（按进程归属判定），每个应用单独一条 `audio` 通道，通道上带该应用的 X11 连接标签；客户端据此**只播放当前渲染的那个应用的声音**，而不是把整个远端桌面的声音一股脑放出来。任一端 `audio_per_app = false` 即退回整桌面混音；主机本身不支持按应用采集时也自动退回整桌面混音（声音照旧，混音而非分流）
 - **逐通道流控（默认开启）** — `flow_control` 能力：接收端「已收下但没消费完」的积压超过高水位（默认 2 MB）就对该通道（`connection_id` 粒度，上下行各自计量）宣告 Pause，发端大块泵**停止从源头 socket 读取**——积压退到内核缓冲和应用自己的 `write()` 里，一个字节都不丢；回落到低于低水位（默认 256 KB）宣告 Resume。流控帧走**实时优先道**并周期性再宣告：信号自己不排在洪峰后面，优先道满丢弃也可再宣告找回；控制帧（心跳/会话）与音频道永不被它门控。同向通道双向同时堵时，下行让位上行——双向互门会冻住 X11 会话，推迟新请求不会。任一端 `[runtime] flow_control = false` 即整链退回纯传输背压（字节预算队列）
 - **增量传输** — 重复度高的 X11 帧只传差异块（可再叠加压缩），画面下行与请求上行两个方向各自差分（`incremental_uplink` 单独控制上行）；**内容完全未变的帧退化为零块引用帧——整帧只有 29 字节（11 字节帧头 + 18 字节差分头），载荷一个字节不再重复上线**（帧本身照发——X11 字节流是定位式的，序号必须前进）；接收端 diff 失步时自动请求回退全帧，自愈不丢流
-- **能力协商** — 增量/上行增量/重同步/流控/重编码/音频等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
+- **能力协商** — 增量/上行增量/重同步/流控/重编码/音频/按应用音频等特性经 Hello/HelloAck 交集协商，未协商即不发送；新特性可按名字灰度上线
 - **通道类型可扩展** — 数据面帧族与载荷类型解耦：`ChannelOpen.kind` 声明类型（现为 `x11` 与 `audio`），kind 即能力名，未知 kind 安全穿透不解析错
 - **双向统计** — 客户端与服务端各自每 30 秒输出收发字节、压缩/增量节省量与活跃连接数
 - **安全加固** — 会话/连接归属权限校验、auth 数据长度限制、解压大小验证、帧同步恢复、read_buf 上限防 DoS
@@ -280,6 +281,7 @@ rx11 config show   # 显示配置文件路径与当前内容
 # image_recode_quality = 80        JPEG 质量
 # image_recode_min_bytes = 16384   像素块小于此值不动
 # audio_forward = true             桌面音频转发总开关（默认开；任一端 false 即关）
+# audio_per_app = true             按应用转发音频（默认开；任一端 false 退回整桌面混音）
 # audio_bitrate_kbps = 64          Opus 码率（32=语音级，64≈接近透明）
 # audio_record_command = []        覆盖采集 argv（默认 parec；Pulse/PipeWire 都自带）
 # audio_play_command = []          覆盖播放 argv（默认 paplay --raw）
@@ -393,7 +395,7 @@ rx11 使用自定义二进制帧协议，每帧结构：
 | SessionDestroy | 0x12 | 销毁会话 |
 | SessionResume | 0x13 | 恢复已有的会话 |
 | SessionAutoCreate | 0x14 | 自动分配 Display 并创建会话 |
-| ChannelOpen | 0x18 | 打开多路复用通道（`kind` + 可选 `display`） |
+| ChannelOpen | 0x18 | 打开多路复用通道（`kind` + 可选 `display` + 可选 `app` 应用标签） |
 | ChannelClose | 0x19 | 按通道号关闭通道 |
 | StreamResyncRequest | 0x1A | 请求对端停止差分、回退全帧（自愈） |
 | StreamData | 0x20 | 通道数据帧（二进制载荷，类型无关） |
@@ -412,7 +414,8 @@ rx11 使用自定义二进制帧协议，每帧结构：
 段位不是口头约定——`TagBand` 注册表 + roster 测试强制执行：**新增帧类型必须同时登记所属段并更新该段的期望清单，否则 CI 失败**；把编号编进无主地带（如 0x05、0x2C）同样直接飘红。
 
 **能力协商（Capability Negotiation）**：`Hello.capabilities` / `HelloAck.capabilities`
-以字符串列表声明特性（`incremental`、`incremental_uplink`、`request_resync`、`flow_control`……），
+以字符串列表声明特性（`incremental`、`incremental_uplink`、`request_resync`、`flow_control`、
+`audio_per_app`……），
 服务端回复交集。未协商的能力两侧都不会使用（例如未声明 `incremental` 时对端
 永不产生增量帧；`incremental_uplink` 在此基础上开启客户端上行请求流的差分，
 接收端会对未协商方向的增量帧拒收）；未识别的能力名会被忽略——新增帧类型只需配合新能力名即可

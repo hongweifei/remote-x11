@@ -61,6 +61,7 @@ pub(super) fn full_config() -> GuiConfig {
             image_recode_quality: Some(85),
             image_recode_min_bytes: Some(16_384),
             audio_forward: Some(false),
+            audio_per_app: Some(true),
             audio_bitrate_kbps: Some(64),
             audio_record_command: Some(vec!["parec".into(), "--raw".into()]),
             audio_play_command: Some(vec!["paplay".into(), "/dev/stdin".into()]),

@@ -338,6 +338,7 @@ impl Section for RuntimeSection {
         "image_recode_quality",
         "image_recode_min_bytes",
         "audio_forward",
+        "audio_per_app",
         "audio_bitrate_kbps",
         "audio_record_command",
         "audio_play_command",
@@ -363,6 +364,7 @@ impl Section for RuntimeSection {
             "image_recode_quality" => self.image_recode_quality.map(|v| v.to_string()),
             "image_recode_min_bytes" => self.image_recode_min_bytes.map(|v| v.to_string()),
             "audio_forward" => self.audio_forward.map(|v| v.to_string()),
+            "audio_per_app" => self.audio_per_app.map(|v| v.to_string()),
             "audio_bitrate_kbps" => self.audio_bitrate_kbps.map(|v| v.to_string()),
             "audio_record_command" => self.audio_record_command.as_deref().map(format_argv),
             "audio_play_command" => self.audio_play_command.as_deref().map(format_argv),
@@ -394,6 +396,7 @@ impl Section for RuntimeSection {
             "image_recode_quality" => opt_field!(self, image_recode_quality, raw, parse_u8),
             "image_recode_min_bytes" => opt_field!(self, image_recode_min_bytes, raw, parse_usize),
             "audio_forward" => opt_field!(self, audio_forward, raw, parse_bool),
+            "audio_per_app" => opt_field!(self, audio_per_app, raw, parse_bool),
             "audio_bitrate_kbps" => opt_field!(self, audio_bitrate_kbps, raw, parse_u32),
             "audio_record_command" => opt_field!(self, audio_record_command, raw, parse_argv),
             "audio_play_command" => opt_field!(self, audio_play_command, raw, parse_argv),
@@ -436,6 +439,7 @@ impl Section for RuntimeSection {
         );
         set_usize(table, "image_recode_min_bytes", self.image_recode_min_bytes);
         set_bool(table, "audio_forward", self.audio_forward);
+        set_bool(table, "audio_per_app", self.audio_per_app);
         set_int(
             table,
             "audio_bitrate_kbps",
@@ -562,7 +566,7 @@ mod tests {
     #[test]
     fn all_field_keys_are_unique_and_dotted() {
         let keys = all_field_keys();
-        assert_eq!(keys.len(), 4 + 3 + 9 + 21, "四段字段总数");
+        assert_eq!(keys.len(), 4 + 3 + 9 + 22, "四段字段总数");
         let mut sorted = keys.clone();
         sorted.sort();
         sorted.dedup();

@@ -89,6 +89,7 @@ impl DemoBackend {
             ("runtime.image_recode_quality", "80"),
             ("runtime.image_recode_min_bytes", "16384"),
             ("runtime.audio_forward", "true"),
+            ("runtime.audio_per_app", "true"),
             ("runtime.audio_bitrate_kbps", "64"),
             ("runtime.audio_record_command", ""),
             ("runtime.audio_play_command", ""),

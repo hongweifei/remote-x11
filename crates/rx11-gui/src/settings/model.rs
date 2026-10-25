@@ -178,6 +178,7 @@ mod tests {
         assert_eq!(rt.image_recode_quality, 85);
         assert_eq!(rt.image_recode_min_bytes, 16_384);
         assert!(!rt.audio_forward);
+        assert!(rt.audio_per_app);
         assert_eq!(rt.audio_bitrate_kbps, 64);
         assert_eq!(
             rt.audio_record_command.as_deref(),

@@ -279,6 +279,12 @@ static RT_AUDIO: &[FieldSpec] = &[
         kind: FieldKind::Toggle,
     },
     FieldSpec {
+        key: "runtime.audio_per_app",
+        label: "按应用转发音频",
+        hint: "服务端逐个应用分别采集，客户端只播放当前渲染的应用的声音；主机不支持按应用采集时自动退回整桌面混音",
+        kind: FieldKind::Toggle,
+    },
+    FieldSpec {
         key: "runtime.audio_bitrate_kbps",
         label: "音频码率",
         hint: "kbps；32 适合人声，64 接近透明",
@@ -414,6 +420,7 @@ mod tests {
             "runtime.image_recode_quality",
             "runtime.image_recode_min_bytes",
             "runtime.audio_forward",
+            "runtime.audio_per_app",
             "runtime.audio_bitrate_kbps",
             "runtime.audio_record_command",
             "runtime.audio_play_command",

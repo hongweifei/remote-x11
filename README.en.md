@@ -38,9 +38,10 @@ Supports **TCP direct** and **SSH tunnel** modes.
 - **WAN queue discipline** — the outbound queue towards the relay is capped by **in-flight bytes** (default 1 MB), not frame count, so a 3 Mbit/s link never accumulates minutes of bufferbloat; an optional `SO_SNDBUF` cap tames the kernel buffer too
 - **Image re-encoding (on by default)** — the `x11_recode` capability recognizes large core `PutImage` requests (ZPixmap, depth 24/32) and ships them as JPEG (lossy, 10–50× smaller) or lossless PNG on the wire; the client re-expands them into the original request bytes before the local X server sees anything. Non-image traffic passes byte-for-byte. On by default with the **lossless** PNG tier; either end setting `image_recode = false` forces byte-for-byte passthrough, and the lossy JPEG tier only exists as an explicit `image_recode_codec = "jpeg"` choice. Honest edge: GL-rendered video and Xv extension paths are out of recognition scope — that's framebuffer territory (Xpra/x2go), not a transparent forwarder's
 - **Desktop audio forwarding (on by default)** — the `audio` channel: the server captures its default output sink's monitor, encodes with Opus (**pure-Rust** port, 48 kHz stereo, no system library build requirements) and streams it on the **real-time priority lane**; the client decodes and feeds `paplay`. The capture is **shared process-wide** — one recorder and one encoder fanned out to every client: N clients never spawn N `parec`s, late joiners pick up at the next packet, and the recorder stops itself when the last listener leaves. 64 kbit/s ≈ 2% of a 3 Mbit/s link; the lane bypasses the outbound byte budget, so audio latency under an image flood is bounded by one write chunk. On by default; `audio_forward = false` on either end disables it, and endpoints without a capture/playback stack (parec/paplay) degrade to silence without touching the session. Honest edge: playback only — no microphone back-channel, no lip sync
+- **Per-application audio forwarding (on by default)** — the `audio_per_app` capability: the server attributes each sound stream to the application producing it (by process ownership) and gives every application its own `audio` channel, tagged with that application's X11 connection; the client then plays **only the sound of the application it currently renders** instead of dumping the whole remote desktop's audio at once. `audio_per_app = false` on either end falls back to the whole-desktop mix, and so does a host that cannot capture per application — the sound still arrives, mixed rather than split
 - **Per-channel flow control (on by default)** — the `flow_control` capability: when a receiver's accepted-but-unconsumed backlog crosses the watermark (default 2 MB), it advertises `Pause` for that channel (`connection_id` granularity, each leg gauged separately); the sender's bulk pump stops reading its source socket, so the stall retreats into kernel buffers and the producing application's own `write()` — lossless by construction, not one byte discarded. Draining below the low watermark (default 256 KB) advertises `Resume`. Flow-control frames ride the **real-time priority lane** and are re-advertised periodically: the signal never queues behind a redraw burst, and a lane drop self-heals by the next re-advertisement; control frames and the audio lane are never gated. A channel congested in both directions at once gates only the uplink — the downlink advertisement yields, because gating both legs freezes an X11 conversation while deferring fresh requests never does. Either end setting `flow_control = false` returns the chain to plain transport-level backpressure (the byte-budgeted queue)
 - **Incremental transfer** — Repetitive X11 frames ship only changed chunks (optionally re-compressed), in BOTH directions: the picture downstream and the request stream upstream (the client→relay leg is gated separately by `incremental_uplink`); **a payload that did not change at all becomes a zero-chunk reference frame — 29 bytes on the wire (11-byte frame header + 18-byte diff header), none of the content travels twice** (the frame itself still goes out: the X11 byte stream is positional, so the sequence number must advance); a receiver auto-requests full frames when its diff cache goes stale
-- **Capability negotiation** — incremental/uplink-incremental/resync/flow-control/recode/audio features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
+- **Capability negotiation** — incremental/uplink-incremental/resync/flow-control/recode/audio/per-application-audio features are intersected at handshake and never used unless agreed; new capabilities ship by name, not by version bump
 - **Channel-kind extensibility** — the data-plane frame family is decoupled from payload type: `ChannelOpen.kind` declares the channel type (today `x11` and `audio`), kinds *are* capability names, and unknown kinds pass through without parse failures
 - **Two-sided statistics** — Client and server each log bytes, compression/incremental savings and active connections every 30 seconds
 - **Config file** — TOML config support. Priority: CLI args > env vars > config file > defaults
@@ -279,6 +280,7 @@ Priority: **CLI args > env vars > config file > defaults**
 # image_recode_quality = 80         JPEG quality
 # image_recode_min_bytes = 16384    pixel blocks below this pass through untouched
 # audio_forward = true              desktop audio forwarding switch (default on; false on either end disables)
+# audio_per_app = true              per-application audio forwarding (default on; false on either end = desktop mix)
 # audio_bitrate_kbps = 64           Opus bitrate (32 = speech-grade, 64 ≈ transparent)
 # audio_record_command = []         override recorder argv (default parec; ships with PulseAudio AND PipeWire)
 # audio_play_command = []           override player argv (default paplay --raw)
@@ -393,7 +395,7 @@ Frame types:
 | SessionDestroy | 0x12 | Destroy session |
 | SessionResume | 0x13 | Resume an existing session |
 | SessionAutoCreate | 0x14 | Auto-assign display and create session |
-| ChannelOpen | 0x18 | Open a multiplexed channel (`kind` + optional `display`) |
+| ChannelOpen | 0x18 | Open a multiplexed channel (`kind` + optional `display` + optional `app` tag) |
 | ChannelClose | 0x19 | Close a channel by id |
 | StreamResyncRequest | 0x1A | Ask peer to stop diffing and resend full frames (self-heal) |
 | StreamData | 0x20 | Channel data frame (binary payload, type-agnostic) |
@@ -412,7 +414,8 @@ The current protocol version is **1**, enforced twice: a frame-header version oc
 Bands are not a gentlemen's agreement — a `TagBand` registry plus a per-band roster test enforce them: **minting a frame requires registering its band and updating that band's expected roster, or CI goes red**, and squatting a tag in no-man's-land (0x05, 0x2C, …) fails the same way.
 
 **Capability negotiation**: `Hello.capabilities` / `HelloAck.capabilities` advertise
-feature names (`incremental`, `incremental_uplink`, `request_resync`, `flow_control`, …) and the server
+feature names (`incremental`, `incremental_uplink`, `request_resync`, `flow_control`,
+`audio_per_app`, …) and the server
 replies with the intersection. Features outside the intersection are never used by
 either side (`incremental` gates the picture downlink, `incremental_uplink` opens
 diffing of the client's request stream; a receiver refuses diff shapes its direction
