@@ -379,6 +379,10 @@ async fn per_application_capture_ships_that_applications_sound() {
     kill_players_of_earlier_runs();
 
     let dir = workdir();
+    // The directory goes when the test ends, however it ends: a failed
+    // assertion would otherwise leave the tone WAV (34 MB) behind for
+    // ever.
+    let _scratch = ScratchDir(dir.clone());
     let wav = dir.join("tone.wav");
     // A LONG tone: the player must still be sounding when the server
     // links the capture, and it must outlast the test's wait window.
@@ -540,7 +544,20 @@ async fn per_application_capture_ships_that_applications_sound() {
     );
 
     server.abort();
-    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Remove a directory when the test ends, however it ends.
+///
+/// The test's working directory holds the tone WAV (34 MB at 180 seconds),
+/// so a run that fails on an assertion would otherwise leave it behind
+/// for ever: the assertions are below the end of the test, and a panic
+/// skips the cleanup that follows them.
+struct ScratchDir(std::path::PathBuf);
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 async fn free_port() -> u16 {
