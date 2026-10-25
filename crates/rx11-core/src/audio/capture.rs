@@ -92,11 +92,24 @@ impl PipeWirePort {
     }
 }
 
+/// A link between two ports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipeWireLink {
+    /// The producer side.
+    pub output_port: u32,
+    /// The consumer side.
+    pub input_port: u32,
+}
+
 /// The audio graph, reduced to what the capture path needs.
 #[derive(Debug, Clone, Default)]
 pub struct PipeWireTopology {
     pub nodes: Vec<PipeWireNode>,
     pub ports: Vec<PipeWirePort>,
+    /// The links currently in the graph. A link that was asked for may
+    /// have landed on other ports (the object numbers are recycled), so
+    /// the link table is what says whether the capture is really wired.
+    pub links: Vec<PipeWireLink>,
 }
 
 impl PipeWireTopology {
@@ -168,6 +181,28 @@ impl PipeWireTopology {
                         node_id: node_id as u32,
                         name: string_prop(props, "port.name"),
                         is_output,
+                    });
+                }
+                "PipeWire:Interface:Link" => {
+                    let Some(props) = props else { continue };
+                    // The link's own properties name the two ports it
+                    // joins. They are NOT the `output.port.id` shape the
+                    // link COMMAND takes — the graph uses
+                    // `link.output.port` / `link.input.port`.
+                    let output_port = props
+                        .get("link.output.port")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| props.get("output.port.id").and_then(|v| v.as_u64()));
+                    let input_port = props
+                        .get("link.input.port")
+                        .and_then(|v| v.as_u64())
+                        .or_else(|| props.get("input.port.id").and_then(|v| v.as_u64()));
+                    let (Some(output_port), Some(input_port)) = (output_port, input_port) else {
+                        continue;
+                    };
+                    topology.links.push(PipeWireLink {
+                        output_port: output_port as u32,
+                        input_port: input_port as u32,
                     });
                 }
                 _ => {}
@@ -396,6 +431,7 @@ mod tests {
                     name: "output_FL".into(),
                 },
             ],
+            links: Vec::new(),
         };
 
         let outputs = topology.application_outputs(52075);
@@ -472,6 +508,7 @@ mod tests {
                 },
             ],
             ports: Vec::new(),
+            links: Vec::new(),
         };
 
         let nodes = topology.application_output_nodes();
@@ -516,6 +553,7 @@ mod tests {
                     name: "input_FR".into(),
                 },
             ],
+            links: Vec::new(),
         };
 
         let pairs = topology.pair_channels(1, 2);
@@ -571,6 +609,7 @@ mod tests {
                     name: "input_FR".into(),
                 },
             ],
+            links: Vec::new(),
         };
 
         let pairs = topology.pair_channels(1, 2);
