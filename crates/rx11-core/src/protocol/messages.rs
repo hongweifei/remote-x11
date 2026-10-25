@@ -183,18 +183,24 @@ impl std::fmt::Display for ChannelKind {
 }
 
 /// Opens a multiplexed channel. Kind-specific parameters (X11's `display`,
-/// the audio channel's owning `app`) travel as optional fields; consumers
-/// must ignore fields their kind does not define.
+/// the audio channel's owning application) travel as optional fields;
+/// consumers must ignore fields their kind does not define.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelOpenMessage {
     pub connection_id: ConnectionId,
     pub kind: ChannelKind,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub display: Option<DisplayNumber>,
-    /// The X11 connection (application) an `audio` channel carries the
-    /// sound of. `None` for every other kind, and for the legacy
+    /// The X11 connection whose application produces the sound carried on
+    /// an `audio` channel. `None` for every other kind, and for the
     /// whole-desktop mix channel (which by definition belongs to no single
     /// application).
+    ///
+    /// The audio channel's own `connection_id` names the audio channel; this
+    /// field names the X11 connection the sound comes from, so the receiver
+    /// can match a sound to the application it renders. One application may
+    /// hold several X11 connections, each with its own audio channel; they
+    /// carry the same sound.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<ConnectionId>,
 }

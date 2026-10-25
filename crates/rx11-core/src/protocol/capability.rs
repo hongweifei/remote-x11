@@ -63,9 +63,10 @@ pub enum Capability {
     /// Advertised by default; either peer opts OUT with
     /// `[runtime] audio_per_app = false`, which falls back to the
     /// whole-desktop mix. The client must gate on this capability: a
-    /// per-application stream is a DIFFERENT channel per application, and
-    /// a client that only understands the single legacy mix channel would
-    /// drop all but one application's sound.
+    /// per-application stream is a DIFFERENT channel per X11 connection
+    /// (one application may hold several), and a client that only
+    /// understands the single legacy mix channel would drop all but one
+    /// application's sound.
     AudioPerApp,
 }
 
