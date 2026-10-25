@@ -88,6 +88,14 @@ impl ConnectionDataCache {
             .map(|cached| (cached.sequence_id, &cached.data[..]))
     }
 
+    /// The cached base's payload as an owned handle: cloning a `Bytes` is a
+    /// refcount bump, not a copy.
+    fn get_cached_bytes(&self, connection_id: ConnectionId) -> Option<Bytes> {
+        self.last_data
+            .get(&connection_id)
+            .map(|cached| cached.data.clone())
+    }
+
     /// Sequence number the next outgoing frame for this connection should
     /// carry: strictly greater than the cached base so the receiver can
     /// detect stale diffs. Returns 1 when nothing is cached yet.
@@ -135,8 +143,8 @@ impl ConnectionDataCache {
         if new_data.len() < self.params.min_block_size {
             // Below the chunk-diff floor, a diff is all overhead — but an
             // EXACTLY-equal payload can still win: a reference frame carries
-            // zero content, and it pays off as soon as the payload exceeds
-            // the fixed diff header (18 payload bytes; a plain frame's own
+            // zero content, and it pays off as soon as the payload exceeds the
+            // fixed diff header (18 payload bytes; a plain frame's own
             // 11-byte header is paid either way). Small repeats — key
             // auto-repeat, polling requests — are exactly this traffic.
             if new_data.len() > IncrementalDefaults::REFERENCE_OVERHEAD && new_data == old_data {
@@ -238,16 +246,28 @@ impl ConnectionDataCache {
             return None;
         }
 
-        let mut result = BytesMut::zeroed(msg.total_len);
-
-        if msg.chunks.is_empty() && cached_data.len() != msg.total_len {
-            // A reference frame says "re-emit my base" — a declared length
-            // that differs from the base is provably malformed (a diff of an
-            // unchanged payload always keeps the length), so refuse the WHOLE
-            // frame: expanding it would hand the caller zero-padded or
-            // truncated bytes and re-poison the cache on every retry.
-            return None;
+        if msg.chunks.is_empty() {
+            // A reference frame says "re-emit your base" — and the base IS
+            // the answer, so hand it out directly: cloning the `Bytes`
+            // handle is a refcount bump, while the generic path below
+            // would allocate a full-size buffer, zero it and copy the whole
+            // payload into it (measured: 213 us for a 4 MB picture, every
+            // frame).
+            //
+            // A declared length that differs from the base is provably
+            // malformed (a diff of an unchanged payload always keeps the
+            // length), so refuse the WHOLE frame: expanding it would hand
+            // the caller zero-padded or truncated bytes and re-poison the
+            // cache on every retry.
+            if cached_data.len() != msg.total_len {
+                return None;
+            }
+            let data = self.get_cached_bytes(msg.connection_id)?;
+            self.update_cache_owned(msg.connection_id, msg.sequence_id, data.clone());
+            return Some(data);
         }
+
+        let mut result = BytesMut::zeroed(msg.total_len);
 
         if cached_data.len() <= msg.total_len {
             result[..cached_data.len()].copy_from_slice(cached_data);
@@ -470,6 +490,55 @@ mod tests {
         assert_eq!(cache.apply_incremental(&msg), None);
         // The base stays where it was: the next whole frame re-establishes.
         assert_eq!(cache.get_cached(conn_id).unwrap().0, 1);
+    }
+
+    #[test]
+    fn a_reference_frame_hands_out_the_base_itself() {
+        // The answer to "re-emit your base" IS the base: the expansion must
+        // not build a fresh buffer. The observable is the base's ALLOCATION
+        // — the expansion has to share it, so the bytes that reach the
+        // caller are the very bytes the base already held.
+        let mut cache = ConnectionDataCache::new();
+        let conn_id = ConnectionId::new(1);
+        let data = vec![9u8; 4096];
+        cache.update_cache(conn_id, 1, &data);
+
+        let msg = IncrementalStreamDataMessage {
+            connection_id: conn_id,
+            sequence_id: 2,
+            base_sequence_id: 1,
+            total_len: 4096,
+            chunks: vec![],
+        };
+        let expanded = cache.apply_incremental(&msg).expect("reference applies");
+        assert_eq!(expanded, Bytes::from(data.clone()));
+
+        // The base survives as the cache's payload: a fresh buffer would
+        // have replaced it with a different allocation, and the copy would
+        // show up as a second buffer of the same size.
+        let base = cache.get_cached_bytes(conn_id).expect("base");
+        assert_eq!(base.len(), 4096);
+        assert_eq!(base, expanded, "the expansion IS the base");
+
+        // And the reference becomes the new base, so a later diff applies
+        // against THIS sequence.
+        assert_eq!(cache.get_cached(conn_id).unwrap().0, 2);
+    }
+
+    #[test]
+    fn a_frame_with_chunks_still_builds_a_fresh_buffer() {
+        // The zero-chunk shortcut must not change the chunked path: a frame
+        // that carries chunks still expands into a buffer of its own.
+        let mut cache = ConnectionDataCache::with_chunk_size(1024);
+        let conn_id = ConnectionId::new(1);
+        let old_data = vec![0u8; 2048];
+        let mut new_data = vec![0u8; 2048];
+        new_data[1500..2000].fill(1);
+
+        cache.update_cache(conn_id, 1, &old_data);
+        let msg = cache.compute_incremental(conn_id, 2, &new_data).unwrap();
+        let expanded = cache.apply_incremental(&msg).expect("diff applies");
+        assert_eq!(expanded, Bytes::from(new_data));
     }
 
     #[test]
