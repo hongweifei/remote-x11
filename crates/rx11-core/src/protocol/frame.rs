@@ -460,12 +460,34 @@ mod tests {
             connection_id: ConnectionId::new(100),
             kind: ChannelKind::x11(),
             display: Some(DisplayNumber::new(5).unwrap()),
+            app: None,
         });
         match roundtrip(&frame) {
             Frame::ChannelOpen(m) => {
                 assert!(m.kind.is_x11());
                 assert_eq!(m.display.unwrap().get(), 5);
                 assert_eq!(m.connection_id.get(), 100);
+                assert!(m.app.is_none());
+            }
+            other => panic!("Expected ChannelOpen frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_open_carries_the_application_tag_of_a_per_app_audio_channel() {
+        // The per-application audio channel rides the same open frame as
+        // every other channel: the `app` tag names the X11 connection whose
+        // application produces the sound carried on that channel.
+        let frame = Frame::ChannelOpen(ChannelOpenMessage {
+            connection_id: ConnectionId::new(200),
+            kind: ChannelKind::audio(),
+            display: None,
+            app: Some(ConnectionId::new(7)),
+        });
+        match roundtrip(&frame) {
+            Frame::ChannelOpen(m) => {
+                assert!(m.kind.is_audio());
+                assert_eq!(m.app.map(|a| a.get()), Some(7));
             }
             other => panic!("Expected ChannelOpen frame, got {other:?}"),
         }
@@ -480,6 +502,7 @@ mod tests {
             connection_id: ConnectionId::new(1),
             kind: ChannelKind::new("clipboard"),
             display: None,
+            app: None,
         });
         match roundtrip(&frame) {
             Frame::ChannelOpen(m) => {
