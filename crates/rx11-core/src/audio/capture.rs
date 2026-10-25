@@ -57,6 +57,14 @@ pub struct PipeWirePort {
     pub id: u32,
     /// The node this port belongs to.
     pub node_id: u32,
+    /// The port's name, e.g. `output_FL` / `input_FL`.
+    ///
+    /// Unique WITHIN a node, but not across applications: every `paplay`
+    /// instance names its node "paplay", so a link must still address the
+    /// port by NUMBER. The name is what pairs channels — `output_FL` with
+    /// `input_FL` — so that a stereo application stays stereo in the
+    /// capture instead of collapsing onto one channel.
+    pub name: String,
     /// `true` for an output port (the producer side).
     pub is_output: bool,
 }
@@ -70,6 +78,18 @@ impl PipeWirePort {
             "input"
         }
     }
+
+    /// The channel suffix of the port's name — `FL` for `output_FL`.
+    ///
+    /// The suffix after the last underscore: `output_FL` and `input_FL`
+    /// both yield `FL`, which is what pairs an application's output port
+    /// with the capture stream's input port of the same channel.
+    pub fn channel_suffix(&self) -> &str {
+        match self.name.rsplit_once('_') {
+            Some((_, suffix)) => suffix,
+            None => &self.name,
+        }
+    }
 }
 
 /// The audio graph, reduced to what the capture path needs.
@@ -80,6 +100,82 @@ pub struct PipeWireTopology {
 }
 
 impl PipeWireTopology {
+    /// Read the audio graph from the host.
+    ///
+    /// `pw-dump` prints the whole graph as JSON; this parses the two
+    /// object kinds the capture path needs — nodes and ports — and drops
+    /// the rest. The parsing goes through `serde_json`, so the graph
+    /// format is not hand-decoded.
+    ///
+    /// Fails when the host has no PipeWire, when `pw-dump` cannot run, or
+    /// when its output is not the expected JSON — the caller then falls
+    /// back to the desktop mix.
+    pub fn read() -> crate::error::Result<Self> {
+        let output = std::process::Command::new("pw-dump").output()?;
+        if !output.status.success() {
+            return Err(crate::error::Rx11Error::Protocol(format!(
+                "pw-dump failed: {}",
+                output.status
+            )));
+        }
+        Self::from_json(&output.stdout)
+    }
+
+    /// Build the topology from `pw-dump`'s JSON output.
+    pub fn from_json(bytes: &[u8]) -> crate::error::Result<Self> {
+        let objects: Vec<serde_json::Value> = serde_json::from_slice(bytes).map_err(|e| {
+            crate::error::Rx11Error::Protocol(format!("pw-dump output is not JSON: {e}"))
+        })?;
+        let mut topology = Self::default();
+        for object in objects {
+            let Some(kind) = object.get("type").and_then(|t| t.as_str()) else {
+                continue;
+            };
+            let Some(id) = object.get("id").and_then(|i| i.as_u64()) else {
+                continue;
+            };
+            let props = object
+                .get("info")
+                .and_then(|info| info.get("props"))
+                .and_then(|props| props.as_object());
+            match kind {
+                "PipeWire:Interface:Node" => {
+                    let Some(props) = props else { continue };
+                    let name = string_prop(props, "node.name");
+                    let media_class = string_prop(props, "media.class");
+                    let process_id = props
+                        .get("application.process.id")
+                        .and_then(|v| v.as_i64())
+                        .map(|v| v as i32);
+                    topology.nodes.push(PipeWireNode {
+                        id: id as u32,
+                        name,
+                        media_class,
+                        process_id,
+                    });
+                }
+                "PipeWire:Interface:Port" => {
+                    let Some(props) = props else { continue };
+                    let Some(node_id) = props.get("node.id").and_then(|v| v.as_u64()) else {
+                        continue;
+                    };
+                    // The direction is a plain string: "out" is the
+                    // producer side, "in" the consumer side.
+                    let is_output =
+                        props.get("port.direction").and_then(|v| v.as_str()) == Some("out");
+                    topology.ports.push(PipeWirePort {
+                        id: id as u32,
+                        node_id: node_id as u32,
+                        name: string_prop(props, "port.name"),
+                        is_output,
+                    });
+                }
+                _ => {}
+            }
+        }
+        Ok(topology)
+    }
+
     /// The output ports of the node with this id.
     pub fn output_ports_of(&self, node_id: u32) -> Vec<&PipeWirePort> {
         self.ports
@@ -110,6 +206,40 @@ impl PipeWireTopology {
     pub fn node_named(&self, name: &str) -> Option<&PipeWireNode> {
         self.nodes.iter().find(|n| n.name == name)
     }
+
+    /// Pair an application's output ports with the capture stream's input
+    /// ports, channel by channel.
+    ///
+    /// The pairing is by channel suffix: `output_FL` with `input_FL`,
+    /// `output_FR` with `input_FR`. Linking by position instead would
+    /// silently swap the channels of an application whose ports are not
+    /// listed in the same order.
+    ///
+    /// Ports whose suffix has no counterpart are left out — an
+    /// application with a mono output links one channel, and a capture
+    /// stream with more channels than the application simply does not use
+    /// them.
+    pub fn pair_channels(&self, output_node: u32, input_node: u32) -> Vec<(u32, u32)> {
+        let inputs = self.input_ports_of(input_node);
+        self.output_ports_of(output_node)
+            .iter()
+            .filter_map(|output| {
+                inputs
+                    .iter()
+                    .find(|input| input.channel_suffix() == output.channel_suffix())
+                    .map(|input| (output.id, input.id))
+            })
+            .collect()
+    }
+}
+
+/// Read a string property from a `pw-dump` property map.
+fn string_prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) -> String {
+    props
+        .get(key)
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// The capture command for ONE application.
@@ -117,13 +247,19 @@ impl PipeWireTopology {
 /// The stream starts unlinked (`--target=0`) and receives the application
 /// through a link; `node.name` is unique so the capture stream can be told
 /// apart from the application's own node.
+///
+/// The sample format is `s16`, NOT `s16le`: `pw-cat` names the format
+/// `s16` (see `pw-cat --list-formats`), and `s16le` — the spelling
+/// `parec`/`paplay` use — makes the capture stream refuse to start with
+/// "open failed: invalid argument". The byte order is the host's, so the
+/// PCM is still interleaved little-endian s16.
 pub fn capture_stream_command(node_name: &str) -> Vec<String> {
     vec![
         "pw-cat".to_string(),
         "--record".to_string(),
         "--target=0".to_string(),
         "--raw".to_string(),
-        "--format=s16le".to_string(),
+        "--format=s16".to_string(),
         "--rate=48000".to_string(),
         "--channels=2".to_string(),
         format!("--properties=node.name={node_name}"),
@@ -135,6 +271,12 @@ pub fn capture_stream_command(node_name: &str) -> Vec<String> {
 /// stream's input port.
 ///
 /// Both ends are port NUMBERS: names are ambiguous across applications.
+///
+/// No `-L` (linger) flag: `-L` does NOT mean "create the link" — the
+/// default behaviour already creates the link, and the link SURVIVES the
+/// exit of the `pw-link` process (measured: the capture node keeps
+/// running and keeps carrying audio after `pw-link` exited). Adding `-L`
+/// to a pair of ports that are already linked fails with "file exists".
 pub fn link_command(output_port: u32, input_port: u32) -> Vec<String> {
     vec![
         "pw-link".to_string(),
@@ -164,7 +306,9 @@ mod tests {
         assert!(argv.iter().any(|a| a == "--target=0"));
         // Raw PCM: without --raw the output carries a container header.
         assert!(argv.iter().any(|a| a == "--raw"));
-        assert!(argv.iter().any(|a| a == "--format=s16le"));
+        // The format is `s16`, not `s16le`: `pw-cat` refuses `s16le`.
+        assert!(argv.iter().any(|a| a == "--format=s16"));
+        assert!(!argv.iter().any(|a| a == "--format=s16le"));
         assert!(argv.iter().any(|a| a == "--rate=48000"));
         assert!(argv.iter().any(|a| a == "--channels=2"));
         // The unique name is what tells the capture stream apart later.
@@ -212,21 +356,25 @@ mod tests {
                     id: 75,
                     node_id: 78,
                     is_output: true,
+                    name: "output_FL".into(),
                 },
                 PipeWirePort {
                     id: 79,
                     node_id: 78,
                     is_output: true,
+                    name: "output_FR".into(),
                 },
                 PipeWirePort {
                     id: 80,
                     node_id: 78,
                     is_output: false,
+                    name: "input_FL".into(),
                 },
                 PipeWirePort {
                     id: 81,
                     node_id: 79,
                     is_output: true,
+                    name: "output_FL".into(),
                 },
             ],
         };

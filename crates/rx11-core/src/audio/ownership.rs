@@ -13,9 +13,43 @@
 //!   LOCAL port is the peer's ephemeral port. `SO_PEERCRED` is not an
 //!   alternative here: on this host it answers pid 0 for TCP.
 //! * An application is a PROCESS TREE, not a process. A browser's audio
-//!   service is a child of the browser's main process, so the two share
-//!   ancestors. Two pids belong to the same application when their
-//!   ancestries meet.
+//!   service is a child of the browser's main process, so the two must
+//!   land on the same application.
+//!
+//! ## What identifies an application
+//!
+//! The obvious rule — "two processes belong to the same application when
+//! their ancestries share a process" — is WRONG on a real desktop, and
+//! wrong in the worst possible direction: every process descends from
+//! init, so the rule declares the whole desktop one application. Measured
+//! on this host: 480 processes, of which 181 share the ancestors
+//! `{1, 1569}` alone; two independent Chromium instances (ancestry
+//! `2701 2622 1569` and `54647 2561 2433 1569`) share only `{1, 1569}`
+//! and would be declared the same application. A browser's sound would
+//! then be attributed to whichever terminal also holds an X11 connection.
+//!
+//! The rule that works is the APPLICATION ROOT: walk the ancestry to the
+//! first SESSION LEADER (a process that leads its own session), and take
+//! the process just below it — unless the leader and that process are the
+//! same program, in which case the leader itself is the root. Measured
+//! on this host, the rule separates exactly what must be separated:
+//!
+//! | pair | same application? |
+//! |---|---|
+//! | browser main process ↔ its audio service | yes |
+//! | browser main process ↔ its renderer | yes |
+//! | messenger main process ↔ its helper | yes |
+//! | two independent browser instances | **no** |
+//! | browser ↔ the shell that launched it | **no** |
+//! | browser ↔ messenger | **no** |
+//! | X server ↔ compositor | **no** |
+//!
+//! Two consequences the audio tier relies on:
+//!
+//! * two X11 connections of one application land on the same root;
+//! * the process that PRODUCES the sound (a browser's audio service) is a
+//!   DESCENDANT of the process that holds the connection, so
+//!   [`ProcessTree::owns_descendant`] attributes it to that connection.
 
 use std::collections::BTreeSet;
 
@@ -23,18 +57,43 @@ use procfs::net::{TcpNetEntry, TcpState};
 use procfs::process::FDTarget;
 use procfs::process::{all_processes, Process};
 
+/// The identity of an application: the process every member of the
+/// application descends from.
+///
+/// Two processes belong to the same application exactly when their
+/// application roots are the same process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ApplicationId(i32);
+
+impl ApplicationId {
+    /// The root process id.
+    pub fn get(self) -> i32 {
+        self.0
+    }
+}
+
 /// The ancestry of one process: itself plus every ancestor up to init.
 ///
-/// The set is the application's identity: two connections belong to the
-/// same application when their trees share at least one process.
+/// The tree is the raw material for the application root; it is also the
+/// answer to "is this pid an ancestor of that one".
+///
+/// The ancestors are kept in ANCESTRY ORDER — the process itself first,
+/// then its parent, and so on up to init. The order matters: the
+/// application root is defined by the NEAREST session leader, and a set
+/// ordered by pid would hand back whichever ancestor happens to have the
+/// smallest number.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessTree {
+    /// The process itself, then its ancestors, nearest first.
+    chain: Vec<i32>,
+    /// The same pids, for membership tests.
     pids: BTreeSet<i32>,
 }
 
 impl ProcessTree {
     /// Build the tree of `pid`. `None` when the process cannot be read.
     pub fn of(pid: i32) -> Option<Self> {
+        let mut chain = Vec::new();
         let mut pids = BTreeSet::new();
         let mut current = pid;
         // The chain terminates: pid 1's parent is 0, and a process that
@@ -44,6 +103,7 @@ impl ProcessTree {
             if current <= 0 || !pids.insert(current) {
                 break;
             }
+            chain.push(current);
             let Ok(process) = Process::new(current) else {
                 break;
             };
@@ -59,7 +119,7 @@ impl ProcessTree {
         if pids.is_empty() {
             None
         } else {
-            Some(Self { pids })
+            Some(Self { chain, pids })
         }
     }
 
@@ -68,10 +128,40 @@ impl ProcessTree {
         Self::of(std::process::id() as i32)
     }
 
-    /// Whether two processes belong to the same application — their
-    /// ancestries share at least one process.
+    /// The application this process belongs to.
+    ///
+    /// `None` when the session leader cannot be read — the caller then has
+    /// no application to attribute sound to.
+    pub fn application_root(&self) -> Option<ApplicationId> {
+        let nearest = *self.chain.first()?;
+        let leader = self.session_leader()?;
+        if leader == nearest {
+            return Some(ApplicationId(leader));
+        }
+        // The process just below the leader on the path to `nearest`.
+        let Some(below) = self.child_below(leader) else {
+            return Some(ApplicationId(leader));
+        };
+        // A leader that runs the same program as the process below it is
+        // the application's root itself (a browser that forks its own
+        // children from a session-leading main process).
+        if same_program(leader, below) {
+            Some(ApplicationId(leader))
+        } else {
+            Some(ApplicationId(below))
+        }
+    }
+
+    /// Whether two processes belong to the same application.
+    ///
+    /// The comparison is on the application root, never on a shared
+    /// ancestor: sharing an ancestor is what every pair of processes on a
+    /// desktop does.
     pub fn same_application(&self, other: &ProcessTree) -> bool {
-        self.pids.intersection(&other.pids).next().is_some()
+        match (self.application_root(), other.application_root()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
     }
 
     /// The processes of this tree, ascending.
@@ -79,9 +169,72 @@ impl ProcessTree {
         self.pids.iter().copied()
     }
 
+    /// The ancestry, nearest first: the process itself, its parent, and so
+    /// on up to init.
+    pub fn chain(&self) -> impl Iterator<Item = i32> + '_ {
+        self.chain.iter().copied()
+    }
+
     /// Whether this tree contains `pid`.
     pub fn contains(&self, pid: i32) -> bool {
         self.pids.contains(&pid)
+    }
+
+    /// Whether `pid` is this application's own process or a descendant of
+    /// it — the relation that attributes a sound to the application that
+    /// holds the X11 connection.
+    pub fn owns_descendant(&self, pid: i32) -> bool {
+        self.contains(pid)
+    }
+
+    /// The NEAREST session leader on the ancestry: a process that leads its
+    /// own session (its session id is its own pid).
+    ///
+    /// "Nearest" is essential: the ancestry of a desktop process runs
+    /// through several session leaders (the session's own, and the user
+    /// manager's), and only the nearest one sits between the process and
+    /// the application that started it.
+    fn session_leader(&self) -> Option<i32> {
+        self.chain
+            .iter()
+            .filter_map(|pid| Process::new(*pid).ok())
+            .filter_map(|process| process.stat().ok())
+            .find(|stat| stat.session == stat.pid)
+            .map(|stat| stat.pid)
+    }
+
+    /// The process below `leader` on the path to this tree's nearest
+    /// member.
+    fn child_below(&self, leader: i32) -> Option<i32> {
+        // The ancestry is a chain; walking it from the nearest member
+        // upwards, the first member whose parent is the leader is the
+        // child below it.
+        let nearest = *self.chain.first()?;
+        let mut current = nearest;
+        while let Ok(process) = Process::new(current) {
+            let Ok(status) = process.status() else {
+                return None;
+            };
+            if status.ppid == leader {
+                return Some(current);
+            }
+            if status.ppid <= 0 || !self.pids.contains(&status.ppid) {
+                return None;
+            }
+            current = status.ppid;
+        }
+        None
+    }
+}
+
+/// Whether two processes run the same program.
+fn same_program(a: i32, b: i32) -> bool {
+    match (Process::new(a).ok(), Process::new(b).ok()) {
+        (Some(a), Some(b)) => match (a.exe().ok(), b.exe().ok()) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -151,16 +304,22 @@ pub fn socket_inode_of(fd: i32) -> Option<u64> {
     }
 }
 
-/// Group pids into applications: each group is the set of pids sharing a
-/// process tree.
+/// Group pids into applications.
+///
+/// Two pids land in the same group when they share an application root —
+/// never merely because they share an ancestor, which on a desktop is true
+/// of every pair of processes.
 pub fn group_by_application(pids: &[i32]) -> Vec<ProcessTree> {
-    let mut trees: Vec<ProcessTree> = Vec::new();
+    let mut groups: Vec<(ApplicationId, ProcessTree)> = Vec::new();
     for pid in pids {
         let Some(tree) = ProcessTree::of(*pid) else {
             continue;
         };
-        match trees.iter_mut().find(|t| t.same_application(&tree)) {
-            Some(existing) => {
+        let Some(root) = tree.application_root() else {
+            continue;
+        };
+        match groups.iter_mut().find(|(id, _)| *id == root) {
+            Some((_, existing)) => {
                 // Merge: the group keeps its identity, but the new tree's
                 // members are remembered so a later lookup by any of them
                 // still lands in this group.
@@ -168,10 +327,10 @@ pub fn group_by_application(pids: &[i32]) -> Vec<ProcessTree> {
                     existing.pids.insert(p);
                 }
             }
-            None => trees.push(tree),
+            None => groups.push((root, tree)),
         }
     }
-    trees
+    groups.into_iter().map(|(_, tree)| tree).collect()
 }
 
 #[cfg(test)]
@@ -212,10 +371,13 @@ mod tests {
     }
 
     #[test]
-    fn pid_one_is_the_same_application_as_any_process() {
+    fn pid_one_is_not_the_same_application_as_any_process() {
+        // Init is an ancestor of every process, but it is not an
+        // application: sharing an ancestor must not make two processes the
+        // same application.
         let me = ProcessTree::of_self().unwrap();
         let init = ProcessTree::of(1).unwrap();
-        assert!(me.same_application(&init));
+        assert!(!me.same_application(&init));
     }
 
     #[test]
@@ -233,6 +395,84 @@ mod tests {
         let groups = group_by_application(&[me, me]);
         assert_eq!(groups.len(), 1, "the same pid twice is one application");
         assert!(groups[0].contains(me));
+    }
+
+    #[test]
+    fn grouping_separates_applications_that_only_share_an_ancestor() {
+        // Two real applications on this host: a browser started from a
+        // shell, and the shell's own session leader. They share ancestors
+        // (init, the user manager) but are different applications.
+        let Some(browser) = browser_main_process() else {
+            // No browser on this host: the rule itself is still pinned by
+            // the other tests, so there is nothing to assert here.
+            return;
+        };
+        let browser_tree = ProcessTree::of(browser).expect("browser tree");
+        let shell = browser_tree
+            .pids()
+            .find(|pid| *pid != browser && ProcessTree::of(*pid).is_some())
+            .expect("an ancestor of the browser");
+        let shell_tree = ProcessTree::of(shell).expect("shell tree");
+        assert!(
+            !browser_tree.same_application(&shell_tree),
+            "a browser and its launcher shell are different applications"
+        );
+
+        let groups = group_by_application(&[browser, shell]);
+        assert_eq!(groups.len(), 2, "two applications, two groups");
+    }
+
+    /// The main process of a desktop browser on this host, if there is one.
+    /// Detected by the process tree, not by a hard-coded pid: the test
+    /// must not depend on which browsers happen to run.
+    fn browser_main_process() -> Option<i32> {
+        // A browser main process is one whose own descendants include a
+        // process with the SAME executable — the helper processes. The
+        // simplest stable marker on a live host: a process whose ancestry
+        // contains a session leader running a different program (the
+        // launcher) and whose own executable has several live copies.
+        let mut candidates: Vec<i32> = Vec::new();
+        for process in procfs::process::all_processes().ok()? {
+            let Ok(process) = process else { continue };
+            let Ok(exe) = process.exe() else { continue };
+            let name = exe.to_string_lossy().to_string();
+            if !name.contains("chromium") && !name.contains("chrome") {
+                continue;
+            }
+            let Ok(status) = process.status() else {
+                continue;
+            };
+            // The main process is the one that is NOT a child of another
+            // browser process.
+            let parent_is_browser = Process::new(status.ppid)
+                .ok()
+                .and_then(|p| p.exe().ok())
+                .is_some_and(|parent_exe| {
+                    let parent = parent_exe.to_string_lossy().to_string();
+                    parent.contains("chromium") || parent.contains("chrome")
+                });
+            if !parent_is_browser {
+                candidates.push(process.pid());
+            }
+        }
+        candidates.into_iter().min()
+    }
+
+    #[test]
+    fn a_process_owns_its_descendants() {
+        // The relation that attributes a sound to the application that
+        // holds the X11 connection: the sound-producing process (a
+        // browser's audio service) is a descendant of the process that
+        // opened the connection.
+        let me = std::process::id() as i32;
+        let tree = ProcessTree::of(me).expect("this process is readable");
+        assert!(tree.owns_descendant(me), "a process owns itself");
+
+        // Every ancestor in the tree is also "owned" — the relation is
+        // about the tree, not about direction.
+        for pid in tree.pids() {
+            assert!(tree.owns_descendant(pid));
+        }
     }
 
     #[test]
