@@ -34,42 +34,10 @@ pub mod per_app;
 
 use std::sync::{Arc, Mutex};
 
+use rx11_core::audio::ApplicationId;
 use rx11_core::config::RuntimeConfig;
 use rx11_core::queue::OutboundSender;
 use rx11_core::types::ConnectionId;
-
-pub(crate) use mix::MixHub;
-
-/// One application's captured sound, shared by all of its channels.
-pub(crate) struct ApplicationStream {
-    /// The application's identity (its process tree, once the core
-    /// attribution API lands). Two X11 connections of the same application
-    /// resolve to the same identity.
-    pub(crate) app: AppIdentity,
-    /// The audio channel each of the application's X11 connections listens
-    /// on. One entry per X11 connection; every entry carries the same
-    /// sound.
-    pub(crate) channels: Vec<Channel>,
-}
-
-/// The identity of an application, used to decide which X11 connections
-/// belong together.
-///
-/// The shape is deliberately opaque to this module: the attribution layer
-/// ([`per_app`]) owns what an identity IS (today: a process tree), and
-/// only asks "are these two the same application?" through it.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub(crate) struct AppIdentity(u64);
-
-impl AppIdentity {
-    pub(crate) fn new(raw: u64) -> Self {
-        Self(raw)
-    }
-
-    pub(crate) fn raw(&self) -> u64 {
-        self.0
-    }
-}
 
 /// One audio channel: a subscriber's real-time lane, plus the X11
 /// connection whose application this sound belongs to.
@@ -90,62 +58,140 @@ pub(crate) struct Channel {
     pub(crate) shed: u64,
 }
 
-/// The subscriber set of one application: the X11 connections that want
-/// this application's sound.
-///
-/// A subscriber is a RELAY CONNECTION (a client), not an X11 connection:
-/// the X11 connections live on the relay side, the clients live on the
-/// wire. One client may hold several X11 connections (it renders several
-/// remote applications), so one client holds one entry per application it
-/// renders.
-pub(crate) struct Subscriber {
-    /// The relay connection this subscriber belongs to. A client that
-    /// renders two applications gets two entries, one per application.
-    pub(crate) client: ClientId,
-    /// The client's real-time lane.
-    pub(crate) outbound: OutboundSender,
-    /// The audio channels this subscriber listens on, one per X11
-    /// connection of the application.
-    pub(crate) channels: Vec<Channel>,
-}
-
-/// Identifies one relay connection (one connected client).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) struct ClientId(pub(crate) u64);
-
 /// The audio hub: the relay's single entry point for audio.
 ///
-/// It owns both capture modes and hands out subscriptions. Which mode is
-/// in force depends on the runtime profile and on what the host supports;
-/// the mode decision happens once, at attach time, and never changes for
-/// a running session.
+/// It owns both capture modes. Which mode is in force depends on the
+/// runtime profile and on what the host supports; the decision happens
+/// once, at attach time, and never changes for a running session.
 #[derive(Clone)]
-pub(crate) struct AudioHub(Arc<Inner>);
+pub(crate) struct AudioHub {
+    inner: Arc<Inner>,
+}
 
 struct Inner {
     runtime: RuntimeConfig,
+    /// The whole-desktop mix: the fallback and the explicit opt-out.
+    mix: mix::MixHub,
     state: Mutex<HubState>,
 }
 
 #[derive(Default)]
 struct HubState {
-    /// The per-application streams currently captured. Keyed by the
-    /// application's identity: one capture and one encoder per
+    /// The applications being captured. One capture and one encoder per
     /// application, shared by every X11 connection of that application.
-    pub(crate) applications: Vec<ApplicationStream>,
-    /// The whole-desktop mix subscribers. Empty in per-application mode.
-    pub(crate) mix_subscribers: Vec<Subscriber>,
+    applications: Vec<per_app::ApplicationCapture>,
+    /// Counts the capture streams started, so each capture stream gets a
+    /// distinct name.
+    sequences: u64,
+    /// The clients subscribed to the per-application tier, each with the
+    /// real-time lane their channels ride.
+    clients: Vec<PerAppClient>,
+}
+
+/// A client subscribed to the per-application tier.
+struct PerAppClient {
+    /// The client's audio subscription id: the id of the channel the
+    /// client first attached with. It identifies the client inside the
+    /// hub.
+    client_connection_id: ConnectionId,
+    /// The client's real-time lane.
+    outbound: OutboundSender,
 }
 
 impl AudioHub {
     pub(crate) fn new(runtime: RuntimeConfig) -> Self {
-        Self(Arc::new(Inner {
-            runtime,
-            state: Mutex::new(HubState::default()),
-        }))
+        Self {
+            inner: Arc::new(Inner {
+                mix: mix::MixHub::new(runtime.clone()),
+                runtime,
+                state: Mutex::new(HubState::default()),
+            }),
+        }
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, HubState> {
-        self.0.state.lock().expect("audio hub state")
+        self.inner.state.lock().expect("audio hub state")
+    }
+
+    /// Whether the whole-desktop mix is in force: the runtime profile
+    /// turned per-application audio off, or the host cannot capture per
+    /// application at all.
+    pub(crate) fn mix_only(&self) -> bool {
+        !self.inner.runtime.audio_per_app || !rx11_core::audio::per_app_capture_available()
+    }
+
+    /// Subscribe a client to the whole-desktop mix.
+    pub(crate) fn attach_mix(&self, outbound: OutboundSender, connection_id: ConnectionId) {
+        self.inner.mix.attach(outbound, connection_id);
+    }
+
+    /// Subscribe a client to the per-application tier.
+    ///
+    /// The client's real-time lane is registered. The application whose
+    /// sound it will carry is decided when an X11 connection of that
+    /// application appears: the audio channel's id and its application
+    /// label both come from that X11 connection.
+    pub(crate) fn attach_per_app(&self, outbound: OutboundSender, connection_id: ConnectionId) {
+        let mut st = self.state();
+        st.clients.push(PerAppClient {
+            client_connection_id: connection_id,
+            outbound,
+        });
+    }
+
+    /// The client's real-time lane, for the per-application tier.
+    ///
+    /// `None` when the client never subscribed (it did not negotiate the
+    /// audio capability).
+    pub(crate) fn client_lane(&self, client_connection_id: ConnectionId) -> Option<OutboundSender> {
+        let st = self.state();
+        st.clients
+            .iter()
+            .find(|c| c.client_connection_id == client_connection_id)
+            .map(|c| c.outbound.clone())
+    }
+
+    /// Give an X11 connection an audio channel on its application's sound.
+    ///
+    /// The application's capture starts if it is not running yet. The
+    /// channel's id is the AUDIO channel's own id — a different namespace
+    /// from the X11 connection ids, because the client routes audio frames
+    /// by the channel id and matches the foreground application by the X11
+    /// connection id.
+    pub(crate) fn attach_connection(
+        &self,
+        app: ApplicationId,
+        app_connection_id: ConnectionId,
+        outbound: OutboundSender,
+    ) {
+        let mut st = self.state();
+        if let Some(capture) = st.applications.iter_mut().find(|c| c.app == app) {
+            // The application is already being captured: this connection
+            // just joins the sound that is already flowing.
+            capture.add_channel(app_connection_id, outbound);
+            return;
+        }
+        let sequence = st.sequences;
+        st.sequences += 1;
+        let mut capture = per_app::ApplicationCapture::new(app, sequence);
+        capture.add_channel(app_connection_id, outbound);
+        capture.start(&self.inner.runtime);
+        st.applications.push(capture);
+    }
+
+    /// Close the audio channel of an X11 connection that went away.
+    ///
+    /// When the application's last channel goes, its capture stops — the
+    /// same "the last listener left" rule the mix mode follows.
+    pub(crate) fn detach_connection(&self, app: ApplicationId, app_connection_id: ConnectionId) {
+        let mut st = self.state();
+        let Some(index) = st.applications.iter().position(|c| c.app == app) else {
+            return;
+        };
+        st.applications[index].remove_channel(app_connection_id);
+        if st.applications[index].is_empty() {
+            let capture = st.applications.remove(index);
+            capture.stop();
+        }
     }
 }

@@ -23,7 +23,6 @@
 //! Failures stay non-fatal everywhere: a missing audio stack warns per
 //! attach attempt and the X11 session never notices.
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
@@ -39,8 +38,6 @@ use rx11_core::protocol::{
 };
 use rx11_core::queue::{OutboundSender, PrioritySendError};
 use rx11_core::types::ConnectionId;
-
-use super::AudioHub;
 
 /// Read granularity from the recorder child; the packetizer re-slices to
 /// frames regardless of how the pipe chunks.

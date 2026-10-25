@@ -88,6 +88,7 @@ pub(super) async fn handle_client(
     let mut incremental_cache = ConnectionDataCache::from_runtime(&runtime);
     let mut uplink_cache = ConnectionDataCache::from_runtime(&runtime);
     let mut audio_attached = false;
+    let audio_client_id = crate::x11_listener::next_connection_id();
     let mut flow = FlowState {
         negotiated: dataplane.features.supports(Capability::FlowControl),
         ..FlowState::default()
@@ -110,6 +111,7 @@ pub(super) async fn handle_client(
         stats: &stats,
         audio: &audio,
         audio_attached: &mut audio_attached,
+        audio_client_id: &audio_client_id,
         flow: &mut flow,
         flow_ticker: &mut flow_ticker,
     };
@@ -165,6 +167,9 @@ struct RelayContext<'a> {
     /// ack, so its ChannelOpen can never interleave before SessionAck).
     audio: &'a crate::audio::AudioHub,
     audio_attached: &'a mut bool,
+    /// The id this connection task's audio subscription was made under:
+    /// it identifies the client inside the hub.
+    audio_client_id: &'a ConnectionId,
     /// Flow-control brain of this session (see the module header).
     flow: &'a mut FlowState,
     /// Re-advertisement period for held flow state on the priority lane.
@@ -628,10 +633,22 @@ async fn send_session_ack(
             // Audio rides the connection, not the display: attach with the
             // first successful ack. Capture/encode are shared process-wide;
             // attaching only registers this client's real-time lane.
+            //
+            // The whole-desktop mix is the fallback. The per-application
+            // tier needs the client to have negotiated `audio_per_app`:
+            // a per-application stream is a DIFFERENT channel per X11
+            // connection, and a client that only understands the single
+            // legacy mix channel would drop all but one application's
+            // sound.
             if ctx.dataplane.features.supports(Capability::AudioForward) && !*ctx.audio_attached {
                 *ctx.audio_attached = true;
                 let conn = crate::x11_listener::next_connection_id();
-                ctx.audio.attach(ctx.outbound.clone(), conn);
+                if ctx.dataplane.features.supports(Capability::AudioPerApp) && !ctx.audio.mix_only()
+                {
+                    ctx.audio.attach_per_app(ctx.outbound.clone(), conn);
+                } else {
+                    ctx.audio.attach_mix(ctx.outbound.clone(), conn);
+                }
             }
             SessionAckMessage {
                 display: disp,
@@ -660,6 +677,26 @@ async fn handle_x11_event(
             connection_id,
         }) => {
             ctx.stats.inc_x11_connections();
+            // The per-application audio tier: this X11 connection belongs
+            // to an application, and that application's sound gets its own
+            // audio channel, tagged with THIS connection. The channel is
+            // opened lazily, on the application's first packet, so a
+            // connection whose application never makes a sound never sees
+            // an audio channel.
+            if ctx.dataplane.features.supports(Capability::AudioPerApp)
+                && ctx.dataplane.features.supports(Capability::AudioForward)
+                && !ctx.audio.mix_only()
+            {
+                if let Some(app) = ctx
+                    .session_mgr
+                    .application_of_connection(connection_id)
+                    .await
+                {
+                    if let Some(lane) = ctx.audio.client_lane(*ctx.audio_client_id) {
+                        ctx.audio.attach_connection(app, connection_id, lane);
+                    }
+                }
+            }
             send_outbound(
                 ctx.outbound,
                 Frame::ChannelOpen(ChannelOpenMessage {
@@ -706,6 +743,21 @@ async fn handle_x11_event(
             RelayAction::Continue
         }
         Some(X11ConnToRelay::Disconnected { connection_id, .. }) => {
+            // The per-application audio channel of this X11 connection
+            // closes with it: the application loses one of its channels.
+            // When it was the last one, the application's capture stops.
+            if ctx.dataplane.features.supports(Capability::AudioPerApp)
+                && ctx.dataplane.features.supports(Capability::AudioForward)
+                && !ctx.audio.mix_only()
+            {
+                if let Some(app) = ctx
+                    .session_mgr
+                    .application_of_connection(connection_id)
+                    .await
+                {
+                    ctx.audio.detach_connection(app, connection_id);
+                }
+            }
             ctx.session_mgr
                 .unregister_x11_connection(connection_id)
                 .await;

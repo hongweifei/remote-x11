@@ -1,6 +1,7 @@
 //! Session lifecycle management: display allocation, ownership, grace
 //! periods and the registry connecting relay tasks with X11 listener tasks.
 
+mod application;
 mod events;
 mod xauth;
 
@@ -11,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex, RwLock};
 use tracing::{info, warn};
 
+use rx11_core::audio::ApplicationId;
 use rx11_core::config::ServerDefaults;
 use rx11_core::flow::{EgressGate, FlowMeter};
 use rx11_core::types::{ConnectionId, DisplayNumber, SessionId};
@@ -18,6 +20,7 @@ use rx11_core::x11recode::RecodeSpec;
 
 use xauth::{xauth_add, xauth_remove};
 
+pub use application::{Application, ApplicationRegistry};
 pub use events::{X11ConnToRelay, X11RelayToConn};
 
 /// Bridges session creation to X11 port binding. Implemented by
@@ -93,6 +96,10 @@ pub struct SessionManager {
     connections: Arc<Mutex<HashMap<u32, ConnState>>>,
     display_conns: Arc<Mutex<HashMap<u16, HashSet<u32>>>>,
     grace_tasks: Arc<Mutex<HashMap<u16, Arc<AtomicBool>>>>,
+    /// Which application each X11 connection belongs to. The per-application
+    /// audio tier reads it to decide which application's sound a channel
+    /// carries.
+    applications: Arc<Mutex<ApplicationRegistry>>,
 }
 
 impl Default for SessionManager {
@@ -110,6 +117,7 @@ impl SessionManager {
             connections: Arc::new(Mutex::new(HashMap::new())),
             display_conns: Arc::new(Mutex::new(HashMap::new())),
             grace_tasks: Arc::new(Mutex::new(HashMap::new())),
+            applications: Arc::new(Mutex::new(ApplicationRegistry::new())),
         }
     }
 
@@ -402,6 +410,7 @@ impl SessionManager {
         disp: DisplayNumber,
         sender: mpsc::Sender<X11RelayToConn>,
         flow: ConnFlow,
+        peer_pid: Option<i32>,
     ) -> rx11_core::error::Result<()> {
         let conn_val = conn_id.get();
         let disp_val = disp.get();
@@ -430,6 +439,14 @@ impl SessionManager {
             .entry(disp_val)
             .or_default()
             .insert(conn_val);
+        // The application behind this connection: the process on the
+        // other end of the X11 socket. Its sound is captured per
+        // application, so the per-application audio tier needs to know it.
+        // A connection whose peer could not be resolved still works — it
+        // simply carries no application.
+        if let Some(pid) = peer_pid {
+            self.applications.lock().await.register(conn_id, pid);
+        }
         Ok(())
     }
 
@@ -440,6 +457,15 @@ impl SessionManager {
                 set.remove(&conn_id.get());
             }
         }
+        self.applications.lock().await.unregister(conn_id);
+    }
+
+    /// The application an X11 connection belongs to.
+    pub async fn application_of_connection(&self, conn_id: ConnectionId) -> Option<ApplicationId> {
+        let applications = self.applications.lock().await;
+        applications
+            .application_of(conn_id)
+            .map(|application| application.root())
     }
 
     /// Route payload toward an X11 connection WITHOUT awaiting its channel:

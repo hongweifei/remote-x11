@@ -7,48 +7,39 @@
 //!    processes each hold one), and their sound is captured once and
 //!    shipped on one audio channel per connection.
 //! 2. Which application does a sound belong to? A sound comes from a
-//!    process; the process is the application itself or one of its
+//!    process; that process is the application's own process or one of its
 //!    descendants (a browser's audio service is a child of the browser's
 //!    main process).
 //!
-//! The attribution is by PROCESS LINEAGE, not by a shared ancestor. A
-//! shared-ancestor rule over-merges on a real host: every process on a
-//! desktop shares the init process, and every process started from the
-//! same terminal shares the shell — so "the ancestries meet" would put
-//! the browser, the terminal and the shell into ONE application, and the
-//! browser's sound would ship on the terminal's channel.
+//! The attribution rule lives in the core crate, so the client and the
+//! server measure "same application" with the same ruler: the APPLICATION
+//! ROOT. Sharing an ancestor is not enough — every process on a desktop
+//! shares the init process, and every process started from the same
+//! terminal shares the shell, so "the ancestries meet" would put the
+//! browser, the terminal and the shell into one application.
 //!
-//! The rule used here is lineage:
-//!
-//! * Two connections are the same application when one connection's peer
-//!   process is an ancestor of the other's.
-//! * A sound belongs to the connection whose peer process is the
-//!   sound's process or one of its ancestors; when several connections
-//!   match, the DEEPEST (nearest) one wins — that is the connection the
-//!   sound was produced for.
+//! The registry here owns the bookkeeping: which connections are
+//! registered, which application each belongs to, and which application a
+//! sound-producing process belongs to.
 
 use std::collections::HashMap;
 
-use rx11_core::audio::ProcessTree;
+use rx11_core::audio::{ApplicationId, ProcessTree};
 use rx11_core::types::ConnectionId;
 
 /// One application's connections.
 #[derive(Debug, Clone)]
 pub struct Application {
-    /// The application's identity: the peer process of its first
-    /// connection, and the process tree that ties the rest of its
-    /// connections to it.
-    tree: ProcessTree,
-    /// The X11 connections of this application, in the order they
-    /// appeared.
+    /// The application's root: the process every member descends from.
+    root: ApplicationId,
+    /// The X11 connections of this application, in registration order.
     connections: Vec<ConnectionId>,
 }
 
 impl Application {
-    /// The application's peer process (the process that opened its first
-    /// X11 connection).
-    pub fn peer_pid(&self) -> Option<i32> {
-        self.tree.pids().next()
+    /// The application's root process.
+    pub fn root(&self) -> ApplicationId {
+        self.root
     }
 
     /// The X11 connections of this application.
@@ -59,13 +50,13 @@ impl Application {
 
 /// The registry of X11 connections and their applications.
 ///
-/// Every X11 connection is registered with the peer process behind it;
+/// Every X11 connection is registered with the process behind it;
 /// connections of the same application land in one [`Application`].
 #[derive(Debug, Default)]
 pub struct ApplicationRegistry {
     /// The applications, in registration order.
     applications: Vec<Application>,
-    /// The application of each X11 connection.
+    /// The application index of each X11 connection.
     owner: HashMap<u32, usize>,
 }
 
@@ -85,11 +76,12 @@ impl ApplicationRegistry {
     /// disconnecting application).
     pub fn register(&mut self, connection_id: ConnectionId, peer_pid: i32) -> Option<usize> {
         let tree = ProcessTree::of(peer_pid)?;
-        let index = match self.find_application(&tree) {
+        let root = tree.application_root()?;
+        let index = match self.find_application(root) {
             Some(index) => index,
             None => {
                 self.applications.push(Application {
-                    tree,
+                    root,
                     connections: Vec::new(),
                 });
                 self.applications.len() - 1
@@ -106,7 +98,7 @@ impl ApplicationRegistry {
         self.applications.get(*index)
     }
 
-    /// The application of a connection, by index.
+    /// The application at an index.
     pub fn application(&self, index: usize) -> Option<&Application> {
         self.applications.get(index)
     }
@@ -131,78 +123,51 @@ impl ApplicationRegistry {
         Some(index)
     }
 
-    /// The application a sound belongs to: the connection whose peer
-    /// process is the sound's process or one of its ancestors. When
-    /// several connections match, the DEEPEST one wins — the connection
-    /// the sound was produced for, not a more distant relative.
+    /// The application a sound belongs to.
     ///
-    /// `sound_pid` is the process that produced the sound.
+    /// `sound_pid` is the process that produced the sound. The test is
+    /// the APPLICATION ROOT, compared for equality — not "the sound's
+    /// ancestry contains the application's root". The ancestry test is
+    /// too wide: it holds for EVERY application on the sound's ancestor
+    /// chain, so a terminal launched before a browser would claim the
+    /// browser's sound. The core's application root already places a
+    /// browser's audio service under the browser's own root, so the
+    /// sound's root equals the application's root exactly.
+    ///
+    /// When several connections of the SAME application match, they all
+    /// belong to it — the sound is that application's sound, and every one
+    /// of its X11 connections must receive it.
+    ///
+    /// Returns the application index, or `None` when the sound belongs to
+    /// no registered application.
     pub fn application_of_sound(&self, sound_pid: i32) -> Option<usize> {
-        let sound_tree = ProcessTree::of(sound_pid)?;
-        let mut best: Option<(usize, i32)> = None;
-        for (index, application) in self.applications.iter().enumerate() {
-            let Some(peer_pid) = application.peer_pid() else {
-                continue;
-            };
-            if !sound_tree.contains(peer_pid) {
-                continue;
-            }
-            // The deepest match wins: the larger the peer pid, the closer
-            // it sits to the sound's process in the lineage.
-            let deeper = match best {
-                Some((_, best_pid)) => peer_pid > best_pid,
-                None => true,
-            };
-            if deeper {
-                best = Some((index, peer_pid));
-            }
-        }
-        best.map(|(index, _)| index)
+        let sound_root = ProcessTree::of(sound_pid)?.application_root()?;
+        self.applications
+            .iter()
+            .position(|application| application.root() == sound_root)
     }
 
-    /// Whether a connection's peer process is an ancestor of another
-    /// process: the test that decides "this sound belongs to that
-    /// connection".
+    /// Whether a connection's application owns a process: the test that
+    /// decides "this sound belongs to that connection".
     pub fn connection_owns_process(&self, connection_id: ConnectionId, pid: i32) -> bool {
         let Some(application) = self.application_of(connection_id) else {
             return false;
         };
-        let Some(peer_pid) = application.peer_pid() else {
-            return false;
-        };
         ProcessTree::of(pid)
-            .map(|tree| tree.contains(peer_pid))
-            .unwrap_or(false)
+            .and_then(|tree| tree.application_root())
+            .is_some_and(|root| root == application.root())
     }
 
-    /// The application index that a process belongs to: the application
-    /// whose peer process is an ancestor of it, deepest match first.
-    ///
-    /// Used to decide which application's capture a sound stream feeds.
+    /// The application index a process belongs to.
     pub fn application_of_process(&self, pid: i32) -> Option<usize> {
         self.application_of_sound(pid)
     }
 
-    /// Find the application a process tree belongs to: the application
-    /// whose peer process is an ancestor of the tree's root.
-    fn find_application(&self, tree: &ProcessTree) -> Option<usize> {
-        let mut best: Option<(usize, i32)> = None;
-        for (index, application) in self.applications.iter().enumerate() {
-            let Some(peer_pid) = application.peer_pid() else {
-                continue;
-            };
-            if !tree.contains(peer_pid) {
-                continue;
-            }
-            let deeper = match best {
-                Some((_, best_pid)) => peer_pid > best_pid,
-                None => true,
-            };
-            if deeper {
-                best = Some((index, peer_pid));
-            }
-        }
-        best.map(|(index, _)| index)
+    /// Find the application with this root.
+    fn find_application(&self, root: ApplicationId) -> Option<usize> {
+        self.applications
+            .iter()
+            .position(|application| application.root() == root)
     }
 }
 
@@ -214,12 +179,6 @@ mod tests {
         ConnectionId::new(id)
     }
 
-    /// This process's own tree: the tests use it as a stand-in for an
-    /// application's tree, because it is guaranteed to be readable.
-    fn own_tree() -> ProcessTree {
-        ProcessTree::of(std::process::id() as i32).expect("this process is readable")
-    }
-
     #[test]
     fn a_connection_is_registered_under_its_application() {
         let mut registry = ApplicationRegistry::new();
@@ -227,7 +186,10 @@ mod tests {
         let index = registry.register(conn(1), me).expect("register");
         let application = registry.application(index).expect("application");
         assert_eq!(application.connections(), &[conn(1)]);
-        assert_eq!(registry.application_of(conn(1)).map(|a| a.connections()), Some(&[conn(1)][..]));
+        assert_eq!(
+            registry.application_of(conn(1)).map(|a| a.connections()),
+            Some(&[conn(1)][..])
+        );
     }
 
     #[test]
@@ -266,7 +228,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sound_from_this_process_belongs_to_this_processs_connection() {
+    fn a_sound_from_this_process_belongs_to_this_processs_application() {
         let mut registry = ApplicationRegistry::new();
         let me = std::process::id() as i32;
         let index = registry.register(conn(1), me).expect("register");
@@ -286,8 +248,19 @@ mod tests {
     }
 
     #[test]
-    fn the_tree_of_a_process_is_reachable_and_contains_itself() {
-        let tree = own_tree();
-        assert!(tree.contains(std::process::id() as i32));
+    fn a_sound_from_another_application_is_not_attributed_here() {
+        let mut registry = ApplicationRegistry::new();
+        let me = std::process::id() as i32;
+        registry.register(conn(1), me).expect("register");
+        // pid 1 is init: its application root is init itself, which is
+        // not this process's application. The sound must not be claimed
+        // by this connection — otherwise a terminal registered first would
+        // take the browser's sound.
+        assert!(
+            registry.application_of_sound(1).is_none(),
+            "another application's sound belongs to another application"
+        );
+        // The connection still owns its own process.
+        assert!(registry.connection_owns_process(conn(1), me));
     }
 }

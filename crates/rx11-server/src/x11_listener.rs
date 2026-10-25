@@ -116,6 +116,17 @@ impl X11DisplayBinder for X11Listener {
     }
 }
 
+/// The process on the other end of an accepted X11 socket.
+///
+/// The socket's inode is read from `/proc/self/fd`, and the core crate
+/// finds the peer through it. `None` when the peer cannot be resolved —
+/// the connection is then usable but carries no application label.
+fn peer_process_of(stream: &TcpStream) -> Option<i32> {
+    let fd = std::os::fd::AsRawFd::as_raw_fd(stream);
+    let inode = rx11_core::audio::socket_inode_of(fd)?;
+    rx11_core::audio::peer_process_of_socket(inode)
+}
+
 async fn handle_x11_connection(
     x11_stream: TcpStream,
     disp: DisplayNumber,
@@ -125,6 +136,23 @@ async fn handle_x11_connection(
     x11_stream.set_nodelay(true)?;
 
     let connection_id = next_connection_id();
+
+    // The application behind this connection: the process on the other end
+    // of the socket. Its sound is captured per application, so the
+    // per-application audio tier needs to know it. A connection whose peer
+    // cannot be resolved still works — it simply carries no application
+    // label.
+    let peer_pid = peer_process_of(&x11_stream);
+    match peer_pid {
+        Some(pid) => info!(
+            "X11 connection {connection_id} on display {} comes from process {pid}",
+            disp
+        ),
+        None => info!(
+            "X11 connection {connection_id} on display {}: peer process unknown",
+            disp
+        ),
+    }
 
     let (event_tx, recode, relay_outbound) =
         tokio::time::timeout(ServerDefaults::HANDSHAKE_TIMEOUT, async {
@@ -156,6 +184,7 @@ async fn handle_x11_connection(
                 upmeter: Arc::clone(&upmeter),
                 egress: Arc::clone(&egress),
             },
+            peer_pid,
         )
         .await?;
 
