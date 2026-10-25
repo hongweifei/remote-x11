@@ -642,11 +642,12 @@ async fn send_session_ack(
             // sound.
             if ctx.dataplane.features.supports(Capability::AudioForward) && !*ctx.audio_attached {
                 *ctx.audio_attached = true;
-                let conn = crate::x11_listener::next_connection_id();
                 if ctx.dataplane.features.supports(Capability::AudioPerApp) && !ctx.audio.mix_only()
                 {
-                    ctx.audio.attach_per_app(ctx.outbound.clone(), conn);
+                    ctx.audio
+                        .attach_per_app(ctx.outbound.clone(), *ctx.audio_client_id);
                 } else {
+                    let conn = crate::x11_listener::next_connection_id();
                     ctx.audio.attach_mix(ctx.outbound.clone(), conn);
                 }
             }
