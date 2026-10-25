@@ -24,8 +24,8 @@
 
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::net::{TcpStream, UnixStream};
 use tracing::debug;
 
 use x11rb_protocol::connect::Connect;
@@ -41,6 +41,79 @@ use super::x11wire::Authorization;
 /// is a single reply; a local server answers immediately.
 const FOCUS_TIMEOUT: Duration = Duration::from_millis(500);
 
+/// The stream to the local X server.
+///
+/// The X server is reachable in two ways: over TCP (the form the
+/// product is configured with) and over a unix socket (the form the
+/// server itself opens). Both are regular entrances, so both are
+/// supported: the address is a socket path when it starts with a slash,
+/// and a `host:port` pair otherwise.
+enum XStream {
+    /// The server over TCP.
+    Tcp(TcpStream),
+    /// The server over a unix socket.
+    Unix(UnixStream),
+}
+
+impl XStream {
+    /// Connect to the X server at this address.
+    async fn connect(address: &str) -> std::io::Result<Self> {
+        if address.starts_with('/') {
+            Ok(Self::Unix(UnixStream::connect(address).await?))
+        } else {
+            let stream = TcpStream::connect(address).await?;
+            stream.set_nodelay(true)?;
+            Ok(Self::Tcp(stream))
+        }
+    }
+}
+
+impl AsyncRead for XStream {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for XStream {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            Self::Tcp(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+            Self::Unix(stream) => std::pin::Pin::new(stream).poll_shutdown(cx),
+        }
+    }
+}
+
 /// The monitor connection to the local X server.
 ///
 /// It holds the protocol state of one connection: the sequence-number
@@ -48,7 +121,7 @@ const FOCUS_TIMEOUT: Duration = Duration::from_millis(500);
 /// itself lives in the task that owns it.
 pub(crate) struct Monitor {
     /// The stream to the local X server.
-    stream: TcpStream,
+    stream: XStream,
     /// The protocol state: which replies are still outstanding.
     connection: Connection,
     /// The framing of the server's stream: a reply is 32 bytes plus four
@@ -65,8 +138,7 @@ impl Monitor {
         address: &str,
         authorization: &Authorization,
     ) -> std::io::Result<Self> {
-        let mut stream = TcpStream::connect(address).await?;
-        stream.set_nodelay(true)?;
+        let mut stream = XStream::connect(address).await?;
 
         // The library builds the setup request and knows its length; the
         // authorization is presented exactly as the application presents
@@ -109,10 +181,17 @@ impl Monitor {
         // (GetInputFocus takes no arguments, so the length is one unit).
         let (bufs, _fds) = GetInputFocusRequest.serialize();
         let buf: Vec<u8> = bufs.iter().flat_map(|b| b.iter().copied()).collect();
+
+        // The sequence number is taken BEFORE the request goes on the
+        // wire: the library counts the requests it is told about, and
+        // the server's reply carries the number of the request it
+        // answers. Registering the request after writing it would leave
+        // the library's counter one behind the wire, and the reply would
+        // never match.
+        let sequence = self.connection.send_request(ReplyFdKind::ReplyWithoutFDs)?;
+
         self.stream.write_all(&buf).await.ok()?;
         self.stream.flush().await.ok()?;
-
-        let sequence = self.connection.send_request(ReplyFdKind::ReplyWithoutFDs)?;
 
         // The reply arrives among the server's events; the framing
         // separates them.
@@ -132,7 +211,10 @@ impl Monitor {
                     let (reply, _) = GetInputFocusReply::try_parse(&reply).ok()?;
                     return Some(reply);
                 }
-                x11rb_protocol::connection::PollReply::NoReply => return None,
+                x11rb_protocol::connection::PollReply::NoReply => {
+                    debug!("audio: the focus request was answered with an error");
+                    return None;
+                }
                 x11rb_protocol::connection::PollReply::TryAgain => {}
             }
         }
@@ -142,6 +224,7 @@ impl Monitor {
     async fn read_packet(&mut self) -> Option<Vec<u8>> {
         loop {
             if self.reader.buffer().is_empty() {
+                debug!("audio: the monitor's read buffer is empty");
                 return None;
             }
             let read = tokio::time::timeout(FOCUS_TIMEOUT, self.stream.read(self.reader.buffer()))
@@ -149,6 +232,7 @@ impl Monitor {
                 .ok()?
                 .ok()?;
             if read == 0 {
+                debug!("audio: the local X server closed the monitor connection");
                 return None; // the server closed the connection
             }
             if let Some(packet) = self.reader.advance(read) {
@@ -160,7 +244,7 @@ impl Monitor {
 
 /// Read the setup reply and parse it with the protocol library.
 async fn read_setup_reply(
-    stream: &mut TcpStream,
+    stream: &mut XStream,
     mut connect: Connect,
 ) -> Option<x11rb_protocol::protocol::xproto::Setup> {
     loop {
@@ -225,6 +309,9 @@ impl ResidentMonitor {
     /// when it breaks, so the next question opens a fresh one.
     pub(crate) async fn focus_window(&mut self) -> Option<u32> {
         if self.authorization.is_empty() {
+            // The authorization is learned from the application's setup
+            // request. Without it the local X server may refuse the
+            // connection, so there is nothing to ask.
             debug!("audio: no authorization for the local X server; focus unknown");
             return None;
         }

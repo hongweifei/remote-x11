@@ -222,6 +222,26 @@ mod tests {
         outlet
     }
 
+    /// An outlet together with the receiver that sees what reaches it.
+    async fn outlet_with_receiver(
+        id: u32,
+    ) -> (AudioOutlet, tokio::sync::mpsc::Receiver<bytes::Bytes>) {
+        AudioOutlet::for_test(ConnectionId::new(id))
+    }
+
+    /// The audibility of the channel, read from the PLAYER itself.
+    ///
+    /// The table's rule decides which player is fed; the player is the
+    /// thing that is muted. Reading the player's own flag therefore
+    /// checks the effect of the rule, not the rule's description of it.
+    fn player_is_fed(table: &OutletTable, channel_id: u32) -> bool {
+        table
+            .outlets
+            .get(&channel_id)
+            .expect("the channel is open")
+            .is_audible_now()
+    }
+
     #[tokio::test]
     async fn a_closed_channel_is_forgotten() {
         let mut table = OutletTable::new(true);
@@ -340,6 +360,52 @@ mod tests {
         assert!(table.deliver(ConnectionId::new(10), packet.clone()));
         assert_eq!(rx.try_recv().ok(), Some(packet));
         assert!(!table.deliver(ConnectionId::new(77), bytes::Bytes::new()));
+    }
+
+    #[tokio::test]
+    async fn only_the_foreground_channels_player_receives_the_sound() {
+        // The evidence that the routing really separates the channels:
+        // the packets of two applications, each delivered to its own
+        // channel, and only the foreground application's channel is
+        // allowed to reach its player.
+        //
+        // The muted channel still RECEIVES its packets — the Opus
+        // decoder carries state across packets, so a channel that
+        // skipped packets would sound wrong once it became audible
+        // again. What the selection rule decides is which PLAYER is
+        // fed, and that is what this test pins.
+        let mut table = OutletTable::new(true);
+        let (foreground_outlet, mut foreground_rx) = outlet_with_receiver(10).await;
+        let (muted_outlet, mut muted_rx) = outlet_with_receiver(11).await;
+        table.insert(foreground_outlet, Some(ConnectionId::new(5)));
+        table.insert(muted_outlet, Some(ConnectionId::new(6)));
+        table.set_foreground(Some(ConnectionId::new(5)));
+
+        let foreground_packet = bytes::Bytes::from_static(b"app-five");
+        let muted_packet = bytes::Bytes::from_static(b"app-six");
+        assert!(table.deliver(ConnectionId::new(10), foreground_packet.clone()));
+        assert!(table.deliver(ConnectionId::new(11), muted_packet.clone()));
+
+        assert_eq!(
+            foreground_rx.try_recv().ok(),
+            Some(foreground_packet),
+            "the foreground application's sound reaches its player"
+        );
+        assert_eq!(
+            muted_rx.try_recv().ok(),
+            Some(muted_packet),
+            "the other application's channel still receives its packets"
+        );
+
+        // And the players themselves: only the foreground one is fed.
+        assert!(
+            player_is_fed(&table, 10),
+            "the foreground application's player is fed"
+        );
+        assert!(
+            !player_is_fed(&table, 11),
+            "the other application's player is silent"
+        );
     }
 
     #[tokio::test]

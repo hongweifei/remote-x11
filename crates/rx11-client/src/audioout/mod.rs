@@ -12,6 +12,8 @@
 //! audible.
 
 mod focus;
+#[cfg(test)]
+mod focus_e2e;
 mod monitor;
 mod table;
 mod x11wire;
@@ -73,6 +75,16 @@ impl AudioOutlet {
     /// Whether the player is fed right now.
     pub fn set_audible(&self, audible: bool) {
         self.audible.store(audible, Ordering::Relaxed);
+    }
+
+    /// Whether the player is being fed right now.
+    ///
+    /// The mute lives on the PLAYER, not on the packets: a muted channel
+    /// still receives its packets, because the Opus decoder carries state
+    /// across packets.
+    #[cfg(test)]
+    pub fn is_audible_now(&self) -> bool {
+        self.audible.load(Ordering::Relaxed)
     }
 
     /// Test seam: an outlet wired to an external receiver (no player child).

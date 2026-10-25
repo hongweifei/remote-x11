@@ -14,3 +14,10 @@ bytes = { workspace = true }
 # which window holds the input focus, and reads the setup reply's resource
 # range. The library does the framing; no X11 byte is parsed by hand here.
 x11rb-protocol = "0.14"
+
+[dev-dependencies]
+# The full X11 client library, for the focus end-to-end test: it creates
+# a real window on a real connection and asks the server about the
+# focus. The protocol library above only parses and serializes; this one
+# also opens a connection and drives the requests.
+x11rb = "0.14"
