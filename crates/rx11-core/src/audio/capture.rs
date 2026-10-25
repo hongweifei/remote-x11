@@ -36,6 +36,20 @@ pub struct PipeWireNode {
     pub media_class: String,
     /// The process that produced the node, when the graph knows it.
     pub process_id: Option<i32>,
+    /// The media the node carries, e.g. the file a player is playing.
+    ///
+    /// The node's own NAME is not enough: every `paplay` instance calls
+    /// itself "paplay", so the media is what tells two players apart.
+    pub media_name: String,
+    /// The node's stable identity in PipeWire.
+    ///
+    /// The graph's own object id (`id`) is RECYCLED — a new object can take
+    /// a freed number — so it cannot address a node across time. The
+    /// `object.serial` is the stable one, and it is what a capture stream
+    /// must be pointed at: with the graph's id the target is ambiguous
+    /// (the capture then receives the sink MIX, measured), with the serial
+    /// it receives exactly that application's sound (measured).
+    pub object_serial: Option<u32>,
 }
 
 impl PipeWireNode {
@@ -164,6 +178,11 @@ impl PipeWireTopology {
                         id: id as u32,
                         name,
                         media_class,
+                        media_name: string_prop(props, "media.name"),
+                        object_serial: props
+                            .get("object.serial")
+                            .and_then(|v| v.as_u64())
+                            .map(|v| v as u32),
                         process_id,
                     });
                 }
@@ -307,6 +326,10 @@ fn string_prop(props: &serde_json::Map<String, serde_json::Value>, key: &str) ->
 /// `parec`/`paplay` use — makes the capture stream refuse to start with
 /// "open failed: invalid argument". The byte order is the host's, so the
 /// PCM is still interleaved little-endian s16.
+///
+/// The output is the standard output (the `-` argument): a pipe, a FIFO
+/// and a regular file all carry the capture (measured: 581632 bytes to a
+/// pipe, 598016 to a file).
 pub fn capture_stream_command(node_name: &str) -> Vec<String> {
     vec![
         "pw-cat".to_string(),
@@ -319,6 +342,82 @@ pub fn capture_stream_command(node_name: &str) -> Vec<String> {
         format!("--properties=node.name={node_name}"),
         "-".to_string(),
     ]
+}
+
+/// The capture command for ONE application, pointed at that application.
+///
+/// The target is the application's `object.serial` — the stable identity of
+/// its stream node. It is NOT the graph's object id: that one is recycled,
+/// and a target given as an id resolves to the wrong node or to the sink
+/// MIX (measured: with an id the capture carries both applications' sounds,
+/// 6752 against 6312; with the serial it carries only the wanted one,
+/// 10882 against 3.8).
+///
+/// With the serial the capture needs no port link at all: PipeWire links
+/// the stream itself, which also means the capture keeps flowing instead
+/// of receiving only the first moments (measured: a port-linked capture
+/// stops after about 200 KB, a serial-targeted one keeps delivering).
+///
+/// The capture stream is created with `--target=<serial>`, so it starts
+/// already bound to the application — there is no separate link step and
+/// no window in which the two ends have to be matched up.
+pub fn capture_command_for_application(target_serial: u32) -> Vec<String> {
+    vec![
+        "pw-cat".to_string(),
+        "--record".to_string(),
+        format!("--target={target_serial}"),
+        "--raw".to_string(),
+        "--format=s16".to_string(),
+        "--rate=48000".to_string(),
+        "--channels=2".to_string(),
+        "-".to_string(),
+    ]
+}
+
+/// A name for a capture stream that no other capture stream can share.
+///
+/// The name MUST be unique among the capture streams alive on the host,
+/// because the graph may hold SEVERAL nodes with the same name (measured:
+/// two capture streams started with the same `node.name` both appear in the
+/// graph), and the lookup by name takes the FIRST match. A stale stream
+/// left by an earlier run would then be picked instead of the live one,
+/// and the live capture would receive nothing at all.
+///
+/// The name therefore carries:
+/// * this process's id — a restarted server never collides with the
+///   streams of the previous run;
+/// * the process's start time — a recycled process id does not collide
+///   either;
+/// * a counter — two capture streams of the SAME process never collide.
+///
+/// The application root's process id is deliberately NOT part of it: it
+/// is reused by the kernel, so it cannot identify anything.
+pub fn unique_capture_stream_name(tag: &str, sequence: u64) -> String {
+    let pid = std::process::id();
+    let started = process_start_time_seconds(pid);
+    format!("rx11-capture-{pid}-{started}-{sequence}-{tag}")
+}
+
+/// The process's start time, in seconds since the epoch.
+///
+/// Linux exposes it as the field 22 of `/proc/<pid>/stat`. It is read
+/// directly because the value has to be the kernel's, not an approximation:
+/// the name's uniqueness rests on it.
+fn process_start_time_seconds(pid: u32) -> u64 {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return 0;
+    };
+    // The comm field may contain spaces and parentheses, so the split
+    // starts after the last ')'.
+    let Some(rest) = stat.rsplit_once(')').map(|(_, r)| r) else {
+        return 0;
+    };
+    // After the comm come: state(3) ppid(4) pgrp(5) session(6) tty(7)
+    // tpgid(8) flags(9) minflt(10) cminflt(11) majflt(12) cmajflt(13)
+    // utime(14) stime(15) cutime(16) cstime(17) priority(18) nice(19)
+    // num_threads(20) itrealvalue(21) starttime(22).
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    fields.get(19).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
 }
 
 /// The command that links an application's output port into the capture
@@ -369,6 +468,7 @@ mod tests {
         assert!(argv
             .iter()
             .any(|a| a == "--properties=node.name=rx11-cap-7"));
+        // The output is the standard output.
         assert_eq!(argv.last().map(String::as_str), Some("-"));
     }
 
@@ -390,18 +490,24 @@ mod tests {
                     id: 78,
                     name: "paplay".into(),
                     media_class: "Stream/Output/Audio".into(),
+                    media_name: "tone.wav".into(),
+                    object_serial: Some(11086),
                     process_id: Some(52075),
                 },
                 PipeWireNode {
                     id: 79,
                     name: "paplay".into(),
                     media_class: "Stream/Output/Audio".into(),
+                    media_name: "other.wav".into(),
+                    object_serial: Some(11087),
                     process_id: Some(52076),
                 },
                 PipeWireNode {
                     id: 57,
                     name: "sink".into(),
                     media_class: "Audio/Sink".into(),
+                    media_name: String::new(),
+                    object_serial: None,
                     process_id: None,
                 },
             ],
@@ -451,6 +557,8 @@ mod tests {
             id: 90,
             name: "rx11-cap-7".into(),
             media_class: "Stream/Input/Audio".into(),
+            media_name: String::new(),
+            object_serial: Some(11088),
             process_id: None,
         };
         let mut topology = topology;
@@ -465,6 +573,8 @@ mod tests {
             id: 1,
             name: "capture".into(),
             media_class: "Stream/Output/Audio".into(),
+            media_name: String::new(),
+            object_serial: None,
             process_id: None,
         };
         assert!(!node.belongs_to(42));
@@ -480,30 +590,40 @@ mod tests {
                     id: 78,
                     name: "paplay".into(),
                     media_class: "Stream/Output/Audio".into(),
+                    media_name: "tone.wav".into(),
+                    object_serial: Some(11086),
                     process_id: Some(52075),
                 },
                 PipeWireNode {
                     id: 79,
                     name: "paplay".into(),
                     media_class: "Stream/Output/Audio".into(),
+                    media_name: "other.wav".into(),
+                    object_serial: Some(11087),
                     process_id: Some(52076),
                 },
                 PipeWireNode {
                     id: 57,
                     name: "sink".into(),
                     media_class: "Audio/Sink".into(),
+                    media_name: String::new(),
+                    object_serial: None,
                     process_id: None,
                 },
                 PipeWireNode {
                     id: 90,
                     name: "rx11-cap-7".into(),
                     media_class: "Stream/Input/Audio".into(),
+                    media_name: String::new(),
+                    object_serial: Some(11088),
                     process_id: None,
                 },
                 PipeWireNode {
                     id: 91,
                     name: "orphan".into(),
                     media_class: "Stream/Output/Audio".into(),
+                    media_name: String::new(),
+                    object_serial: None,
                     process_id: None,
                 },
             ],
@@ -614,5 +734,54 @@ mod tests {
 
         let pairs = topology.pair_channels(1, 2);
         assert_eq!(pairs, vec![(10, 20)], "only the FL channel exists");
+    }
+
+    #[test]
+    fn capture_stream_names_are_unique_per_process_and_sequence() {
+        let first = unique_capture_stream_name("app-42", 0);
+        let second = unique_capture_stream_name("app-42", 1);
+        assert_ne!(first, second, "two streams of one process differ");
+        assert_ne!(
+            first,
+            unique_capture_stream_name("app-43", 0),
+            "two applications of one process differ"
+        );
+        // The name carries this process's id, so a restarted server never
+        // collides with the streams of the previous run — and those may
+        // still be alive, which is exactly the collision that breaks the
+        // lookup by name.
+        assert!(
+            first.contains(&std::process::id().to_string()),
+            "the name carries the process id: {first}"
+        );
+    }
+
+    #[test]
+    fn the_process_start_time_is_read_from_the_kernel() {
+        let pid = std::process::id();
+        let started = process_start_time_seconds(pid);
+        assert!(started > 0, "this process has a start time: {started}");
+    }
+
+    #[test]
+    fn the_application_capture_is_pointed_at_the_nodes_serial() {
+        let argv = capture_command_for_application(11086);
+        assert_eq!(argv.first().map(String::as_str), Some("pw-cat"));
+        assert!(argv.iter().any(|a| a == "--record"));
+        // The target is the object's SERIAL: the graph's own id is
+        // recycled, and a target given as an id resolves to the sink mix.
+        assert!(
+            argv.iter().any(|a| a == "--target=11086"),
+            "the target is the serial: {argv:?}"
+        );
+        assert!(
+            !argv.iter().any(|a| a == "--target=0"),
+            "the capture is bound to the application, not left unlinked"
+        );
+        assert!(argv.iter().any(|a| a == "--raw"), "raw s16le");
+        assert!(argv.iter().any(|a| a == "--format=s16"), "the format is s16");
+        assert!(argv.iter().any(|a| a == "--rate=48000"));
+        assert!(argv.iter().any(|a| a == "--channels=2"));
+        assert_eq!(argv.last().map(String::as_str), Some("-"), "to the pipe");
     }
 }

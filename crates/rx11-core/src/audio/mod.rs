@@ -34,7 +34,8 @@ mod capture;
 mod ownership;
 
 pub use capture::{
-    capture_stream_command, link_command, per_app_capture_available, PipeWireNode, PipeWirePort,
+    capture_command_for_application, capture_stream_command, link_command,
+    per_app_capture_available, unique_capture_stream_name, PipeWireLink, PipeWireNode, PipeWirePort,
     PipeWireTopology,
 };
 pub use ownership::{
