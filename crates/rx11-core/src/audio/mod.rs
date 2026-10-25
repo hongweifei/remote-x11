@@ -35,8 +35,8 @@ mod ownership;
 
 pub use capture::{
     capture_command_for_application, capture_stream_arguments, link_command,
-    per_app_capture_available, unique_capture_stream_name, PipeWireLink, PipeWireNode, PipeWirePort,
-    PipeWireTopology,
+    per_app_capture_available, unique_capture_stream_name, PipeWireLink, PipeWireNode,
+    PipeWirePort, PipeWireTopology,
 };
 pub use ownership::{
     group_by_application, peer_process_of_socket, socket_inode_of, ApplicationId, ProcessTree,

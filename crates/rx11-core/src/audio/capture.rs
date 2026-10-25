@@ -425,7 +425,10 @@ fn process_start_time_seconds(pid: u32) -> u64 {
     // utime(14) stime(15) cutime(16) cstime(17) priority(18) nice(19)
     // num_threads(20) itrealvalue(21) starttime(22).
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    fields.get(19).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0)
+    fields
+        .get(19)
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// The command that links an application's output port into the capture
@@ -796,7 +799,10 @@ mod tests {
             "the capture is bound to the application, not left unlinked"
         );
         assert!(argv.iter().any(|a| a == "--raw"), "raw s16le");
-        assert!(argv.iter().any(|a| a == "--format=s16"), "the format is s16");
+        assert!(
+            argv.iter().any(|a| a == "--format=s16"),
+            "the format is s16"
+        );
         assert!(argv.iter().any(|a| a == "--rate=48000"));
         assert!(argv.iter().any(|a| a == "--channels=2"));
         assert_eq!(argv.last().map(String::as_str), Some("-"), "to the pipe");
