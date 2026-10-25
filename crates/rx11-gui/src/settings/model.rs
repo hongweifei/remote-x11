@@ -41,7 +41,7 @@ pub struct SshSection {
 }
 
 /// `[runtime]`：运行时可调参数，秒为单位，字段与 CLI 的
-/// `RuntimeFileConfig` 一一对应（共 21 项）。
+/// `RuntimeFileConfig` 一一对应（共 22 项）。
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct RuntimeSection {
@@ -61,6 +61,8 @@ pub struct RuntimeSection {
     pub image_recode_quality: Option<u8>,
     pub image_recode_min_bytes: Option<usize>,
     pub audio_forward: Option<bool>,
+    /// 逐个应用分别转发音频（默认开启）。主机不支持按应用采集时退回整桌面混音。
+    pub audio_per_app: Option<bool>,
     pub audio_bitrate_kbps: Option<u32>,
     pub audio_record_command: Option<Vec<String>>,
     pub audio_play_command: Option<Vec<String>>,
@@ -114,6 +116,7 @@ impl RuntimeSection {
                 .image_recode_min_bytes
                 .unwrap_or(defaults.image_recode_min_bytes),
             audio_forward: self.audio_forward.unwrap_or(defaults.audio_forward),
+            audio_per_app: self.audio_per_app.unwrap_or(defaults.audio_per_app),
             audio_bitrate_kbps: self
                 .audio_bitrate_kbps
                 .unwrap_or(defaults.audio_bitrate_kbps),

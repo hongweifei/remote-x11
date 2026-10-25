@@ -36,6 +36,10 @@ pub struct RuntimeFileConfig {
     pub image_recode_quality: Option<u8>,
     pub image_recode_min_bytes: Option<usize>,
     pub audio_forward: Option<bool>,
+    /// Forward each remote application's audio separately instead of one
+    /// desktop mix. ON by default; hosts that cannot capture per application
+    /// fall back to the desktop mix.
+    pub audio_per_app: Option<bool>,
     pub audio_bitrate_kbps: Option<u32>,
     pub audio_record_command: Option<Vec<String>>,
     pub audio_play_command: Option<Vec<String>>,
@@ -88,6 +92,7 @@ impl RuntimeFileConfig {
                 .image_recode_min_bytes
                 .unwrap_or(defaults.image_recode_min_bytes),
             audio_forward: self.audio_forward.unwrap_or(defaults.audio_forward),
+            audio_per_app: self.audio_per_app.unwrap_or(defaults.audio_per_app),
             audio_bitrate_kbps: self
                 .audio_bitrate_kbps
                 .unwrap_or(defaults.audio_bitrate_kbps),
@@ -194,6 +199,12 @@ pub const CONFIG_TEMPLATE: &str = r#"# rx11 configuration file
 # disables it. No lip-sync with GL-rendered video; system sounds, music and
 # alerts are the use case.
 # audio_forward = true           # the switch (default on)
+# audio_per_app = true           # forward each application's audio separately
+#                                # (default on): the server captures one stream
+#                                # per remote application, and the client plays
+#                                # only the application currently in focus.
+#                                # Hosts that cannot capture per application
+#                                # fall back to the desktop mix.
 # audio_bitrate_kbps = 64        # 32 = speech-grade, 64 = near-transparent
 # # Only when auto-detection misses your stack — full argv, verbatim:
 # # audio_record_command = ["parec", "--raw", "--format=s16le", "--rate=48000", "--channels=2", "--device=@DEFAULT_SINK@.monitor"]

@@ -165,6 +165,17 @@ pub struct RuntimeConfig {
     /// no Pulse/PipeWire capture exists the probe warns and audio stays
     /// inactive — it never fails the session.
     pub audio_forward: bool,
+    /// ON by default: the server attributes each captured sound stream to
+    /// the application producing it (by process id) and ships it on its own
+    /// `audio` channel, tagged with that application's X11 connection. The
+    /// client then plays the sound of the applications it renders instead
+    /// of the server's entire desktop mix.
+    ///
+    /// Set `false` on either end to fall back to the single whole-desktop
+    /// mix channel. The server also falls back on its own when the host
+    /// cannot attribute sound to applications (no per-stream capture
+    /// support), so a mixed or unsupported host still gets audio.
+    pub audio_per_app: bool,
     /// Opus target bitrate in kbit/s (VBR). 64 ≈ transparent stereo music;
     /// 32 is fine for speech-heavy desktop sound.
     pub audio_bitrate_kbps: u32,
@@ -207,6 +218,7 @@ impl Default for RuntimeConfig {
             image_recode_quality: 80,
             image_recode_min_bytes: 16 * 1024,
             audio_forward: true,
+            audio_per_app: true,
             audio_bitrate_kbps: crate::audio::DEFAULT_BITRATE_KBPS,
             audio_record_command: None,
             audio_play_command: None,

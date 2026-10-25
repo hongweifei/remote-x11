@@ -53,15 +53,27 @@ pub enum Capability {
     /// default output sink, Opus-encoded, delivered on the real-time lane.
     /// Advertised by default; either peer opts OUT with
     /// `[runtime] audio_forward = false`. Endpoints without a capture or
-    /// playback stack stay silent instead of failing.
+    /// playback stack stay silent instead of failing the session.
     AudioForward,
+    /// The `audio` channel may carry ONE application's sound instead of
+    /// the whole desktop mix: the server attributes each sound stream to
+    /// the application that produces it and ships it on a channel tagged
+    /// with that application's X11 connection.
+    ///
+    /// Advertised by default; either peer opts OUT with
+    /// `[runtime] audio_per_app = false`, which falls back to the
+    /// whole-desktop mix. The client must gate on this capability: a
+    /// per-application stream is a DIFFERENT channel per application, and
+    /// a client that only understands the single legacy mix channel would
+    /// drop all but one application's sound.
+    AudioPerApp,
 }
 
 impl Capability {
     /// What this build can actually do. Every capability here is fully
     /// implemented; the gated ones ride default-ON with per-end kill
     /// switches in `advertised_for`.
-    pub const SUPPORTED: [Capability; 7] = [
+    pub const SUPPORTED: [Capability; 8] = [
         Capability::RequestResync,
         Capability::Incremental,
         Capability::IncrementalUplink,
@@ -69,6 +81,7 @@ impl Capability {
         Capability::X11,
         Capability::X11Recode,
         Capability::AudioForward,
+        Capability::AudioPerApp,
     ];
 
     pub fn name(self) -> &'static str {
@@ -80,6 +93,7 @@ impl Capability {
             Capability::X11 => "x11",
             Capability::X11Recode => "x11_recode",
             Capability::AudioForward => "audio_forward",
+            Capability::AudioPerApp => "audio_per_app",
         }
     }
 
@@ -99,16 +113,17 @@ impl Capability {
     }
 
     /// Advertised list honoring the per-endpoint kill switches: recode,
-    /// audio, uplink diffing and flow control ride by default (their default
-    /// tiers are lossless / harmless), and an explicit `false` in `[runtime]`
-    /// removes the name from the wire — a peer that disabled a capability can
-    /// never be talked into it.
+    /// audio, per-app audio, uplink diffing and flow control ride by
+    /// default (their default tiers are lossless / harmless), and an
+    /// explicit `false` in `[runtime]` removes the name from the wire — a
+    /// peer that disabled a capability can never be talked into it.
     pub fn advertised_for(runtime: &crate::config::RuntimeConfig) -> Vec<String> {
         Capability::SUPPORTED
             .iter()
             .filter(|c| match c {
                 Capability::X11Recode => runtime.image_recode,
                 Capability::AudioForward => runtime.audio_forward,
+                Capability::AudioPerApp => runtime.audio_per_app,
                 Capability::FlowControl => runtime.flow_control,
                 Capability::IncrementalUplink => runtime.incremental_uplink,
                 _ => true,
